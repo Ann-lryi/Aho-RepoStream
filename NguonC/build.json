@@ -1,0 +1,13 @@
+{
+  "name": "NguonC",
+  "pluginClassName": "com.phimnguonc.NguonC",
+  "version": 1,
+  "requiresResources": false,
+  "description": "Vietnamese anime streaming site",
+  "authors": ["NguonC"],
+  "repositoryUrl": "https://github.com/dah215/Aho-Repo",
+  "status": 1,
+  "tvTypes": ["Movie"],
+  "language": "vi",
+  "iconUrl": "https://phim.nguonc.com/favicon.ico"
+}

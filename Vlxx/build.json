@@ -1,0 +1,14 @@
+{
+  "name": "Vlxx",
+  "pluginClassName": "com.vlxx.Vlxx",
+  "version": 1,
+  "requiresResources": false,
+  "description": "Vietnamese anime streaming site",
+  "authors": ["Vlxx"],
+  "repositoryUrl": "https://github.com/dah215/Aho-Repo",
+  "status": 1,
+  "tvTypes": ["NSFW"],
+  "language": "vi",
+  "iconUrl": "https://vlxx.bz/favicon.ico"
+}
+ 
