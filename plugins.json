@@ -1,0 +1,63 @@
+[
+    {
+        "iconUrl": "https://watchhentai.net/favicon.ico",
+        "fileHash": "sha256-da57b34100cb1284eba206724be7caf37fc42d7ff3a52782cde96dc2afc92b58",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Ann-lryi/Aho-RepoStream",
+        "fileSize": 21371,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "Hentai"
+        ],
+        "tvTypes": [
+            "NSFW"
+        ],
+        "version": 1,
+        "internalName": "Hentai",
+        "description": "Vietnamese anime streaming site",
+        "url": "https://raw.githubusercontent.com/Ann-lryi/Aho-RepoStream/builds/Hentai.cs3",
+        "name": "Hentai"
+    },
+    {
+        "iconUrl": "https://phim.nguonc.com/favicon.ico",
+        "fileHash": "sha256-2b12ba1fe55cab91b94e2f6972a705b21582a656a8bd0ce40b9c3208248cf773",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Ann-lryi/Aho-RepoStream",
+        "fileSize": 37715,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "NguonC"
+        ],
+        "tvTypes": [
+            "Movie",
+            "AnimeMovie"
+        ],
+        "version": 1,
+        "internalName": "NguonC",
+        "description": "Vietnamese anime streaming site",
+        "url": "https://raw.githubusercontent.com/Ann-lryi/Aho-RepoStream/builds/NguonC.cs3",
+        "name": "NguonC"
+    },
+    {
+        "iconUrl": "https://vlxx.bz/favicon.ico",
+        "fileHash": "sha256-bfba508b69df5f1cec93b7893852925cd1186fbad86e0670d8facdb1437261c3",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Ann-lryi/Aho-RepoStream",
+        "fileSize": 15212,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "Vlxx"
+        ],
+        "tvTypes": [
+            "NSFW"
+        ],
+        "version": 1,
+        "internalName": "Vlxx",
+        "description": "Vietnamese anime streaming site",
+        "url": "https://raw.githubusercontent.com/Ann-lryi/Aho-RepoStream/builds/Vlxx.cs3",
+        "name": "Vlxx"
+    }
+]
