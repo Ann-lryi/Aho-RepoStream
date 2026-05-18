@@ -28,7 +28,8 @@ class PhimNguonCProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|.*streamc\.xyz|.*amass15\.top|.*hihihoho2\.top"""))
+    private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com(?!/\?__cf)|.*streamc\.xyz|.*amass15\.top|.*hihihoho2\.top"""))
+
 
     private val commonHeaders = mapOf(
         "User-Agent"      to USER_AGENT,
@@ -40,9 +41,9 @@ class PhimNguonCProvider : MainAPI() {
 
     override val mainPage = mainPageOf(
         "${API_PREFIX}api/films/phim-moi-cap-nhat" to "Phim Mới Cập Nhật",
-        "danh-sach/phim-le"                        to "Phim Lẻ",
-        "danh-sach/phim-bo"                        to "Phim Bộ",
-        "danh-sach/tv-shows"                       to "TV Shows"
+        "${API_PREFIX}api/films/phim-le"            to "Phim Lẻ",
+        "${API_PREFIX}api/films/phim-bo"            to "Phim Bộ",
+        "${API_PREFIX}api/films/hoat-hinh"          to "Nhật Bản + Anime"
     )
 
     private fun parseCard(el: Element): SearchResponse? {
@@ -120,11 +121,15 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/tim-kiem?keyword=${URLEncoder.encode(query, "utf-8")}"
-        val doc = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
-        return doc.select("table tbody tr").mapNotNull { parseCard(it) }
+        val res = try {
+            app.get("$mainUrl/api/films/search?keyword=${URLEncoder.encode(query, "utf-8")}",
+                headers = commonHeaders, interceptor = cfInterceptor)
+               .parsedSafe<NguonCApiResponse>()
+        } catch (_: Exception) { null }
+        return res?.items?.mapNotNull { parseApiItem(it) } ?: emptyList()
     }
 
+    
     override suspend fun load(url: String): LoadResponse {
         val slug  = url.trim().trimEnd('/').substringAfterLast("/")
         val res   = app.get("$mainUrl/api/film/$slug", headers = commonHeaders)
