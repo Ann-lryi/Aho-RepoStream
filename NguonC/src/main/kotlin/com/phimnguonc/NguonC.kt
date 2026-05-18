@@ -114,7 +114,13 @@ class PhimNguonCProvider : MainAPI() {
             newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
         } else {
             val url   = if (page == 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
-            val doc   = app.get(url, headers = commonHeaders).document
+            // Use a per-request WebViewResolver that matches the exact page URL
+            // This ensures WebView loads the full page past Cloudflare
+            val pageInterceptor = com.lagradost.cloudstream3.network.WebViewResolver(
+                Regex(Regex.escape(url))
+            )
+            val resp = app.get(url, headers = commonHeaders, interceptor = pageInterceptor)
+            val doc  = resp.document
             val items = doc.select("table tbody tr").mapNotNull { parseCard(it) }
             newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
         }
@@ -130,10 +136,11 @@ class PhimNguonCProvider : MainAPI() {
         if (!res?.items.isNullOrEmpty())
             return res!!.items!!.mapNotNull { parseApiItem(it) }
         // Fallback HTML search
-        val doc = app.get(
-            "$mainUrl/tim-kiem?keyword=${URLEncoder.encode(query, "utf-8")}",
-            headers = commonHeaders
-        ).document
+        val searchUrl = "$mainUrl/tim-kiem?keyword=${URLEncoder.encode(query, "utf-8")}"
+        val pageInterceptor2 = com.lagradost.cloudstream3.network.WebViewResolver(
+            Regex(Regex.escape(searchUrl))
+        )
+        val doc = app.get(searchUrl, headers = commonHeaders, interceptor = pageInterceptor2).document
         return doc.select("table tbody tr").mapNotNull { parseCard(it) }
     }
 
@@ -197,304 +204,50 @@ class PhimNguonCProvider : MainAPI() {
         namPhatHanh: String,
         quocGia: String
     ): String {
-        val description = movie.description ?: ""
-        val director = movie.director ?: ""
-        val casts = movie.casts ?: ""
-        val time = movie.time ?: ""
-        val quality = movie.quality ?: ""
-        val language = movie.language ?: ""
-        val currentEpisode = movie.current_episode ?: ""
-        val totalEpisodes = movie.total_episodes?.toString() ?: ""
+        val description  = movie.description ?: ""
+        val director     = movie.director ?: ""
+        val casts        = movie.casts ?: ""
+        val time         = movie.time ?: ""
+        val quality      = movie.quality ?: ""
+        val language     = movie.language ?: ""
+        val currentEp    = movie.current_episode ?: ""
+        val totalEp      = movie.total_episodes?.toString() ?: ""
         val originalName = movie.original_name ?: ""
 
-        return """
-        <html>
-        <head>
-        <style>
-            @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap');
-            
-            * {
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
+        return buildString {
+            if (originalName.isNotBlank() && originalName != (movie.name ?: ""))
+                append("<font color='#AAAAAA'><i>$originalName</i></font><br><br>")
+
+            fun addInfo(icon: String, label: String, value: String?, color: String = "#FFFFFF") {
+                if (!value.isNullOrBlank())
+                    append("$icon <b>$label:</b> <font color='$color'>$value</font><br>")
             }
-            
-            body {
-                font-family: 'Roboto', sans-serif;
-                background: linear-gradient(180deg, #0d1117 0%, #161b22 100%);
-                color: #e6edf3;
-                line-height: 1.6;
-                padding: 16px;
+
+            val statusColor = when {
+                currentEp.contains("hoàn tất", ignoreCase = true) -> "#2196F3"
+                currentEp.contains("full",     ignoreCase = true) -> "#9C27B0"
+                else -> "#4CAF50"
             }
-            
-            .movie-header {
-                background: linear-gradient(135deg, #1a1f2e 0%, #21262d 100%);
-                border-radius: 16px;
-                padding: 20px;
-                margin-bottom: 16px;
-                border: 1px solid #30363d;
-                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+
+            addInfo("📺", "Trạng thái",  currentEp,  statusColor)
+            if (totalEp.isNotBlank() && totalEp != "0")
+                addInfo("🎞",  "Số tập",     "$totalEp tập")
+            addInfo("⏱",  "Thời lượng",  time)
+            addInfo("🎬",  "Chất lượng",  quality,    "#E91E63")
+            addInfo("🔊",  "Ngôn ngữ",   language)
+            addInfo("🌍",  "Quốc gia",   quocGia)
+            addInfo("📅",  "Năm",        namPhatHanh)
+            addInfo("📽",  "Định dạng",  dinhDang)
+            addInfo("🎥",  "Đạo diễn",   director)
+            addInfo("🎭",  "Diễn viên",  casts)
+            addInfo("🏷",  "Thể loại",   theLoai)
+
+            if (description.isNotBlank()) {
+                append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
+                append("<hr color='#333333' size='1'><br>")
+                append(description)
             }
-            
-            .movie-title {
-                font-size: 24px;
-                font-weight: 700;
-                color: #ffffff;
-                margin-bottom: 8px;
-                text-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
-            }
-            
-            .original-title {
-                font-size: 14px;
-                color: #8b949e;
-                font-style: italic;
-                margin-bottom: 12px;
-            }
-            
-            .tags-container {
-                display: flex;
-                flex-wrap: wrap;
-                gap: 8px;
-                margin-bottom: 16px;
-            }
-            
-            .tag {
-                background: linear-gradient(135deg, #238636 0%, #2ea043 100%);
-                color: white;
-                padding: 4px 12px;
-                border-radius: 20px;
-                font-size: 12px;
-                font-weight: 500;
-            }
-            
-            .tag.quality {
-                background: linear-gradient(135deg, #8957e5 0%, #a371f7 100%);
-            }
-            
-            .tag.year {
-                background: linear-gradient(135deg, #1f6feb 0%, #58a6ff 100%);
-            }
-            
-            .tag.language {
-                background: linear-gradient(135deg, #d29922 0%, #e3b341 100%);
-            }
-            
-            .rating-section {
-                display: flex;
-                align-items: center;
-                gap: 12px;
-                margin-bottom: 16px;
-                padding: 12px;
-                background: rgba(0, 0, 0, 0.2);
-                border-radius: 12px;
-            }
-            
-            .stars {
-                color: #fbbc04;
-                font-size: 18px;
-                letter-spacing: 2px;
-            }
-            
-            .rating-text {
-                font-size: 14px;
-                color: #8b949e;
-            }
-            
-            .rating-score {
-                color: #fbbc04;
-                font-weight: 700;
-                font-size: 16px;
-            }
-            
-            .info-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-                gap: 12px;
-                margin-bottom: 16px;
-            }
-            
-            .info-item {
-                background: rgba(48, 54, 61, 0.6);
-                padding: 12px;
-                border-radius: 10px;
-                border-left: 3px solid #58a6ff;
-            }
-            
-            .info-label {
-                font-size: 11px;
-                color: #8b949e;
-                text-transform: uppercase;
-                letter-spacing: 0.5px;
-                margin-bottom: 4px;
-            }
-            
-            .info-value {
-                font-size: 14px;
-                color: #e6edf3;
-                font-weight: 500;
-            }
-            
-            .section-title {
-                font-size: 16px;
-                font-weight: 700;
-                color: #f0883e;
-                margin: 20px 0 12px 0;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-            }
-            
-            .section-title::before {
-                content: "◆";
-                color: #f0883e;
-            }
-            
-            .description-box {
-                background: linear-gradient(135deg, #1c2128 0%, #21262d 100%);
-                border-radius: 12px;
-                padding: 16px;
-                border: 1px solid #30363d;
-                position: relative;
-                overflow: hidden;
-            }
-            
-            .description-box::before {
-                content: "";
-                position: absolute;
-                top: 0;
-                left: 0;
-                right: 0;
-                height: 3px;
-                background: linear-gradient(90deg, #f0883e, #fb8500, #f0883e);
-            }
-            
-            .description-text {
-                font-size: 14px;
-                color: #c9d1d9;
-                line-height: 1.8;
-                text-align: justify;
-            }
-            
-            .meta-section {
-                margin-top: 16px;
-                padding: 16px;
-                background: rgba(48, 54, 61, 0.4);
-                border-radius: 12px;
-            }
-            
-            .meta-row {
-                display: flex;
-                margin-bottom: 10px;
-                align-items: flex-start;
-            }
-            
-            .meta-label {
-                min-width: 100px;
-                font-size: 13px;
-                color: #58a6ff;
-                font-weight: 500;
-            }
-            
-            .meta-value {
-                flex: 1;
-                font-size: 13px;
-                color: #e6edf3;
-            }
-            
-            .episode-badge {
-                display: inline-block;
-                background: linear-gradient(135deg, #da3633 0%, #f85149 100%);
-                color: white;
-                padding: 6px 16px;
-                border-radius: 20px;
-                font-size: 14px;
-                font-weight: 600;
-                margin-bottom: 12px;
-            }
-            
-            .divider {
-                height: 1px;
-                background: linear-gradient(90deg, transparent, #30363d, transparent);
-                margin: 16px 0;
-            }
-        </style>
-        </head>
-        <body>
-            <div class="movie-header">
-                ${if (originalName.isNotBlank()) "<div class=\"original-title\">$originalName</div>" else ""}
-                
-                <div class="tags-container">
-                    ${if (language.isNotBlank()) "<span class=\"tag language\">$language</span>" else ""}
-                    ${if (quality.isNotBlank()) "<span class=\"tag quality\">$quality</span>" else ""}
-                    ${if (namPhatHanh.isNotBlank()) "<span class=\"tag year\">$namPhatHanh</span>" else ""}
-                    ${if (dinhDang.isNotBlank()) "<span class=\"tag\">$dinhDang</span>" else ""}
-                </div>
-                
-                <div class="info-grid">
-                    ${if (currentEpisode.isNotBlank()) """
-                    <div class="info-item">
-                        <div class="info-label">📺 Trạng thái</div>
-                        <div class="info-value">$currentEpisode</div>
-                    </div>
-                    """ else ""}
-                    
-                    ${if (totalEpisodes.isNotBlank() && totalEpisodes != "0") """
-                    <div class="info-item">
-                        <div class="info-label">🎬 Số tập</div>
-                        <div class="info-value">$totalEpisodes</div>
-                    </div>
-                    """ else ""}
-                    
-                    ${if (time.isNotBlank()) """
-                    <div class="info-item">
-                        <div class="info-label">⏱️ Thờ lượng</div>
-                        <div class="info-value">$time</div>
-                    </div>
-                    """ else ""}
-                    
-                    ${if (quocGia.isNotBlank()) """
-                    <div class="info-item">
-                        <div class="info-label">🌍 Quốc gia</div>
-                        <div class="info-value">$quocGia</div>
-                    </div>
-                    """ else ""}
-                </div>
-                
-                ${if (director.isNotBlank() || casts.isNotBlank() || theLoai.isNotBlank()) """
-                <div class="meta-section">
-                    ${if (director.isNotBlank()) """
-                    <div class="meta-row">
-                        <span class="meta-label">🎬 Đạo diễn:</span>
-                        <span class="meta-value">$director</span>
-                    </div>
-                    """ else ""}
-                    
-                    ${if (casts.isNotBlank()) """
-                    <div class="meta-row">
-                        <span class="meta-label">🎭 Diễn viên:</span>
-                        <span class="meta-value">$casts</span>
-                    </div>
-                    """ else ""}
-                    
-                    ${if (theLoai.isNotBlank()) """
-                    <div class="meta-row">
-                        <span class="meta-label">🏷️ Thể loại:</span>
-                        <span class="meta-value">$theLoai</span>
-                    </div>
-                    """ else ""}
-                </div>
-                """ else ""}
-            </div>
-            
-            ${if (description.isNotBlank()) """
-            <div class="section-title">NỘI DUNG PHIM</div>
-            <div class="description-box">
-                <div class="description-text">$description</div>
-            </div>
-            """ else ""}
-        </body>
-        </html>
-        """.trimIndent()
+        }
     }
 
     // ── Local proxy server ────────────────────────────────────────────────────
