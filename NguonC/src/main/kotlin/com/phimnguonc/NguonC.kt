@@ -40,10 +40,10 @@ class PhimNguonCProvider : MainAPI() {
     private val API_PREFIX = "API::"
 
     override val mainPage = mainPageOf(
-        "${API_PREFIX}api/films/phim-moi-cap-nhat" to "Phim Mới Cập Nhật",
-        "${API_PREFIX}api/films/phim-le"            to "Phim Lẻ",
-        "${API_PREFIX}api/films/phim-bo"            to "Phim Bộ",
-        "${API_PREFIX}api/films/hoat-hinh"          to "Nhật Bản + Anime"
+        "${API_PREFIX}api/films/phim-moi-cap-nhat"    to "Phim Mới Cập Nhật",
+        "danh-sach/phim-le"                           to "Phim Lẻ",
+        "danh-sach/phim-bo"                           to "Phim Bộ",
+        "danh-sach/tv-shows"                          to "Nhật Bản + Anime"
     )
 
     private fun parseCard(el: Element): SearchResponse? {
@@ -114,19 +114,27 @@ class PhimNguonCProvider : MainAPI() {
             newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
         } else {
             val url   = if (page == 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
-            val doc   = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
+            val doc   = app.get(url, headers = commonHeaders).document
             val items = doc.select("table tbody tr").mapNotNull { parseCard(it) }
             newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
         }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        // Try API search first
         val res = try {
-            app.get("$mainUrl/api/films/search?keyword=${URLEncoder.encode(query, "utf-8")}",
+            app.get("$mainUrl/api/films?keyword=${URLEncoder.encode(query, "utf-8")}",
                 headers = commonHeaders, interceptor = cfInterceptor)
                .parsedSafe<NguonCApiResponse>()
         } catch (_: Exception) { null }
-        return res?.items?.mapNotNull { parseApiItem(it) } ?: emptyList()
+        if (!res?.items.isNullOrEmpty())
+            return res!!.items!!.mapNotNull { parseApiItem(it) }
+        // Fallback HTML search
+        val doc = app.get(
+            "$mainUrl/tim-kiem?keyword=${URLEncoder.encode(query, "utf-8")}",
+            headers = commonHeaders
+        ).document
+        return doc.select("table tbody tr").mapNotNull { parseCard(it) }
     }
 
     
