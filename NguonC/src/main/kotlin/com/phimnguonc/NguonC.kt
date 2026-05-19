@@ -189,22 +189,30 @@ class PhimNguonCProvider : MainAPI() {
             quocGia = quocGia
         )
 
-        // Fetch similar films using first genre category
-        val firstCatId = categories.values
+        // Fetch similar films: try multiple API patterns
+        val theLoaiSlug = categories.values
             .find { it.group?.name == "Thể loại" }
-            ?.list?.firstOrNull()?.id
-        val recommendations: List<SearchResponse> = if (!firstCatId.isNullOrBlank()) {
-            try {
-                app.get("$mainUrl/api/films?category=$firstCatId&page=1",
-                    headers = commonHeaders, interceptor = cfInterceptor)
-                   .parsedSafe<NguonCApiResponse>()
-                   ?.items
-                   ?.filter { it.slug != movie.slug }
-                   ?.take(20)
-                   ?.mapNotNull { parseApiItem(it) }
-                   ?: emptyList()
-            } catch (_: Exception) { emptyList() }
-        } else emptyList()
+            ?.list?.firstOrNull()
+        val recommendations: List<SearchResponse> = try {
+            val endpoints = listOfNotNull(
+                theLoaiSlug?.id?.let { "$mainUrl/api/films?cat=$it&page=1" },
+                theLoaiSlug?.id?.let { "$mainUrl/api/films?category_id=$it&page=1" },
+                theLoaiSlug?.name?.lowercase()?.replace(" ", "-")
+                    ?.let { "$mainUrl/api/films/$it?page=1" },
+                "$mainUrl/api/films/phim-moi-cap-nhat?page=1"
+            )
+            var result: List<SearchResponse> = emptyList()
+            for (endpoint in endpoints) {
+                val items = app.get(endpoint, headers = commonHeaders, interceptor = cfInterceptor)
+                    .parsedSafe<NguonCApiResponse>()?.items
+                if (!items.isNullOrEmpty()) {
+                    result = items.filter { it.slug != movie.slug }
+                        .take(20).mapNotNull { parseApiItem(it) }
+                    break
+                }
+            }
+            result
+        } catch (_: Exception) { emptyList() }
 
         return newTvSeriesLoadResponse(movie.name ?: "", url, TvType.TvSeries, episodes) {
             this.posterUrl       = movie.poster_url ?: movie.thumb_url
