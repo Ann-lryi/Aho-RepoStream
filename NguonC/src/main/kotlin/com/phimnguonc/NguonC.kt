@@ -189,11 +189,29 @@ class PhimNguonCProvider : MainAPI() {
             quocGia = quocGia
         )
 
+        // Fetch similar films using first genre category
+        val firstCatId = categories.values
+            .find { it.group?.name == "Thể loại" }
+            ?.list?.firstOrNull()?.id
+        val recommendations: List<SearchResponse> = if (!firstCatId.isNullOrBlank()) {
+            try {
+                app.get("$mainUrl/api/films?category=$firstCatId&page=1",
+                    headers = commonHeaders, interceptor = cfInterceptor)
+                   .parsedSafe<NguonCApiResponse>()
+                   ?.items
+                   ?.filter { it.slug != movie.slug }
+                   ?.take(20)
+                   ?.mapNotNull { parseApiItem(it) }
+                   ?: emptyList()
+            } catch (_: Exception) { emptyList() }
+        } else emptyList()
+
         return newTvSeriesLoadResponse(movie.name ?: "", url, TvType.TvSeries, episodes) {
-            this.posterUrl = movie.poster_url ?: movie.thumb_url
-            this.plot      = beautifulPlot
-            this.tags      = theLoai.split(", ").filter { it.isNotBlank() }
-            this.year      = namPhatHanh.toIntOrNull()
+            this.posterUrl       = movie.poster_url ?: movie.thumb_url
+            this.plot            = beautifulPlot
+            this.tags            = theLoai.split(", ").filter { it.isNotBlank() }
+            this.year            = namPhatHanh.toIntOrNull()
+            this.recommendations = recommendations
         }
     }
 
