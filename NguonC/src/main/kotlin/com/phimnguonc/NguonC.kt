@@ -98,9 +98,11 @@ class PhimNguonCProvider : MainAPI() {
             this.posterUrl = poster
             this.quality   = quality
             this.dubStatus = dubStatus
-            val ep = episodeCount
-            this.episodes = mutableMapOf(DubStatus.Subbed to (ep ?: 0))
-                .also { map -> if (hasDub) map[DubStatus.Dubbed] = ep ?: 0 }
+            if (episodeCount != null) {
+                if (hasSub) addSub(episodeCount)
+                if (hasDub) addDub(episodeCount)
+                if (!hasSub && !hasDub) addSub(episodeCount)
+            }
         }
     }
 
@@ -189,22 +191,35 @@ class PhimNguonCProvider : MainAPI() {
             quocGia = quocGia
         )
 
-        // Fetch similar films: try multiple API patterns
-        val theLoaiSlug = categories.values
+        // Recommendations: fetch films of same genre using category slug
+        val genreItems = categories.values
             .find { it.group?.name == "Thể loại" }
-            ?.list?.firstOrNull()
+            ?.list ?: emptyList()
         val recommendations: List<SearchResponse> = try {
-            val endpoints = listOfNotNull(
-                theLoaiSlug?.id?.let { "$mainUrl/api/films?cat=$it&page=1" },
-                theLoaiSlug?.id?.let { "$mainUrl/api/films?category_id=$it&page=1" },
-                theLoaiSlug?.name?.lowercase()?.replace(" ", "-")
-                    ?.let { "$mainUrl/api/films/$it?page=1" },
-                "$mainUrl/api/films/phim-moi-cap-nhat?page=1"
-            )
             var result: List<SearchResponse> = emptyList()
-            for (endpoint in endpoints) {
-                val items = app.get(endpoint, headers = commonHeaders, interceptor = cfInterceptor)
-                    .parsedSafe<NguonCApiResponse>()?.items
+            // Try each genre until we find results
+            for (genre in genreItems.take(3)) {
+                // API endpoint: /api/films/{genre-name-slug}?page=1
+                val slug = genre.name
+                    ?.lowercase()
+                    ?.replace("ắ","a").replace("ẳ","a").replace("ặ","a")
+                    ?.replace("ề","e").replace("ể","e").replace("ệ","e")
+                    ?.replace("ống","ong").replace("ộ","o").replace("ổ","o")
+                    ?.replace("ử","u").replace("ữ","u").replace("ự","u")
+                    ?.replace("ị","i").replace("ỉ","i")
+                    ?.replace("à","a").replace("á","a").replace("ã","a").replace("ả","a")
+                    ?.replace("è","e").replace("é","e").replace("ẽ","e").replace("ẻ","e")
+                    ?.replace("ì","i").replace("í","i").replace("ĩ","i")
+                    ?.replace("ò","o").replace("ó","o").replace("õ","o").replace("ỏ","o")
+                    ?.replace("ù","u").replace("ú","u").replace("ũ","u")
+                    ?.replace("ỳ","y").replace("ý","y").replace("ỹ","y")
+                    ?.replace("đ","d")
+                    ?.replace(" ", "-")
+                    ?.replace(Regex("[^a-z0-9-]"), "") ?: continue
+                val items = app.get(
+                    "$mainUrl/api/films/$slug?page=1",
+                    headers = commonHeaders, interceptor = cfInterceptor
+                ).parsedSafe<NguonCApiResponse>()?.items
                 if (!items.isNullOrEmpty()) {
                     result = items.filter { it.slug != movie.slug }
                         .take(20).mapNotNull { parseApiItem(it) }
