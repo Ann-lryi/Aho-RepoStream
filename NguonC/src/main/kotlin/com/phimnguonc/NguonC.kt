@@ -28,7 +28,7 @@ class PhimNguonCProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com(?!/\?__cf)|.*streamc\.xyz|.*amass15\.top|.*hihihoho2\.top"""))
+    private val cfInterceptor = WebViewResolver(Regex(""".*streamc\.xyz|.*amass15\.top|.*hihihoho2\.top"""))
 
 
     private val commonHeaders = mapOf(
@@ -110,7 +110,7 @@ class PhimNguonCProvider : MainAPI() {
         return if (request.data.startsWith(API_PREFIX)) {
             val path  = request.data.removePrefix(API_PREFIX)
             val url   = "$mainUrl/$path?page=$page"
-            val res   = app.get(url, headers = commonHeaders, interceptor = cfInterceptor)
+            val res   = app.get(url, headers = commonHeaders)
                            .parsedSafe<NguonCApiResponse>()
             val items = res?.items?.mapNotNull { parseApiItem(it) } ?: emptyList()
             newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
@@ -121,7 +121,7 @@ class PhimNguonCProvider : MainAPI() {
             val pageInterceptor = com.lagradost.cloudstream3.network.WebViewResolver(
                 Regex(Regex.escape(url))
             )
-            val resp = app.get(url, headers = commonHeaders, interceptor = pageInterceptor)
+            val resp = app.get(url, headers = commonHeaders)
             val doc  = resp.document
             val items = doc.select("table tbody tr").mapNotNull { parseCard(it) }
             newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
@@ -132,7 +132,7 @@ class PhimNguonCProvider : MainAPI() {
         // Try API search first
         val res = try {
             app.get("$mainUrl/api/films?keyword=${URLEncoder.encode(query, "utf-8")}",
-                headers = commonHeaders, interceptor = cfInterceptor)
+                headers = commonHeaders)
                .parsedSafe<NguonCApiResponse>()
         } catch (_: Exception) { null }
         if (!res?.items.isNullOrEmpty())
@@ -142,7 +142,7 @@ class PhimNguonCProvider : MainAPI() {
         val pageInterceptor2 = com.lagradost.cloudstream3.network.WebViewResolver(
             Regex(Regex.escape(searchUrl))
         )
-        val doc = app.get(searchUrl, headers = commonHeaders, interceptor = pageInterceptor2).document
+        val doc = app.get(searchUrl, headers = commonHeaders).document
         return doc.select("table tbody tr").mapNotNull { parseCard(it) }
     }
 
@@ -200,25 +200,18 @@ class PhimNguonCProvider : MainAPI() {
             // Try each genre until we find results
             for (genre in genreItems.take(3)) {
                 // API endpoint: /api/films/{genre-name-slug}?page=1
-                val slug = genre.name
-                    ?.lowercase()
-                    ?.replace("ắ","a").replace("ẳ","a").replace("ặ","a")
-                    ?.replace("ề","e").replace("ể","e").replace("ệ","e")
-                    ?.replace("ống","ong").replace("ộ","o").replace("ổ","o")
-                    ?.replace("ử","u").replace("ữ","u").replace("ự","u")
-                    ?.replace("ị","i").replace("ỉ","i")
-                    ?.replace("à","a").replace("á","a").replace("ã","a").replace("ả","a")
-                    ?.replace("è","e").replace("é","e").replace("ẽ","e").replace("ẻ","e")
-                    ?.replace("ì","i").replace("í","i").replace("ĩ","i")
-                    ?.replace("ò","o").replace("ó","o").replace("õ","o").replace("ỏ","o")
-                    ?.replace("ù","u").replace("ú","u").replace("ũ","u")
-                    ?.replace("ỳ","y").replace("ý","y").replace("ỹ","y")
-                    ?.replace("đ","d")
-                    ?.replace(" ", "-")
-                    ?.replace(Regex("[^a-z0-9-]"), "") ?: continue
+                val rawName = genre.name ?: continue
+                val slug = java.text.Normalizer
+                    .normalize(rawName, java.text.Normalizer.Form.NFD)
+                    .replace(Regex("""\p{InCombiningDiacriticalMarks}+"""), "")
+                    .replace("đ", "d").replace("Đ", "d")
+                    .lowercase()
+                    .replace(" ", "-")
+                    .replace(Regex("[^a-z0-9-]"), "")
+                if (slug.isBlank()) continue
                 val items = app.get(
                     "$mainUrl/api/films/$slug?page=1",
-                    headers = commonHeaders, interceptor = cfInterceptor
+                    headers = commonHeaders
                 ).parsedSafe<NguonCApiResponse>()?.items
                 if (!items.isNullOrEmpty()) {
                     result = items.filter { it.slug != movie.slug }
