@@ -192,16 +192,31 @@ class PhimNguonCProvider : MainAPI() {
         )
 
         // Recommendations: fetch films of same genre using category slug
+        // Take genre items from any group (group name may vary by API response)
         val genreItems = categories.values
-            .find { it.group?.name == "Thể loại" }
-            ?.list ?: emptyList()
-        // Recommendations: use genre.id (already a slug like "hanh-dong")
+            .flatMap { it.list ?: emptyList() }
+            .filter { !it.id.isNullOrBlank() }
+        // Recommendations: convert genre name to slug for API
+        // genre.id is UUID hash, not slug - must use name converted to slug
+        val theLoaiItems = categories.values
+            .find { it.group?.name?.contains("loại", ignoreCase = true) == true }
+            ?.list ?: genreItems.take(5)
+
+        fun nameToSlug(name: String): String =
+            java.text.Normalizer.normalize(name, java.text.Normalizer.Form.NFD)
+                .replace(Regex("""\p{InCombiningDiacriticalMarks}+"""), "")
+                .replace("đ", "d", ignoreCase = true)
+                .lowercase().trim()
+                .replace(" ", "-")
+                .replace(Regex("[^a-z0-9-]"), "")
+
         val recommendations: List<SearchResponse> = try {
             var result: List<SearchResponse> = emptyList()
-            for (genre in genreItems.take(3)) {
-                val genreId = genre.id ?: continue
+            for (genre in theLoaiItems.take(3)) {
+                val slug = nameToSlug(genre.name ?: continue)
+                if (slug.isBlank()) continue
                 val items = app.get(
-                    "$mainUrl/api/films/$genreId?page=1",
+                    "$mainUrl/api/films/$slug?page=1",
                     headers = commonHeaders
                 ).parsedSafe<NguonCApiResponse>()?.items
                 if (!items.isNullOrEmpty()) {
@@ -212,7 +227,6 @@ class PhimNguonCProvider : MainAPI() {
                     break
                 }
             }
-            // Fallback: latest films
             if (result.isEmpty()) {
                 result = app.get(
                     "$mainUrl/api/films/phim-moi-cap-nhat?page=1",
