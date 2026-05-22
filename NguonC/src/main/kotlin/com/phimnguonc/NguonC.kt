@@ -195,29 +195,31 @@ class PhimNguonCProvider : MainAPI() {
         val genreItems = categories.values
             .find { it.group?.name == "Thể loại" }
             ?.list ?: emptyList()
+        // Recommendations: use genre.id (already a slug like "hanh-dong")
         val recommendations: List<SearchResponse> = try {
             var result: List<SearchResponse> = emptyList()
-            // Try each genre until we find results
             for (genre in genreItems.take(3)) {
-                // API endpoint: /api/films/{genre-name-slug}?page=1
-                val rawName = genre.name ?: continue
-                val slug = java.text.Normalizer
-                    .normalize(rawName, java.text.Normalizer.Form.NFD)
-                    .replace(Regex("""\p{InCombiningDiacriticalMarks}+"""), "")
-                    .replace("đ", "d").replace("Đ", "d")
-                    .lowercase()
-                    .replace(" ", "-")
-                    .replace(Regex("[^a-z0-9-]"), "")
-                if (slug.isBlank()) continue
+                val genreId = genre.id ?: continue
                 val items = app.get(
-                    "$mainUrl/api/films/$slug?page=1",
+                    "$mainUrl/api/films/$genreId?page=1",
                     headers = commonHeaders
                 ).parsedSafe<NguonCApiResponse>()?.items
                 if (!items.isNullOrEmpty()) {
-                    result = items.filter { it.slug != movie.slug }
-                        .take(20).mapNotNull { parseApiItem(it) }
+                    result = items
+                        .filter { it.slug != movie.slug }
+                        .take(20)
+                        .mapNotNull { parseApiItem(it) }
                     break
                 }
+            }
+            // Fallback: latest films
+            if (result.isEmpty()) {
+                result = app.get(
+                    "$mainUrl/api/films/phim-moi-cap-nhat?page=1",
+                    headers = commonHeaders
+                ).parsedSafe<NguonCApiResponse>()?.items
+                    ?.filter { it.slug != movie.slug }
+                    ?.take(20)?.mapNotNull { parseApiItem(it) } ?: emptyList()
             }
             result
         } catch (_: Exception) { emptyList() }
