@@ -503,8 +503,9 @@ class PhimNguonCProvider : MainAPI() {
 
     // ── Data classes ──────────────────────────────────────────────────────────
     data class NguonCApiResponse(
-        @JsonProperty("status")     val status:     String?             = null,
-        @JsonProperty("total_page") val total_page: Int?                = null,
+        @JsonProperty("status")     val status:     String?              = null,
+        @JsonProperty("total_page") val total_page: Int?                 = null,
+        @JsonProperty("items")      val items:      List<NguonCApiItem>? = null
     )
     
     data class NguonCApiItem(
