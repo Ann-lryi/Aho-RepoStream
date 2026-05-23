@@ -198,8 +198,17 @@ class PhimNguonCProvider : MainAPI() {
             .filter { !it.id.isNullOrBlank() }
         // Recommendations: convert genre name to slug for API
         // genre.id is UUID hash, not slug - must use name converted to slug
+        // Find genre group - "Thể loại" is key "2" in API
+        // Use group with most genre-like items (not năm/quốc gia/định dạng)
         val theLoaiItems = categories.values
-            .find { it.group?.name?.contains("loại", ignoreCase = true) == true }
+            .filter { cat ->
+                val gname = cat.group?.name ?: ""
+                !gname.contains("ăm") &&      // Năm
+                !gname.contains("gia") &&      // Quốc gia  
+                !gname.contains("nh d") &&     // Định dạng
+                (cat.list?.size ?: 0) >= 2     // Has multiple genres
+            }
+            .maxByOrNull { it.list?.size ?: 0 }
             ?.list ?: genreItems.take(5)
 
         fun nameToSlug(name: String): String {
@@ -494,8 +503,8 @@ class PhimNguonCProvider : MainAPI() {
 
     // ── Data classes ──────────────────────────────────────────────────────────
     data class NguonCApiResponse(
-        @JsonProperty("status") val status: String?             = null,
-        @JsonProperty("items")  val items:  List<NguonCApiItem>? = null
+        @JsonProperty("status")     val status:     String?             = null,
+        @JsonProperty("total_page") val total_page: Int?                = null,
     )
     
     data class NguonCApiItem(
