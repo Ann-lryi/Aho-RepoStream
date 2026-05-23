@@ -231,9 +231,9 @@ class PhimNguonCProvider : MainAPI() {
                 'ụ' to "u", 'ủ' to "u", 'ũ' to "u",
                 'ỳ' to "y", 'ý' to "y", 'ỵ' to "y", 'ỷ' to "y", 'ỹ' to "y",
                 'đ' to "d", 'Đ' to "d",
-                'ư' to "u", 'ướ' to "u",
-                'ơ' to "o", 'ớ' to "o",
-                'Ă' to "a", 'Â' to "a", 'Ê' to "e", 'Ô' to "o", 'Ơ' to "o", 'Ư' to "u" 
+                'ư' to "u", 'ơ' to "o",
+                'Ă' to "a", 'Â' to "a", 'Ê' to "e", 'Ô' to "o", 'Ơ' to "o", 'Ư' to "u",
+                'ớ' to "o", 'ờ' to "o", 'ở' to "o", 'ỡ' to "o", 'ợ' to "o"
             )
             return name.lowercase().trim().map { c ->
                 map[c] ?: if (c in 'a'..'z' || c in '0'..'9') c.toString() else if (c == ' ') "-" else ""
