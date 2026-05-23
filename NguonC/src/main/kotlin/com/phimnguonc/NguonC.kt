@@ -202,23 +202,47 @@ class PhimNguonCProvider : MainAPI() {
             .find { it.group?.name?.contains("loại", ignoreCase = true) == true }
             ?.list ?: genreItems.take(5)
 
-        fun nameToSlug(name: String): String =
-            java.text.Normalizer.normalize(name, java.text.Normalizer.Form.NFD)
-                .replace(Regex("""\p{InCombiningDiacriticalMarks}+"""), "")
-                .replace("đ", "d", ignoreCase = true)
-                .lowercase().trim()
-                .replace(" ", "-")
-                .replace(Regex("[^a-z0-9-]"), "")
+        fun nameToSlug(name: String): String {
+            val map = mapOf(
+                'à' to "a", 'á' to "a", 'â' to "a", 'ã' to "a", 'ä' to "a",
+                'å' to "a", 'ă' to "a", 'ắ' to "a", 'ặ' to "a", 'ằ' to "a",
+                'ẳ' to "a", 'ẵ' to "a", 'ấ' to "a", 'ầ' to "a", 'ẩ' to "a",
+                'ẫ' to "a", 'ậ' to "a", 'ả' to "a", 'ạ' to "a",
+                'è' to "e", 'é' to "e", 'ê' to "e", 'ë' to "e",
+                'ề' to "e", 'ế' to "e", 'ệ' to "e", 'ể' to "e", 'ễ' to "e",
+                'ẹ' to "e", 'ẻ' to "e", 'ẽ' to "e",
+                'ì' to "i", 'í' to "i", 'î' to "i", 'ï' to "i",
+                'ị' to "i", 'ỉ' to "i", 'ĩ' to "i",
+                'ò' to "o", 'ó' to "o", 'ô' to "o", 'õ' to "o", 'ö' to "o",
+                'ồ' to "o", 'ố' to "o", 'ộ' to "o", 'ổ' to "o", 'ỗ' to "o",
+                'ờ' to "o", 'ớ' to "o", 'ợ' to "o", 'ở' to "o", 'ỡ' to "o",
+                'ọ' to "o", 'ỏ' to "o",
+                'ù' to "u", 'ú' to "u", 'û' to "u", 'ü' to "u",
+                'ừ' to "u", 'ứ' to "u", 'ự' to "u", 'ử' to "u", 'ữ' to "u",
+                'ụ' to "u", 'ủ' to "u", 'ũ' to "u",
+                'ỳ' to "y", 'ý' to "y", 'ỵ' to "y", 'ỷ' to "y", 'ỹ' to "y",
+                'đ' to "d", 'Đ' to "d",
+                'ư' to "u", 'ướ' to "u",
+                'ơ' to "o", 'ớ' to "o",
+                'Ă' to "a", 'Â' to "a", 'Ê' to "e", 'Ô' to "o", 'Ơ' to "o", 'Ư' to "u" 
+            )
+            return name.lowercase().trim().map { c ->
+                map[c] ?: if (c in 'a'..'z' || c in '0'..'9') c.toString() else if (c == ' ') "-" else ""
+            }.joinToString("").replace(Regex("-{2,}"), "-").trim('-')
+        }
 
         val recommendations: List<SearchResponse> = try {
             var result: List<SearchResponse> = emptyList()
             for (genre in theLoaiItems.take(3)) {
-                val slug = nameToSlug(genre.name ?: continue)
+                val genreName = genre.name ?: continue
+                val slug = nameToSlug(genreName)
                 if (slug.isBlank()) continue
-                val items = app.get(
-                    "$mainUrl/api/films/$slug?page=1",
-                    headers = commonHeaders
-                ).parsedSafe<NguonCApiResponse>()?.items
+                val items = try {
+                    app.get(
+                        "$mainUrl/api/films/$slug?page=1",
+                        headers = commonHeaders
+                    ).parsedSafe<NguonCApiResponse>()?.items
+                } catch (_: Exception) { null }
                 if (!items.isNullOrEmpty()) {
                     result = items
                         .filter { it.slug != movie.slug }
