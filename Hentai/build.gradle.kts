@@ -22,7 +22,7 @@ cloudstream {
     // You can find a list of available types here:
     // https://recloudstream.github.io/cloudstream/html/app/com.lagradost.cloudstream3/-tv-type/index.html
     tvTypes = listOf("NSFW")
-    iconUrl = "https://watchhentai.net/favicon.ico"
+    iconUrl = "https://hentaiz.cc/favicon.ico"
 
     isCrossPlatform = false
 }

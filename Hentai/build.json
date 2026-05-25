@@ -1,6 +1,6 @@
 {
   "name": "Hentai",
-  "pluginClassName": "com.hentai.WatchHentai",
+  "pluginClassName": "com.hentai.hentaiz",
   "version": 1,
   "requiresResources": false,
   "description": "Vietnamese anime streaming site",
@@ -9,6 +9,6 @@
   "status": 1,
   "tvTypes": ["NSFW"],
   "language": "vi",
-  "iconUrl": "https://watchhentai.ney/favicon.ico"
+  "iconUrl": "https://hentaiz.cc/favicon.ico"
 }
  
