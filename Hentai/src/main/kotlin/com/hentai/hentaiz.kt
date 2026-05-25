@@ -44,10 +44,10 @@ class HentaiZProvider : MainAPI() {
         "genres/yuri" to "Yuri"
     )
 
-    // Hàm giải mã Unicode (như \u003C thành <) và các ký tự escape trong chuỗi JSON
+    // Hàm giải mã Unicode chuẩn xác (nhập xuất ký tự HTML \u003C thành <, \u003E thành >)
     private fun unescapeJson(str: String): String {
         var result = str
-        val unicodeRegex = """\\u([0-9a-fA-F]{4})""".toRegex()
+        val unicodeRegex = "\\\\u([0-9a-fA-F]{4})".toRegex()
         result = unicodeRegex.replace(result) { match ->
             val charCode = match.groupValues[1].toInt(16)
             charCode.toChar().toString()
@@ -138,7 +138,6 @@ class HentaiZProvider : MainAPI() {
             throw ErrorLoadingException("Không thể tìm thấy thông tin tập phim")
         }
 
-        // Bóc tách và giải mã văn bản tránh lỗi hiển thị mã Unicode
         val titleRaw = """\btitle\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"""".toRegex().find(episodeBlock)?.groupValues?.get(1)
             ?: throw ErrorLoadingException("Không tìm thấy tiêu đề")
         val title = unescapeJson(titleRaw)
@@ -288,10 +287,9 @@ class HentaiZProvider : MainAPI() {
         }
     }
 
-    // Hàm bóc tách liên kết thông minh hỗ trợ cả URL tuyệt đối lẫn tương đối
+    // Cơ chế trích xuất liên kết linh hoạt, tự động vá lỗi link tương đối
     private fun extractLinksFromText(text: String, embedDomain: String): List<String> {
         val cleanedText = text.replace("\\/", "/")
-        // Tìm mọi chuỗi nằm trong nháy đơn/nháy kép kết thúc bằng đuôi .m3u8 hoặc .mp4 (kèm tham số nếu có)
         val fileRegex = """["']([^"']+\.(?:m3u8|mp4)[^"']*)["']""".toRegex()
         
         return fileRegex.findAll(cleanedText).map { match ->
@@ -299,7 +297,6 @@ class HentaiZProvider : MainAPI() {
             if (path.startsWith("http")) {
                 path
             } else {
-                // Tự ghép tên miền gốc của iframe nếu liên kết trả về là đường dẫn tương đối (relative path)
                 "$embedDomain/${path.trimStart('/')}"
             }
         }.distinct().toList()
@@ -311,7 +308,7 @@ class HentaiZProvider : MainAPI() {
     )
 
     override suspend fun loadLinks(
-        data:             String, // URL embed gốc: https://x.haiten.org/watch?v=...
+        data:             String, // Embed URL: https://x.haiten.org/watch?v=...
         isCasting:        Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback:         (ExtractorLink) -> Unit
@@ -319,24 +316,36 @@ class HentaiZProvider : MainAPI() {
         var linkFound = false
         val embedDomain = Regex("""https?://[^/]+""").find(data)?.value ?: "https://x.haiten.org"
 
-        // Danh sách các URL dữ liệu cần thử nghiệm tuần tự (Triple-Redundancy)
         val urlsToTry = mutableListOf<String>()
         
-        // 1. SvelteKit __data.json chuẩn
+        // 1. SvelteKit __data.json theo cấu trúc chuẩn
         val dataUrl1 = data.replace("/watch?", "/watch/__data.json?")
         urlsToTry.add(dataUrl1)
         
-        // 2. SvelteKit __data.json dạng tham số query dự phòng
+        // 2. Dự phòng 1: SvelteKit __data.json dạng truy vấn đuôi
         val dataUrl2 = if (data.contains("?")) "$data&__data.json" else "$data?__data.json"
         urlsToTry.add(dataUrl2)
         
-        // 3. Toàn bộ mã HTML tĩnh của iframe
+        // 3. Dự phòng 2: HTML iframe thô
         urlsToTry.add(data)
 
+        // 4. Dự phòng 3: Các API REST nội bộ thường thấy của Bunny Player
+        val videoId = Regex("""[?&]v=([^&]+)""").find(data)?.groupValues?.get(1) ?: ""
+        if (videoId.isNotEmpty()) {
+            urlsToTry.add("$embedDomain/api/video?id=$videoId")
+            urlsToTry.add("$embedDomain/api/watch?v=$videoId")
+            urlsToTry.add("$embedDomain/api/player?v=$videoId")
+            urlsToTry.add("$embedDomain/api/source?v=$videoId")
+            urlsToTry.add("$embedDomain/api/get-link?v=$videoId")
+            urlsToTry.add("$embedDomain/api/get-stream?v=$videoId")
+        }
+
+        // Tạo headers mô phỏng trình duyệt, gửi kèm x-sveltekit-invalidated để bắt buộc trả về JSON
         val headers = mapOf(
             "Referer" to "$mainUrl/",
             "User-Agent" to USER_AGENT,
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,application/json,*/*;q=0.8"
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,application/json,*/*;q=0.8",
+            "x-sveltekit-invalidated" to "1"
         )
 
         for (url in urlsToTry) {
@@ -387,7 +396,7 @@ class HentaiZProvider : MainAPI() {
                     linkFound = true
                 }
                 
-                if (linkFound) break // Dừng thử nghiệm các URL khác nếu đã lấy link thành công
+                if (linkFound) break
             } catch (e: Exception) {
                 e.printStackTrace()
             }
