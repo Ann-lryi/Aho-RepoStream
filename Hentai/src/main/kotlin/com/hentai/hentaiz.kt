@@ -44,16 +44,17 @@ class HentaiZProvider : MainAPI() {
         "genres/yuri" to "Yuri"
     )
 
-    // Hàm giải mã Unicode viết bằng StringBuilder thủ công: Hiệu năng cao, miễn dịch hoàn toàn với lỗi Regex của Kotlin
+    // Bộ giải mã Unicode kép (\\u) và đơn (\u) bằng StringBuilder tốc độ cao, không bị lỗi gạch chéo ngược
     private fun unescapeJson(str: String): String {
+        val cleanedStr = str.replace("\\\\u", "\\u")
         val sb = java.lang.StringBuilder()
         var i = 0
-        while (i < str.length) {
-            val c = str[i]
-            if (c == '\\' && i + 1 < str.length) {
-                val next = str[i + 1]
-                if (next == 'u' && i + 5 < str.length) {
-                    val hex = str.substring(i + 2, i + 6)
+        while (i < cleanedStr.length) {
+            val c = cleanedStr[i]
+            if (c == '\\' && i + 1 < cleanedStr.length) {
+                val next = cleanedStr[i + 1]
+                if (next == 'u' && i + 5 < cleanedStr.length) {
+                    val hex = cleanedStr.substring(i + 2, i + 6)
                     try {
                         val charCode = hex.toInt(16)
                         sb.append(charCode.toChar())
@@ -87,7 +88,7 @@ class HentaiZProvider : MainAPI() {
         val matchResult = episodesBlockRegex.find(html) ?: return emptyList()
         val episodesBlock = matchResult.groupValues[1]
 
-        val episodeRegex = """\{id\s*:\s*"([^"]+)"\s*,\s*title\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"\s*,\s*slug\s*:\s*"([^"]+)"\s*,\s*episodeNumber\s*:\s*(\d+)\s*,\s*duration\s*:\s*[^,]+\s*,\s*posterImage\s*:\s*(?:\{filePath\s*:\s*"([^"]+)"\}|null)""".toRegex()
+        val episodeRegex = """\{id\s*:\s*"([^"]+)"\s*,\s*title\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*slug\s*:\s*"([^"]+)"\s*,\s*episodeNumber\s*:\s*(\d+)\s*,\s*duration\s*:\s*[^,]+\s*,\s*posterImage\s*:\s*(?:\{filePath\s*:\s*"([^"]+)"\}|null)""".toRegex()
         
         return episodeRegex.findAll(episodesBlock).mapNotNull { match ->
             val titleRaw = match.groupValues[2]
@@ -159,14 +160,14 @@ class HentaiZProvider : MainAPI() {
             throw ErrorLoadingException("Không thể tìm thấy thông tin tập phim")
         }
 
-        val titleRaw = """\btitle\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"""".toRegex().find(episodeBlock)?.groupValues?.get(1)
+        val titleRaw = """\btitle\s*:\s*"((?:[^"\\]|\\.)*)"""".toRegex().find(episodeBlock)?.groupValues?.get(1)
             ?: throw ErrorLoadingException("Không tìm thấy tiêu đề")
         val title = unescapeJson(titleRaw)
 
-        val descriptionRaw = """\bdescription\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"""".toRegex().find(episodeBlock)?.groupValues?.get(1) ?: ""
+        val descriptionRaw = """\bdescription\s*:\s*"((?:[^"\\]|\\.)*)"""".toRegex().find(episodeBlock)?.groupValues?.get(1) ?: ""
         val description = unescapeJson(descriptionRaw)
 
-        val embedUrl = """\bembedUrl\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"""".toRegex().find(episodeBlock)?.groupValues?.get(1)
+        val embedUrl = """\bembedUrl\s*:\s*"((?:[^"\\]|\\.)*)"""".toRegex().find(episodeBlock)?.groupValues?.get(1)
             ?: throw ErrorLoadingException("Không tìm thấy link embed")
         val releaseYear = """\breleaseYear\s*:\s*(\d+)""".toRegex().find(episodeBlock)?.groupValues?.get(1)?.toIntOrNull()
 
@@ -174,7 +175,7 @@ class HentaiZProvider : MainAPI() {
         val posterPath = if (posterParam.isNotEmpty()) URLDecoder.decode(posterParam, "UTF-8") else null
         val posterUrl = if (posterPath != null) "https://storage.haiten.org$posterPath" else null
 
-        val genreRegex = """genre:\{name:"([^"]+)"""".toRegex()
+        val genreRegex = """genre:\{name:"((?:[^"\\]|\\.)*)"""".toRegex()
         val genres = genreRegex.findAll(episodeBlock).map { unescapeJson(it.groupValues[1]) }.toList()
 
         val beautifulPlot = buildBeautifulDescription(title, description, genres, releaseYear)
@@ -308,28 +309,84 @@ class HentaiZProvider : MainAPI() {
         }
     }
 
-    // Cơ chế bóc tách link thông minh tự động vá đường dẫn tương đối (relative path)
-    private fun extractLinksFromText(text: String, embedDomain: String): List<String> {
-        val cleanedText = text.replace("\\/", "/")
-        val fileRegex = """["']([^"']+\.(?:m3u8|mp4)[^"']*)["']""".toRegex()
+    // Cơ chế phân tích SvelteKit URL, tích hợp chuẩn tham số x-sveltekit-invalidated=001 bắt buộc
+    private fun getSvelteKitDataUrl(url: String): List<String> {
+        val result = mutableListOf<String>()
+        val cleanUrl = url.substringBefore("?").trimEnd('/')
         
-        return fileRegex.findAll(cleanedText).map { match ->
-            val path = match.groupValues[1].trim()
-            if (path.startsWith("http")) {
-                path
-            } else {
-                "$embedDomain/${path.trimStart('/')}"
-            }
-        }.distinct().toList()
+        // Thử nghiệm hai biến thể phân dải x-sveltekit-invalidated phổ biến để đảm bảo luôn nhận được JSON thô
+        result.add("$cleanUrl/__data.json?x-sveltekit-invalidated=001")
+        result.add("$cleanUrl/__data.json?x-sveltekit-invalidated=100")
+        
+        if (url.contains("/watch/")) {
+            val slug = url.substringAfter("/watch/").substringBefore("?")
+            result.add("$mainUrl/watch/$slug/__data.json?x-sveltekit-invalidated=001")
+            result.add("$mainUrl/watch/$slug/__data.json?x-sveltekit-invalidated=100")
+        }
+        
+        return result.distinct()
     }
 
-    data class StreamData(
-        @JsonProperty("sUb") val sUb: String? = null,
-        @JsonProperty("hD")  val hD:  String? = null
-    )
+    // Quét liên kết: hỗ trợ m3u8 trực tiếp và phân rã các server CDN trong mảng phẳng SvelteKit
+    private fun extractLinksFromText(text: String, embedDomain: String, videoId: String): List<String> {
+        val cleanedText = text.replace("\\/", "/")
+        val results = mutableListOf<String>()
+
+        // 1. Quét tệp luồng phát có sẵn
+        val fileRegex = """["']([^"']+\.(?:m3u8|mp4)[^"']*)["']""".toRegex()
+        fileRegex.findAll(cleanedText).forEach { match ->
+            val path = match.groupValues[1].trim()
+            val url = if (path.startsWith("http")) path else "$embedDomain/${path.trimStart('/')}"
+            results.add(url)
+        }
+
+        // 2. Dự phòng sUb/hD
+        val sUbRegex = """"(?:sUb|s_ub|sub)"\s*:\s*"([^"]+)"""".toRegex()
+        val hDRegex = """"(?:hD|h_d|hd)"\s*:\s*"([^"]+)"""".toRegex()
+        val sUbPath = sUbRegex.find(cleanedText)?.groupValues?.get(1)
+        val hDPath = hDRegex.find(cleanedText)?.groupValues?.get(1)
+        val chosenPath = sUbPath ?: hDPath
+
+        if (!chosenPath.isNullOrBlank() && !chosenPath.contains(".m3u8")) {
+            results.add("$embedDomain/${chosenPath.trimStart('/')}.m3u8")
+        }
+
+        // 3. Sử dụng tên miền CDN xuất hiện trong JSON (như c2.animez.top) kết hợp với ID video thô để dựng luồng phát
+        if (videoId.isNotEmpty()) {
+            val domainRegex = """([a-zA-Z0-9-]+\.[a-zA-Z0-9.-]+)""".toRegex()
+            val domains = domainRegex.findAll(cleanedText)
+                .map { it.groupValues[1] }
+                .filter { dom ->
+                    dom.contains(".") && 
+                    !dom.contains("/") && 
+                    !dom.contains("svelte") && 
+                    !dom.contains("google") && 
+                    !dom.contains("janitor") && 
+                    !dom.contains("clammy") && 
+                    !dom.contains("badland") &&
+                    !dom.contains("haiten.org") &&
+                    !dom.contains("mimix.cc")
+                }
+                .distinct()
+                .toList()
+
+            for (dom in domains) {
+                val cleanDom = dom.trim().trimEnd('.')
+                // Tạo toàn bộ biến thể đường dẫn HLS m3u8 có thể có trên máy chủ CDN đích
+                results.add("https://$cleanDom/$videoId/playlist.m3u8")
+                results.add("https://$cleanDom/$videoId/master.m3u8")
+                results.add("https://$cleanDom/$videoId/index.m3u8")
+                results.add("https://$cleanDom/hls/$videoId/playlist.m3u8")
+                results.add("https://$cleanDom/hls/$videoId/master.m3u8")
+                results.add("https://$cleanDom/hls/$videoId/index.m3u8")
+            }
+        }
+
+        return results.distinct().toList()
+    }
 
     override suspend fun loadLinks(
-        data:             String, // Embed URL: https://x.haiten.org/watch?v=...
+        data:             String, // Embed URL
         isCasting:        Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback:         (ExtractorLink) -> Unit
@@ -337,21 +394,15 @@ class HentaiZProvider : MainAPI() {
         var linkFound = false
         val embedDomain = Regex("""https?://[^/]+""").find(data)?.value ?: "https://x.haiten.org"
 
+        // Trích xuất mã ID UUID của video phát
+        val videoId = Regex("""([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})""", RegexOption.IGNORE_CASE)
+            .find(data)?.groupValues?.get(0) ?: ""
+
         val urlsToTry = mutableListOf<String>()
         
-        // 1. SvelteKit __data.json theo chuẩn SvelteKit
-        val dataUrl1 = data.replace("/watch?", "/watch/__data.json?")
-        urlsToTry.add(dataUrl1)
-        
-        // 2. Dự phòng 1: SvelteKit __data.json dạng truy vấn đuôi
-        val dataUrl2 = if (data.contains("?")) "$data&__data.json" else "$data?__data.json"
-        urlsToTry.add(dataUrl2)
-        
-        // 3. Dự phòng 2: HTML iframe thô
+        urlsToTry.addAll(getSvelteKitDataUrl(data))
         urlsToTry.add(data)
 
-        // 4. Dự phòng 3: Các API REST nội bộ thường thấy của Bunny Player
-        val videoId = Regex("""[?&]v=([^&]+)""").find(data)?.groupValues?.get(1) ?: ""
         if (videoId.isNotEmpty()) {
             urlsToTry.add("$embedDomain/api/video?id=$videoId")
             urlsToTry.add("$embedDomain/api/watch?v=$videoId")
@@ -361,7 +412,6 @@ class HentaiZProvider : MainAPI() {
             urlsToTry.add("$embedDomain/api/get-stream?v=$videoId")
         }
 
-        // Đặt Referer chính chủ là "https://x.haiten.org/" để đánh lừa máy chủ Bunny Player
         val svelteHeaders = mapOf(
             "Referer" to "$embedDomain/",
             "User-Agent" to USER_AGENT,
@@ -377,7 +427,6 @@ class HentaiZProvider : MainAPI() {
 
         for (url in urlsToTry) {
             try {
-                // Thử gửi request với cấu hình svelte header trước, nếu lỗi thì chuyển sang fallback header
                 val response = try {
                     app.get(url, headers = svelteHeaders)
                 } catch (_: Exception) {
@@ -387,7 +436,7 @@ class HentaiZProvider : MainAPI() {
                 if (response.code != 200) continue
                 
                 val text = response.text
-                val extractedLinks = extractLinksFromText(text, embedDomain)
+                val extractedLinks = extractLinksFromText(text, embedDomain, videoId)
                 
                 for (streamUrl in extractedLinks) {
                     val isM3u8 = streamUrl.contains(".m3u8")
