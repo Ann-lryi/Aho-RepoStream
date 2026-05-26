@@ -44,21 +44,42 @@ class HentaiZProvider : MainAPI() {
         "genres/yuri" to "Yuri"
     )
 
-    // Hàm giải mã Unicode chuẩn xác (nhập xuất ký tự HTML \u003C thành <, \u003E thành >)
+    // Hàm giải mã Unicode viết bằng StringBuilder thủ công: Hiệu năng cao, miễn dịch hoàn toàn với lỗi Regex của Kotlin
     private fun unescapeJson(str: String): String {
-        var result = str
-        val unicodeRegex = "\\\\u([0-9a-fA-F]{4})".toRegex()
-        result = unicodeRegex.replace(result) { match ->
-            val charCode = match.groupValues[1].toInt(16)
-            charCode.toChar().toString()
+        val sb = java.lang.StringBuilder()
+        var i = 0
+        while (i < str.length) {
+            val c = str[i]
+            if (c == '\\' && i + 1 < str.length) {
+                val next = str[i + 1]
+                if (next == 'u' && i + 5 < str.length) {
+                    val hex = str.substring(i + 2, i + 6)
+                    try {
+                        val charCode = hex.toInt(16)
+                        sb.append(charCode.toChar())
+                        i += 6
+                        continue
+                    } catch (_: Exception) {}
+                } else {
+                    val escaped = when (next) {
+                        'n' -> '\n'
+                        'r' -> '\r'
+                        't' -> '\t'
+                        '\"' -> '\"'
+                        '\'' -> '\''
+                        '/' -> '/'
+                        '\\' -> '\\'
+                        else -> next
+                    }
+                    sb.append(escaped)
+                    i += 2
+                    continue
+                }
+            }
+            sb.append(c)
+            i++
         }
-        return result
-            .replace("\\\"", "\"")
-            .replace("\\/", "/")
-            .replace("\\\\", "\\")
-            .replace("\\n", "\n")
-            .replace("\\r", "\r")
-            .replace("\\t", "\t")
+        return sb.toString()
     }
 
     private fun parseEpisodesFromHtml(html: String): List<SearchResponse> {
@@ -287,7 +308,7 @@ class HentaiZProvider : MainAPI() {
         }
     }
 
-    // Cơ chế trích xuất liên kết linh hoạt, tự động vá lỗi link tương đối
+    // Cơ chế bóc tách link thông minh tự động vá đường dẫn tương đối (relative path)
     private fun extractLinksFromText(text: String, embedDomain: String): List<String> {
         val cleanedText = text.replace("\\/", "/")
         val fileRegex = """["']([^"']+\.(?:m3u8|mp4)[^"']*)["']""".toRegex()
@@ -318,7 +339,7 @@ class HentaiZProvider : MainAPI() {
 
         val urlsToTry = mutableListOf<String>()
         
-        // 1. SvelteKit __data.json theo cấu trúc chuẩn
+        // 1. SvelteKit __data.json theo chuẩn SvelteKit
         val dataUrl1 = data.replace("/watch?", "/watch/__data.json?")
         urlsToTry.add(dataUrl1)
         
@@ -340,17 +361,29 @@ class HentaiZProvider : MainAPI() {
             urlsToTry.add("$embedDomain/api/get-stream?v=$videoId")
         }
 
-        // Tạo headers mô phỏng trình duyệt, gửi kèm x-sveltekit-invalidated để bắt buộc trả về JSON
-        val headers = mapOf(
-            "Referer" to "$mainUrl/",
+        // Đặt Referer chính chủ là "https://x.haiten.org/" để đánh lừa máy chủ Bunny Player
+        val svelteHeaders = mapOf(
+            "Referer" to "$embedDomain/",
             "User-Agent" to USER_AGENT,
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,application/json,*/*;q=0.8",
+            "Accept" to "*/*",
             "x-sveltekit-invalidated" to "1"
+        )
+
+        val fallbackHeaders = mapOf(
+            "Referer" to "$embedDomain/",
+            "User-Agent" to USER_AGENT,
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,application/json,*/*;q=0.8"
         )
 
         for (url in urlsToTry) {
             try {
-                val response = app.get(url, headers = headers)
+                // Thử gửi request với cấu hình svelte header trước, nếu lỗi thì chuyển sang fallback header
+                val response = try {
+                    app.get(url, headers = svelteHeaders)
+                } catch (_: Exception) {
+                    app.get(url, headers = fallbackHeaders)
+                }
+                
                 if (response.code != 200) continue
                 
                 val text = response.text
