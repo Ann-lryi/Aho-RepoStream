@@ -445,25 +445,63 @@ class PhimNguonCProvider : MainAPI() {
             embedEntries.map { (serverName, url) ->
                 async {
                     // Case 1: Direct m3u8 URL (format mới từ API)
+                    // Cần fetch cookies từ embed page và proxy qua local server
                     if (url.contains(".m3u8")) {
+                        // Extract hash từ m3u8 URL để tạo embed URL
+                        val hash = Regex("""/([^/]+)/hls\.m3u8""").find(url)?.groupValues?.get(1)
+                        val embedPageUrl = if (hash != null) {
+                            "https://embed1.streamc.xyz/embed.php?hash=$hash"
+                        } else null
+
+                        // Fetch embed page trước để lấy cookies (bypass Cloudflare)
+                        var cookies = ""
+                        if (embedPageUrl != null) {
+                            try {
+                                val embedRes = app.get(
+                                    embedPageUrl,
+                                    interceptor = cfInterceptor,
+                                    headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT)
+                                )
+                                cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+                            } catch (_: Exception) {}
+                        }
+
                         val m3u8Domain = Regex("""https?://[^/]+""").find(url)?.value ?: ""
                         try {
-                            // M3U8 từ sing.phimmoi.net có thể cần referer đúng
+                            // Fetch m3u8 trong plugin với cookies
                             val m3u8Headers = mapOf(
                                 "User-Agent"      to USER_AGENT,
-                                "Referer"         to "https://phim.nguonc.com/",
+                                "Referer"         to (embedPageUrl ?: "https://phim.nguonc.com/"),
                                 "Origin"          to m3u8Domain,
+                                "Cookie"          to cookies,
                                 "Accept"          to "*/*",
                                 "Accept-Language" to "vi-VN,vi;q=0.9"
                             )
+                            val m3u8Raw = app.get(url, interceptor = cfInterceptor, headers = m3u8Headers).text
+                            val finalM3u8Raw = if (!m3u8Raw.contains("#EXTM3U")) {
+                                // Thử fallback không có interceptor
+                                val m3u8Raw2 = app.get(url, headers = m3u8Headers).text
+                                if (!m3u8Raw2.contains("#EXTM3U")) return@async
+                                m3u8Raw2
+                            } else m3u8Raw
+
+                            // Proxy qua local server
+                            val server = NguonCProxyServer("", embedPageUrl ?: url)
+                            server.start()
+                            activeServers.add(server)
+
+                            val proxyBase      = "http://127.0.0.1:${server.port}"
+                            val rewrittenM3U8  = rewriteM3U8(finalM3u8Raw, proxyBase)
+                            server.setM3U8(rewrittenM3U8)
+
                             callback(newExtractorLink(
                                 source = "NguonC",
                                 name   = serverName,
-                                url    = url,
+                                url    = "$proxyBase/stream.m3u8",
                                 type   = ExtractorLinkType.M3U8
                             ) {
                                 this.quality = Qualities.P1080.value
-                                this.headers = m3u8Headers
+                                this.headers = mapOf("User-Agent" to USER_AGENT)
                             })
                             linkFound = true
                         } catch (_: Exception) {}
