@@ -444,16 +444,14 @@ class PhimNguonCProvider : MainAPI() {
         coroutineScope {
             embedEntries.map { (serverName, url) ->
                 async {
-                    // Case 1: Direct m3u8 URL (format mới từ API)
-                    // Cần fetch cookies từ embed page và proxy qua local server
-                    if (url.contains(".m3u8")) {
-                        // Extract hash từ m3u8 URL để tạo embed URL
+                    // Case 1: Direct m3u8 URL from sing.phimmoi.net (format from API)
+                    if (url.contains("sing.phimmoi.net") && url.contains(".m3u8")) {
                         val hash = Regex("""/([^/]+)/hls\.m3u8""").find(url)?.groupValues?.get(1)
                         val embedPageUrl = if (hash != null) {
                             "https://embed1.streamc.xyz/embed.php?hash=$hash"
                         } else null
 
-                        // Fetch embed page trước để lấy cookies (bypass Cloudflare)
+                        // Fetch embed page for cookies
                         var cookies = ""
                         if (embedPageUrl != null) {
                             try {
@@ -467,113 +465,108 @@ class PhimNguonCProvider : MainAPI() {
                         }
 
                         val m3u8Domain = Regex("""https?://[^/]+""").find(url)?.value ?: ""
-                        try {
-                            // Fetch m3u8 trong plugin với cookies
-                            val m3u8Headers = mapOf(
-                                "User-Agent"      to USER_AGENT,
-                                "Referer"         to (embedPageUrl ?: "https://phim.nguonc.com/"),
-                                "Origin"          to m3u8Domain,
-                                "Cookie"          to cookies,
-                                "Accept"          to "*/*",
-                                "Accept-Language" to "vi-VN,vi;q=0.9"
-                            )
-                            val m3u8Raw = app.get(url, interceptor = cfInterceptor, headers = m3u8Headers).text
-                            val finalM3u8Raw = if (!m3u8Raw.contains("#EXTM3U")) {
-                                // Thử fallback không có interceptor
-                                val m3u8Raw2 = app.get(url, headers = m3u8Headers).text
-                                if (!m3u8Raw2.contains("#EXTM3U")) return@async
-                                m3u8Raw2
-                            } else m3u8Raw
-
-                            // Proxy qua local server
-                            val server = NguonCProxyServer("", embedPageUrl ?: url)
-                            server.start()
-                            activeServers.add(server)
-
-                            val proxyBase      = "http://127.0.0.1:${server.port}"
-                            val rewrittenM3U8  = rewriteM3U8(finalM3u8Raw, proxyBase)
-                            server.setM3U8(rewrittenM3U8)
-
-                            callback(newExtractorLink(
-                                source = "NguonC",
-                                name   = serverName,
-                                url    = "$proxyBase/stream.m3u8",
-                                type   = ExtractorLinkType.M3U8
-                            ) {
-                                this.quality = Qualities.P1080.value
-                                this.headers = mapOf("User-Agent" to USER_AGENT)
-                            })
-                            linkFound = true
-                        } catch (_: Exception) {}
-                        return@async
-                    }
-
-                    // Case 2: Embed URL (format cũ - cần parse thêm)
-                    // Sử dụng cfInterceptor để bypass Cloudflare
-                    val embedDomain = Regex("""https?://[^/]+""").find(url)?.value ?: return@async
-                    try {
-                        val embedRes = app.get(
-                            url,
-                            interceptor = cfInterceptor,
-                            headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT)
-                        )
-                        val html    = embedRes.text
-                        val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
-
-                        val obfMatch = Regex("""data-obf\s*=\s*["']([A-Za-z0-9+/=]+)["']""").find(html)
-                            ?: return@async
-
-                        val jsonData   = String(Base64.decode(obfMatch.groupValues[1], Base64.DEFAULT))
-                        val streamData = AppUtils.parseJson<StreamData>(jsonData)
-
-                        val fetchHdr = mapOf(
+                        val m3u8Headers = mapOf(
                             "User-Agent"      to USER_AGENT,
-                            "Referer"         to url,
-                            "Origin"          to embedDomain,
+                            "Referer"         to (embedPageUrl ?: "https://phim.nguonc.com/"),
+                            "Origin"          to m3u8Domain,
                             "Cookie"          to cookies,
                             "Accept"          to "*/*",
                             "Accept-Language" to "vi-VN,vi;q=0.9"
                         )
 
-                    suspend fun serveStream(m3u8Url: String, serverName: String) {
                         try {
-                            val m3u8Domain = Regex("""https?://[^/]+""").find(m3u8Url)?.value ?: embedDomain
-                            val streamHdr = mapOf(
+                            val m3u8Raw = app.get(url, headers = m3u8Headers).text
+                            if (m3u8Raw.contains("#EXTM3U")) {
+                                val server = NguonCProxyServer("", embedPageUrl ?: url)
+                                server.start()
+                                activeServers.add(server)
+
+                                val proxyBase     = "http://127.0.0.1:${server.port}"
+                                val rewrittenM3U8 = rewriteM3U8(m3u8Raw, proxyBase)
+                                server.setM3U8(rewrittenM3U8)
+
+                                callback(newExtractorLink(
+                                    source = "NguonC",
+                                    name   = serverName,
+                                    url    = "$proxyBase/stream.m3u8",
+                                    type   = ExtractorLinkType.M3U8
+                                ) {
+                                    this.quality = Qualities.P1080.value
+                                    this.headers = mapOf("User-Agent" to USER_AGENT)
+                                })
+                                linkFound = true
+                                return@async
+                            }
+                        } catch (_: Exception) {}
+                    }
+
+                    // Case 2: Embed URL - Parse jwplayer config from page
+                    val embedDomain = Regex("""https?://[^/]+""").find(url)?.value ?: return@async
+                    try {
+                        val embedRes = app.get(
+                            url,
+                            interceptor = cfInterceptor,
+                            headers = mapOf(
+                                "Referer" to "$mainUrl/",
+                                "User-Agent" to USER_AGENT
+                            )
+                        )
+                        val html = embedRes.text
+                        val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+
+                        // Parse jwplayer config - looking for "file": "..." pattern
+                        val jwplayerMatch = Regex("""jwplayer\s*\([^{]*\{[^}]*?"file"\s*:\s*["']([^"']+)["']""", RegexOption.DOT_MATCHES_ALL)
+                            .find(html)
+                            ?: Regex(""""file"\s*:\s*"([^"]+\.m3u8[^"]*)""""").find(html)
+                            ?: Regex(""""sources"\s*:\s*\[\s*\{[^}]*?"file"\s*:\s*["']([^"']+)["']""", RegexOption.DOT_MATCHES_ALL)
+                            .find(html)
+                            ?: Regex(""""sources"\s*:\s*\[\s*\{[^}]*?"file"\s*:\s*"([^"]+)""""").find(html)
+
+                        var m3u8Url = jwplayerMatch?.groupValues?.getOrNull(1)
+                            ?.replace("\\/", "/")
+                            ?.replace("""\""", "")
+                            ?: ""
+
+                        // If URL is relative, prepend domain
+                        if (m3u8Url.isNotEmpty() && !m3u8Url.startsWith("http")) {
+                            m3u8Url = "$embedDomain/$m3u8Url"
+                        }
+
+                        if (m3u8Url.isNotEmpty() && m3u8Url.contains(".m3u")) {
+                            val m3u8Headers = mapOf(
                                 "User-Agent"      to USER_AGENT,
                                 "Referer"         to url,
-                                "Origin"          to m3u8Domain,
+                                "Origin"          to embedDomain,
                                 "Cookie"          to cookies,
                                 "Accept"          to "*/*",
                                 "Accept-Language" to "vi-VN,vi;q=0.9"
                             )
-                            // Dùng interceptor để bypass Cloudflare cho m3u8
-                            val m3u8Raw = app.get(m3u8Url, interceptor = cfInterceptor, headers = streamHdr).text
-                            if (!m3u8Raw.contains("#EXTM3U")) return
 
-                            val server = NguonCProxyServer("", url)
-                            server.start()
-                            activeServers.add(server)
+                            val m3u8Raw = try {
+                                val resp = app.get(m3u8Url, headers = m3u8Headers)
+                                if (resp.text.contains("#EXTM3U")) resp.text else ""
+                            } catch (_: Exception) { "" }
 
-                            val proxyBase     = "http://127.0.0.1:${server.port}"
-                            val rewrittenM3U8 = rewriteM3U8(m3u8Raw, proxyBase)
-                            server.setM3U8(rewrittenM3U8)
+                            if (m3u8Raw.isNotEmpty()) {
+                                val server = NguonCProxyServer("", url)
+                                server.start()
+                                activeServers.add(server)
 
-                            callback(newExtractorLink(
-                                source = "NguonC",
-                                name   = serverName,
-                                url    = "$proxyBase/stream.m3u8",
-                                type   = ExtractorLinkType.M3U8
-                            ) {
-                                this.quality = Qualities.P1080.value
-                                this.headers = mapOf("User-Agent" to USER_AGENT)
-                            })
-                            linkFound = true
-                        } catch (_: Exception) {}
-                    }
+                                val proxyBase     = "http://127.0.0.1:${server.port}"
+                                val rewrittenM3U8 = rewriteM3U8(m3u8Raw, proxyBase)
+                                server.setM3U8(rewrittenM3U8)
 
-                        val m3u8Path = streamData.sUb ?: streamData.hD
-                        if (!m3u8Path.isNullOrBlank()) {
-                            serveStream("$embedDomain/$m3u8Path.m3u8", serverName)
+                                callback(newExtractorLink(
+                                    source = "NguonC",
+                                    name   = serverName,
+                                    url    = "$proxyBase/stream.m3u8",
+                                    type   = ExtractorLinkType.M3U8
+                                ) {
+                                    this.quality = Qualities.P1080.value
+                                    this.headers = mapOf("User-Agent" to USER_AGENT)
+                                })
+                                linkFound = true
+                            }
                         }
 
                     } catch (e: Exception) {
