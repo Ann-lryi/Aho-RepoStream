@@ -515,17 +515,16 @@ class PhimNguonCProvider : MainAPI() {
                         val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
                         // Parse jwplayer config - looking for "file": "..." pattern
-                        val jwplayerMatch = Regex("""jwplayer\s*\([^{]*\{[^}]*?"file"\s*:\s*["']([^"']+)["']""", RegexOption.DOT_MATCHES_ALL)
+                        val jwplayerMatch = Regex("""jwplayer\s*\([^{]*\{[^}]*?file\s*:\s*[\""']([^\""']+)[\""']""", RegexOption.DOT_MATCHES_ALL)
                             .find(html)
-                            ?: Regex(""""file"\s*:\s*"([^"]+\.m3u8[^"]*)""""").find(html)
-                            ?: Regex(""""sources"\s*:\s*\[\s*\{[^}]*?"file"\s*:\s*["']([^"']+)["']""", RegexOption.DOT_MATCHES_ALL)
+                            ?: Regex("""file\s*:\s*"([^"]*\.m3u8[^"]*)"""").find(html)
+                            ?: Regex("""sources\s*:\s*\[\s*\{[^}]*?file\s*:\s*[\""']([^\""']+)[\""']""", RegexOption.DOT_MATCHES_ALL)
                             .find(html)
-                            ?: Regex(""""sources"\s*:\s*\[\s*\{[^}]*?"file"\s*:\s*"([^"]+)""""").find(html)
 
                         var m3u8Url = jwplayerMatch?.groupValues?.getOrNull(1)
                             ?.replace("\\/", "/")
-                            ?.replace("""\""", "")
-                            ?: ""
+                            ?.replace("""\"""", "")
+                            ?.trim() ?: ""
 
                         // If URL is relative, prepend domain
                         if (m3u8Url.isNotEmpty() && !m3u8Url.startsWith("http")) {
