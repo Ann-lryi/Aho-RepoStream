@@ -28,7 +28,7 @@ class PhimNguonCProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    private val cfInterceptor = WebViewResolver(Regex(""".*streamc\.xyz|.*amass15\.top|.*hihihoho2\.top"""))
+    private val cfInterceptor = WebViewResolver(Regex(""".*streamc\.xyz|.*amass15\.top|.*hihihoho2\.top|.*phimmoi\.net"""))
 
 
     private val commonHeaders = mapOf(
@@ -446,7 +446,16 @@ class PhimNguonCProvider : MainAPI() {
                 async {
                     // Case 1: Direct m3u8 URL (format mới từ API)
                     if (url.contains(".m3u8")) {
+                        val m3u8Domain = Regex("""https?://[^/]+""").find(url)?.value ?: ""
                         try {
+                            // M3U8 từ sing.phimmoi.net có thể cần referer đúng
+                            val m3u8Headers = mapOf(
+                                "User-Agent"      to USER_AGENT,
+                                "Referer"         to "https://phim.nguonc.com/",
+                                "Origin"          to m3u8Domain,
+                                "Accept"          to "*/*",
+                                "Accept-Language" to "vi-VN,vi;q=0.9"
+                            )
                             callback(newExtractorLink(
                                 source = "NguonC",
                                 name   = serverName,
@@ -454,10 +463,7 @@ class PhimNguonCProvider : MainAPI() {
                                 type   = ExtractorLinkType.M3U8
                             ) {
                                 this.quality = Qualities.P1080.value
-                                this.headers = mapOf(
-                                    "User-Agent" to USER_AGENT,
-                                    "Referer"   to "https://phim.nguonc.com/"
-                                )
+                                this.headers = m3u8Headers
                             })
                             linkFound = true
                         } catch (_: Exception) {}
@@ -465,10 +471,12 @@ class PhimNguonCProvider : MainAPI() {
                     }
 
                     // Case 2: Embed URL (format cũ - cần parse thêm)
+                    // Sử dụng cfInterceptor để bypass Cloudflare
                     val embedDomain = Regex("""https?://[^/]+""").find(url)?.value ?: return@async
                     try {
                         val embedRes = app.get(
                             url,
+                            interceptor = cfInterceptor,
                             headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT)
                         )
                         val html    = embedRes.text
@@ -491,7 +499,17 @@ class PhimNguonCProvider : MainAPI() {
 
                     suspend fun serveStream(m3u8Url: String, serverName: String) {
                         try {
-                            val m3u8Raw = app.get(m3u8Url, headers = fetchHdr).text
+                            val m3u8Domain = Regex("""https?://[^/]+""").find(m3u8Url)?.value ?: embedDomain
+                            val streamHdr = mapOf(
+                                "User-Agent"      to USER_AGENT,
+                                "Referer"         to url,
+                                "Origin"          to m3u8Domain,
+                                "Cookie"          to cookies,
+                                "Accept"          to "*/*",
+                                "Accept-Language" to "vi-VN,vi;q=0.9"
+                            )
+                            // Dùng interceptor để bypass Cloudflare cho m3u8
+                            val m3u8Raw = app.get(m3u8Url, interceptor = cfInterceptor, headers = streamHdr).text
                             if (!m3u8Raw.contains("#EXTM3U")) return
 
                             val server = NguonCProxyServer("", url)
