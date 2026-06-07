@@ -443,41 +443,118 @@ class PhimNguonCProvider : MainAPI() {
                         }
                     }
                     
-                    // Fallback: Nếu là URL .m3u8 hoặc .m3u9 trực tiếp
-                    if (targetUrl.contains(".m3u8") || targetUrl.contains(".m3u9")) {
-                        try {
-                            val m3u8Response = app.get(
-                                targetUrl,
-                                interceptor = cfInterceptor,
-                                headers = mapOf(
-                                    "Referer" to "$mainUrl/",
-                                    "User-Agent" to USER_AGENT
-                                )
+                    // Case 2: Embed URL - Parse m3u8 URL and handle encrypted stream
+                    val embedDomain = Regex("""https?://[^/]+""").find(url)?.value ?: return@async
+                    try {
+                        val embedRes = app.get(
+                            url,
+                            interceptor = cfInterceptor,
+                            headers = mapOf(
+                                "Referer" to "$mainUrl/",
+                                "User-Agent" to USER_AGENT
                             )
-                            
-                            val m3u8Content = m3u8Response.text
-                            
-                            if (m3u8Content.contains("#EXTM3U") && !m3u8Content.contains("#ENC-AESGCM")) {
-                                val server = NguonCProxyServer("", targetUrl)
-                                server.start()
-                                activeServers.add(server)
-                                val proxyBase = "http://127.0.0.1:${server.port}"
-                                val rewrittenM3U8 = rewriteM3U8(m3u8Content, proxyBase)
-                                server.setM3U8(rewrittenM3U8)
-                                
-                                callback(newExtractorLink(
-                                    source = "NguonC",
-                                    name   = serverName,
-                                    url    = "$proxyBase/stream.m3u8",
-                                    type   = ExtractorLinkType.M3U8
-                                ) {
-                                    this.quality = Qualities.P1080.value
-                                    this.headers = mapOf("User-Agent" to USER_AGENT)
-                                })
-                                linkFound = true
-                                return@async
+                        )
+                        val html = embedRes.text
+                        val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+
+                        // Try to find m3u8 URL in page
+                        // Pattern 1: jwplayer with file config
+                        var m3u8Url = Regex("""jwplayer\s*\(\s*\{[^}]*?file\s*:\s*["']([^"']+)["']""", RegexOption.DOT_MATCHES_ALL)
+                            .find(html)?.groupValues?.getOrNull(1)
+                            ?.replace("\\/", "/")
+                            ?.trim()
+                            ?: ""
+
+                        // Pattern 2: sources array
+                        if (m3u8Url.isEmpty()) {
+                            m3u8Url = Regex("""sources\s*:\s*\[\s*\{[^}]*?file\s*:\s*["']([^"']+)["']""", RegexOption.DOT_MATCHES_ALL)
+                                .find(html)?.groupValues?.getOrNull(1)
+                                ?.replace("\\/", "/")
+                                ?.trim() ?: ""
+                        }
+
+                        // Pattern 3: data-m3u8 attribute
+                        if (m3u8Url.isEmpty()) {
+                            m3u8Url = Regex("""data-m3u8\s*=\s*["']([^"']+)["']""")
+                                .find(html)?.groupValues?.getOrNull(1) ?: ""
+                        }
+
+                        // If URL is blob, try to extract actual m3u8 URL from page
+                        if (m3u8Url.startsWith("blob:")) {
+                            // Look for m3u8 URL in script tags or data attributes
+                            m3u8Url = Regex("""https?://[^\s"']+\.m3u8[^\s"']*""")
+                                .find(html)?.value ?: ""
+                        }
+
+                        // If still empty, try to find any m3u8 reference
+                        if (m3u8Url.isEmpty()) {
+                            m3u8Url = Regex("""(https?://[^\s"']+m3u8[^\s"']*)""")
+                                .find(html)?.groupValues?.getOrNull(1) ?: ""
+                        }
+
+                        if (m3u8Url.isNotEmpty() && (m3u8Url.startsWith("http") || m3u8Url.startsWith("/"))) {
+                            // Prepend domain if relative
+                            if (m3u8Url.startsWith("/")) {
+                                m3u8Url = embedDomain + m3u8Url
                             }
-                        } catch (_: Exception) {}
+
+                            val m3u8Headers = mapOf(
+                                "User-Agent"      to USER_AGENT,
+                                "Referer"         to url,
+                                "Origin"          to embedDomain,
+                                "Cookie"          to cookies,
+                                "Accept"          to "*/*",
+                                "Accept-Language" to "vi-VN,vi;q=0.9"
+                            )
+
+                            // Fetch m3u8 content
+                            val m3u8Raw = try {
+                                val resp = app.get(m3u8Url, headers = m3u8Headers)
+                                resp.text
+                            } catch (_: Exception) { "" }
+
+                            if (m3u8Raw.isNotEmpty()) {
+                                // Check if stream is encrypted
+                                val isEncrypted = m3u8Raw.contains("ENC-AESGCM") || m3u8Raw.contains("#EXT-X-KEY")
+
+                                if (!isEncrypted) {
+                                    // Plain m3u8 - use proxy server
+                                    val server = NguonCProxyServer("", url)
+                                    server.start()
+                                    activeServers.add(server)
+
+                                    val proxyBase     = "http://127.0.0.1:${server.port}"
+                                    val rewrittenM3U8 = rewriteM3U8(m3u8Raw, proxyBase)
+                                    server.setM3U8(rewrittenM3U8)
+
+                                    callback(newExtractorLink(
+                                        source = "NguonC",
+                                        name   = serverName,
+                                        url    = "$proxyBase/stream.m3u8",
+                                        type   = ExtractorLinkType.M3U8
+                                    ) {
+                                        this.quality = Qualities.P1080.value
+                                        this.headers = mapOf("User-Agent" to USER_AGENT)
+                                    })
+                                    linkFound = true
+                                } else {
+                                    // Encrypted stream - return direct URL with headers
+                                    callback(newExtractorLink(
+                                        source = "NguonC",
+                                        name   = serverName,
+                                        url    = m3u8Url,
+                                        type   = ExtractorLinkType.M3U8
+                                    ) {
+                                        this.quality = Qualities.P1080.value
+                                        this.headers = m3u8Headers
+                                    })
+                                    linkFound = true
+                                }
+                            }
+                        }
+
+                    } catch (e: Exception) {
+                        e.printStackTrace()
                     }
                 }
             }.awaitAll()
