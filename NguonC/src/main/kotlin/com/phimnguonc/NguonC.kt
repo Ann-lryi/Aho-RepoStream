@@ -13,6 +13,10 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import java.util.EnumSet
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
+import java.security.MessageDigest
 
 @CloudstreamPlugin
 class PhimNguonCPlugin : Plugin() {
@@ -26,18 +30,18 @@ class PhimNguonCProvider : MainAPI() {
     override var lang = "vi"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
-    
-    private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    
-    // Cập nhật regex để match các domain mới
+
+    private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+    // Match any embed subdomain: embed11, embed15, etc.
     private val cfInterceptor = WebViewResolver(Regex(""".*streamc\.xyz|.*amass\d+\.top|.*hihihoho\d+\.top|.*phimmoi\.net|.*seouls\d+\.amass\d+\.top"""))
-    
+
     private val commonHeaders = mapOf(
         "User-Agent"      to USER_AGENT,
         "Accept"          to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language" to "vi-VN,vi;q=0.9"
     )
-    
+
     private val API_PREFIX = "API::"
 
     override val mainPage = mainPageOf(
@@ -53,7 +57,7 @@ class PhimNguonCProvider : MainAPI() {
         val title  = el.selectFirst("h3")?.text()?.trim() ?: a.attr("title")
         val poster = el.selectFirst("img")?.let { it.attr("data-src").ifBlank { it.attr("src") } }
         val statusText = el.selectFirst("span.bg-green-300")?.text()?.trim() ?: ""
-        
+
         val episodeCount: Int? = when {
             statusText.equals("FULL", ignoreCase = true) -> null
             else ->
@@ -61,7 +65,7 @@ class PhimNguonCProvider : MainAPI() {
                 ?: Regex("""(\d+)\s*/\s*\d+""").find(statusText)?.groupValues?.get(1)?.toIntOrNull()
                 ?: Regex("""^(\d+)$""").find(statusText)?.groupValues?.get(1)?.toIntOrNull()
         }
-        
+
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
             this.quality   = SearchQuality.HD
@@ -76,7 +80,7 @@ class PhimNguonCProvider : MainAPI() {
         val href   = "$mainUrl/phim/$slug"
         val poster = item.poster_url ?: item.thumb_url
         val currentEp = item.current_episode ?: ""
-        
+
         val episodeCount: Int? = when {
             currentEp.equals("FULL", ignoreCase = true)         -> null
             currentEp.startsWith("Hoàn tất", ignoreCase = true) -> null
@@ -84,7 +88,7 @@ class PhimNguonCProvider : MainAPI() {
                 Regex("""[Tt]ập\s*(\d+)""").find(currentEp)?.groupValues?.get(1)?.toIntOrNull()
                 ?: Regex("""(\d+)\s*/\s*\d+""").find(currentEp)?.groupValues?.get(1)?.toIntOrNull()
         }
-        
+
         val lang      = item.language ?: ""
         val hasSub    = lang.contains("Vietsub",     ignoreCase = true)
         val hasDub    = lang.contains("Thuyết Minh", ignoreCase = true)
@@ -93,14 +97,14 @@ class PhimNguonCProvider : MainAPI() {
             hasDub           -> EnumSet.of(DubStatus.Dubbed)
             else             -> EnumSet.of(DubStatus.Subbed)
         }
-        
+
         val quality = when (item.quality?.uppercase()) {
             "FHD", "HD" -> SearchQuality.HD
             "CAM"       -> SearchQuality.Cam
             "SD"        -> SearchQuality.SD
             else        -> SearchQuality.HD
         }
-        
+
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
             this.quality   = quality
@@ -122,8 +126,8 @@ class PhimNguonCProvider : MainAPI() {
             newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
         } else {
             val url   = if (page == 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
-            val pageInterceptor = com.lagradost.cloudstream3.network.WebViewResolver(Regex(Regex.escape(url)))
-            val resp = app.get(url, headers = commonHeaders)
+            val pageInterceptor = WebViewResolver(Regex(Regex.escape(url)))
+            val resp = app.get(url, headers = commonHeaders, interceptor = pageInterceptor)
             val doc  = resp.document
             val items = doc.select("table tbody tr").mapNotNull { parseCard(it) }
             newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
@@ -134,13 +138,13 @@ class PhimNguonCProvider : MainAPI() {
         val res = try {
             app.get("$mainUrl/api/films?keyword=${URLEncoder.encode(query, "utf-8")}", headers = commonHeaders).parsedSafe<NguonCApiResponse>()
         } catch (_: Exception) { null }
-        
+
         if (!res?.items.isNullOrEmpty())
             return res!!.items!!.mapNotNull { parseApiItem(it) }
-            
+
         val searchUrl = "$mainUrl/tim-kiem?keyword=${URLEncoder.encode(query, "utf-8")}"
-        val pageInterceptor2 = com.lagradost.cloudstream3.network.WebViewResolver(Regex(Regex.escape(searchUrl)))
-        val doc = app.get(searchUrl, headers = commonHeaders).document
+        val pageInterceptor2 = WebViewResolver(Regex(Regex.escape(searchUrl)))
+        val doc = app.get(searchUrl, headers = commonHeaders, interceptor = pageInterceptor2).document
         return doc.select("table tbody tr").mapNotNull { parseCard(it) }
     }
 
@@ -148,7 +152,7 @@ class PhimNguonCProvider : MainAPI() {
         val slug  = url.trim().trimEnd('/').substringAfterLast("/")
         val res   = app.get("$mainUrl/api/film/$slug", headers = commonHeaders).parsedSafe<NguonCDetailResponse>()
         val movie = res?.movie ?: throw ErrorLoadingException("Không thể tải dữ liệu phim")
-        
+
         val epMap = linkedMapOf<String, MutableList<String>>()
         movie.episodes?.forEachIndexed { idx, server ->
             val serverName = server.server_name ?: server.name ?: if (idx == 0) "Vietsub" else "Thuyết minh"
@@ -158,31 +162,31 @@ class PhimNguonCProvider : MainAPI() {
                 if (!directM3u8.isNullOrBlank()) {
                     epMap.getOrPut(ep.name ?: "0") { mutableListOf() }.add("$serverName::$directM3u8")
                 } else {
-                    val embed = ep.embed?.replace("\\/", "/") ?: ""
+                    val embed = ep.embed?.replace("\/", "/") ?: ""
                     if (embed.isNotBlank()) {
                         epMap.getOrPut(ep.name ?: "0") { mutableListOf() }.add("$serverName::$embed")
                     }
                 }
             }
         }
-        
+
         if (epMap.isEmpty()) throw ErrorLoadingException("Không tìm thấy tập phim")
-        
+
         val episodes = epMap.map { (epName, embeds) ->
             newEpisode(embeds.distinct().joinToString("|")) {
                 this.name    = "Tập $epName"
                 this.episode = epName.toIntOrNull()
             }
         }.sortedBy { it.episode ?: 0 }
-        
+
         val categories = movie.category ?: emptyMap()
         val dinhDang = categories.values.find { it.group?.name == "Định dạng" }?.list?.map { it.name }?.joinToString(", ") ?: ""
         val theLoai = categories.values.find { it.group?.name == "Thể loại" }?.list?.map { it.name }?.joinToString(", ") ?: ""
         val namPhatHanh = categories.values.find { it.group?.name == "Năm" }?.list?.map { it.name }?.joinToString(", ") ?: ""
         val quocGia = categories.values.find { it.group?.name == "Quốc gia" }?.list?.map { it.name }?.joinToString(", ") ?: ""
-        
+
         val beautifulPlot = buildBeautifulDescription(movie, dinhDang, theLoai, namPhatHanh, quocGia)
-        
+
         val genreItems = categories.values.flatMap { it.list ?: emptyList() }.filter { !it.id.isNullOrBlank() }
         val theLoaiItems = categories.values
             .filter { cat ->
@@ -190,7 +194,7 @@ class PhimNguonCProvider : MainAPI() {
                 !gname.contains("ăm") && !gname.contains("gia") && !gname.contains("nh d") && (cat.list?.size ?: 0) >= 2
             }
             .maxByOrNull { it.list?.size ?: 0 }?.list ?: genreItems.take(5)
-            
+
         fun nameToSlug(name: String): String {
             val map = mapOf(
                 'à' to "a", 'á' to "a", 'â' to "a", 'ã' to "a", 'ä' to "a", 'å' to "a", 'ă' to "a", 'ắ' to "a", 'ặ' to "a", 'ằ' to "a", 'ẳ' to "a", 'ẵ' to "a", 'ấ' to "a", 'ầ' to "a", 'ẩ' to "a", 'ẫ' to "a", 'ậ' to "a", 'ả' to "a", 'ạ' to "a",
@@ -205,7 +209,7 @@ class PhimNguonCProvider : MainAPI() {
                 map[c] ?: if (c in 'a'..'z' || c in '0'..'9') c.toString() else if (c == ' ') "-" else ""
             }.joinToString("").replace(Regex("-{2,}"), "-").trim('-')
         }
-        
+
         val recommendations: List<SearchResponse> = try {
             var result: List<SearchResponse> = emptyList()
             for (genre in theLoaiItems.take(3)) {
@@ -225,7 +229,7 @@ class PhimNguonCProvider : MainAPI() {
             }
             result
         } catch (_: Exception) { emptyList() }
-        
+
         return newTvSeriesLoadResponse(movie.name ?: "", url, TvType.TvSeries, episodes) {
             this.posterUrl       = movie.poster_url ?: movie.thumb_url
             this.plot            = beautifulPlot
@@ -247,22 +251,22 @@ class PhimNguonCProvider : MainAPI() {
         val currentEp    = movie.current_episode ?: ""
         val totalEp      = movie.total_episodes?.toString() ?: ""
         val originalName = movie.original_name ?: ""
-        
+
         return buildString {
             if (originalName.isNotBlank() && originalName != (movie.name ?: ""))
                 append("<font color='#AAAAAA'><i>$originalName</i></font><br><br>")
-                
+
             fun addInfo(icon: String, label: String, value: String?, color: String = "#FFFFFF") {
                 if (!value.isNullOrBlank())
                     append("$icon <b>$label:</b> <font color='$color'>$value</font><br>")
             }
-            
+
             val statusColor = when {
                 currentEp.contains("hoàn tất", ignoreCase = true) -> "#2196F3"
                 currentEp.contains("full",     ignoreCase = true) -> "#9C27B0"
                 else -> "#4CAF50"
             }
-            
+
             addInfo("📺", "Trạng thái",  currentEp,  statusColor)
             if (totalEp.isNotBlank() && totalEp != "0") addInfo("🎞",  "Số tập",     "$totalEp tập")
             addInfo("⏱",  "Thời lượng",  time)
@@ -274,7 +278,7 @@ class PhimNguonCProvider : MainAPI() {
             addInfo("🎥",  "Đạo diễn",   director)
             addInfo("🎭",  "Diễn viên",  casts)
             addInfo("🏷",  "Thể loại",   theLoai)
-            
+
             if (description.isNotBlank()) {
                 append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
                 append("<hr color='#333333' size='1'><br>")
@@ -313,10 +317,10 @@ class PhimNguonCProvider : MainAPI() {
                 val output = client.getOutputStream()
                 val requestLine = input.readLine() ?: return
                 while (true) { if ((input.readLine() ?: "").isBlank()) break }
-                
+
                 val path = requestLine.split(" ").getOrNull(1) ?: "/"
                 val crlf = "\r\n"
-                
+
                 when {
                     path == "/stream.m3u8" -> {
                         val body = getM3U8().toByteArray(Charsets.UTF_8)
@@ -334,7 +338,7 @@ class PhimNguonCProvider : MainAPI() {
                             conn.connect()
                             val bytes = conn.inputStream.readBytes()
                             conn.disconnect()
-                            
+
                             output.write(("HTTP/1.1 200 OK${crlf}Content-Type: video/mp2t${crlf}Content-Length: ${bytes.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}").toByteArray())
                             output.write(bytes)
                         } catch (_: Exception) {
@@ -367,10 +371,100 @@ class PhimNguonCProvider : MainAPI() {
         }
     }
 
-    data class StreamData(
-        @JsonProperty("sUb") val sUb: String? = null,
-        @JsonProperty("hD")  val hD:  String? = null
-    )
+    // ── Encryption helpers ────────────────────────────────────────────────────
+
+    private fun deriveKey(token: String): ByteArray {
+        // Try multiple derivation methods
+        val methods = listOf(
+            // Method 1: SHA-256 of token string, take first 16 bytes
+            { MessageDigest.getInstance("SHA-256").digest(token.toByteArray()).copyOf(16) },
+            // Method 2: MD5 of token string
+            { MessageDigest.getInstance("MD5").digest(token.toByteArray()) },
+            // Method 3: First 32 hex chars as direct key
+            { token.take(32).chunked(2).map { it.toInt(16).toByte() }.toByteArray() },
+            // Method 4: SHA-256 of hex-decoded token
+            { 
+                val hexBytes = token.chunked(2).mapNotNull { it.toIntOrNull(16)?.toByte() }.toByteArray()
+                MessageDigest.getInstance("SHA-256").digest(hexBytes).copyOf(16) 
+            }
+        )
+        return methods.firstNotNullOfOrNull { try { it() } catch (_: Exception) { null } } 
+            ?: ByteArray(16) { 0 }
+    }
+
+    private fun tryDecryptAesGcm(content: String, keyBytes: ByteArray): String? {
+        return try {
+            // Parse IV from #ENC-AESGCM;iv=...
+            val ivHex = Regex("""#ENC-AESGCM;iv=([a-f0-9]+)""").find(content)?.groupValues?.getOrNull(1) ?: return null
+            val iv = ivHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+
+            // Extract base64 data after headers
+            val lines = content.lines()
+            val dataLines = lines.dropWhile { it.startsWith("#") || it.isBlank() }
+            val b64Data = dataLines.joinToString("").trim()
+            if (b64Data.isEmpty()) return null
+
+            val encryptedData = Base64.decode(b64Data, Base64.DEFAULT)
+
+            // AES-128-GCM with 128-bit tag (default for GCM)
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            val spec = GCMParameterSpec(128, iv)
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), spec)
+            val decrypted = cipher.doFinal(encryptedData)
+            String(decrypted, Charsets.UTF_8)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun findToken(html: String): String? {
+        val patterns = listOf(
+            Regex("""token\s*[:=]\s*["']([a-f0-9]{28,64})["']""", RegexOption.IGNORE_CASE),
+            Regex("""["']t["']\s*:\s*["']([a-f0-9]{28,64})["']"""),
+            Regex("""key\s*[:=]\s*["']([a-f0-9]{28,64})["']""", RegexOption.IGNORE_CASE),
+            Regex("""var\s+(?:token|t|key)\s*=\s*["']([a-f0-9]{28,64})["']""", RegexOption.IGNORE_CASE),
+            Regex("""data-token\s*=\s*["']([a-f0-9]{28,64})["']""", RegexOption.IGNORE_CASE),
+            Regex("""["']([a-f0-9]{32,64})["']""")
+        )
+
+        for (pattern in patterns) {
+            val match = pattern.find(html)
+            if (match != null) {
+                val candidate = match.groupValues[1]
+                if (candidate.toSet().size > 4) return candidate
+            }
+        }
+        return null
+    }
+
+    private suspend fun findTokenDeep(html: String, embedDomain: String, referer: String, cookies: String): String? {
+        var token = findToken(html)
+        if (token != null) return token
+
+        // Search in JS files
+        val jsFiles = Regex("""["']([^"']*(?:player1|debug|player|embed|stream)[^"']*\.js[^"']*)["']""", RegexOption.IGNORE_CASE)
+            .findAll(html).map { it.groupValues[1] }.distinct().toList()
+
+        for (jsPath in jsFiles) {
+            val jsUrl = if (jsPath.startsWith("http")) jsPath else "$embedDomain/$jsPath"
+            try {
+                val jsContent = app.get(jsUrl, headers = mapOf(
+                    "Referer" to referer, "User-Agent" to USER_AGENT, "Cookie" to cookies
+                )).text
+                token = findToken(jsContent)
+                if (token != null) return token
+            } catch (_: Exception) { }
+        }
+        return null
+    }
+
+    private fun buildM3u8Url(embedDomain: String, hash: String, token: String): String {
+        val json = """{"h":"$hash","t":"$token"}"""
+        val base64 = Base64.encodeToString(json.toByteArray(Charsets.UTF_8), Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+        return "$embedDomain/$base64.m3u8"
+    }
+
+    // ── Main link loading logic ───────────────────────────────────────────────
 
     override suspend fun loadLinks(
         data:             String,
@@ -385,181 +479,249 @@ class PhimNguonCProvider : MainAPI() {
             else null
         }
         var linkFound = false
-        
+
         coroutineScope {
             embedEntries.map { (serverName, url) ->
                 async {
                     var targetUrl = url
-                    
-                    // CHẶN link chết sing.phimmoi.net và chuyển sang embed URL mới
+
+                    // Fix dead sing.phimmoi.net links
                     if (url.contains("sing.phimmoi.net")) {
                         val hash = Regex("""/([^/]+)/hls\.m3u8""").find(url)?.groupValues?.get(1)
                         if (hash != null) {
-                            targetUrl = "https://embed11.streamc.xyz/embed.php?hash=$hash"
-                        } else {
-                            return@async
-                        }
+                            // Use embed domain from API or default
+                            targetUrl = "https://embed15.streamc.xyz/embed.php?hash=$hash"
+                        } else return@async
                     }
-                    
-                    // Nếu là URL embed (embed.php?hash=...)
-                    if (targetUrl.contains("embed.php") && targetUrl.contains("hash=")) {
-                        val hash = Regex("""hash=([a-f0-9]+)""").find(targetUrl)?.groupValues?.get(1)
-                        if (hash != null) {
-                            val m3u9Url = "https://embed11.streamc.xyz/$hash.m3u9"
-                            
-                            try {
-                                val m3u9Response = app.get(
-                                    m3u9Url,
-                                    interceptor = cfInterceptor,
-                                    headers = mapOf(
-                                        "Referer" to "https://embed11.streamc.xyz/",
-                                        "User-Agent" to USER_AGENT
-                                    )
-                                )
-                                
-                                val m3u9Content = m3u9Response.text
-                                
-                                if (m3u9Content.contains("#EXTM3U") && !m3u9Content.contains("#ENC-AESGCM")) {
-                                    val server = NguonCProxyServer("", m3u9Url)
-                                    server.start()
-                                    activeServers.add(server)
+
+                    // Extract embed domain dynamically (embed11, embed15, etc.)
+                    val embedDomain = Regex("""(https?://embed\d+\.streamc\.xyz)""").find(targetUrl)?.groupValues?.getOrNull(1)
+                        ?: Regex("""(https?://[^/]+)""").find(targetUrl)?.groupValues?.getOrNull(1)
+                        ?: "https://embed15.streamc.xyz"
+
+                    // Case 1: Direct m3u8 URL
+                    if (targetUrl.contains(".m3u8") || targetUrl.contains(".m3u9")) {
+                        try {
+                            val m3u8Resp = app.get(targetUrl, headers = mapOf(
+                                "User-Agent" to USER_AGENT,
+                                "Referer" to "$mainUrl/"
+                            ), interceptor = cfInterceptor)
+                            val content = m3u8Resp.text
+
+                            if (content.contains("#EXTM3U")) {
+                                if (!content.contains("#ENC-AESGCM") && !content.contains("#EXT-X-KEY")) {
+                                    // Plain m3u8
+                                    val server = NguonCProxyServer("", targetUrl)
+                                    server.start(); activeServers.add(server)
                                     val proxyBase = "http://127.0.0.1:${server.port}"
-                                    val rewrittenM3U8 = rewriteM3U8(m3u9Content, proxyBase)
-                                    server.setM3U8(rewrittenM3U8)
-                                    
-                                    callback(newExtractorLink(
-                                        source = "NguonC",
-                                        name   = serverName,
-                                        url    = "$proxyBase/stream.m3u8",
-                                        type   = ExtractorLinkType.M3U8
-                                    ) {
-                                        this.quality = Qualities.P1080.value
-                                        this.headers = mapOf("User-Agent" to USER_AGENT)
-                                    })
-                                    linkFound = true
-                                    return@async
-                                }
-                            } catch (_: Exception) {}
-                        }
-                    }
-                    
-                    // Case 2: Embed URL - Parse m3u8 URL and handle encrypted stream
-                    val embedDomain = Regex("""https?://[^/]+""").find(url)?.value ?: return@async
-                    try {
-                        val embedRes = app.get(
-                            url,
-                            interceptor = cfInterceptor,
-                            headers = mapOf(
-                                "Referer" to "$mainUrl/",
-                                "User-Agent" to USER_AGENT
-                            )
-                        )
-                        val html = embedRes.text
-                        val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
-
-                        // Try to find m3u8 URL in page
-                        // Pattern 1: jwplayer with file config
-                        var m3u8Url = Regex("""jwplayer\s*\(\s*\{[^}]*?file\s*:\s*["']([^"']+)["']""", RegexOption.DOT_MATCHES_ALL)
-                            .find(html)?.groupValues?.getOrNull(1)
-                            ?.replace("\\/", "/")
-                            ?.trim()
-                            ?: ""
-
-                        // Pattern 2: sources array
-                        if (m3u8Url.isEmpty()) {
-                            m3u8Url = Regex("""sources\s*:\s*\[\s*\{[^}]*?file\s*:\s*["']([^"']+)["']""", RegexOption.DOT_MATCHES_ALL)
-                                .find(html)?.groupValues?.getOrNull(1)
-                                ?.replace("\\/", "/")
-                                ?.trim() ?: ""
-                        }
-
-                        // Pattern 3: data-m3u8 attribute
-                        if (m3u8Url.isEmpty()) {
-                            m3u8Url = Regex("""data-m3u8\s*=\s*["']([^"']+)["']""")
-                                .find(html)?.groupValues?.getOrNull(1) ?: ""
-                        }
-
-                        // If URL is blob, try to extract actual m3u8 URL from page
-                        if (m3u8Url.startsWith("blob:")) {
-                            // Look for m3u8 URL in script tags or data attributes
-                            m3u8Url = Regex("""https?://[^\s"']+\.m3u8[^\s"']*""")
-                                .find(html)?.value ?: ""
-                        }
-
-                        // If still empty, try to find any m3u8 reference
-                        if (m3u8Url.isEmpty()) {
-                            m3u8Url = Regex("""(https?://[^\s"']+m3u8[^\s"']*)""")
-                                .find(html)?.groupValues?.getOrNull(1) ?: ""
-                        }
-
-                        if (m3u8Url.isNotEmpty() && (m3u8Url.startsWith("http") || m3u8Url.startsWith("/"))) {
-                            // Prepend domain if relative
-                            if (m3u8Url.startsWith("/")) {
-                                m3u8Url = embedDomain + m3u8Url
-                            }
-
-                            val m3u8Headers = mapOf(
-                                "User-Agent"      to USER_AGENT,
-                                "Referer"         to url,
-                                "Origin"          to embedDomain,
-                                "Cookie"          to cookies,
-                                "Accept"          to "*/*",
-                                "Accept-Language" to "vi-VN,vi;q=0.9"
-                            )
-
-                            // Fetch m3u8 content
-                            val m3u8Raw = try {
-                                val resp = app.get(m3u8Url, headers = m3u8Headers)
-                                resp.text
-                            } catch (_: Exception) { "" }
-
-                            if (m3u8Raw.isNotEmpty()) {
-                                // Check if stream is encrypted
-                                val isEncrypted = m3u8Raw.contains("ENC-AESGCM") || m3u8Raw.contains("#EXT-X-KEY")
-
-                                if (!isEncrypted) {
-                                    // Plain m3u8 - use proxy server
-                                    val server = NguonCProxyServer("", url)
-                                    server.start()
-                                    activeServers.add(server)
-
-                                    val proxyBase     = "http://127.0.0.1:${server.port}"
-                                    val rewrittenM3U8 = rewriteM3U8(m3u8Raw, proxyBase)
-                                    server.setM3U8(rewrittenM3U8)
-
-                                    callback(newExtractorLink(
-                                        source = "NguonC",
-                                        name   = serverName,
-                                        url    = "$proxyBase/stream.m3u8",
-                                        type   = ExtractorLinkType.M3U8
-                                    ) {
-                                        this.quality = Qualities.P1080.value
-                                        this.headers = mapOf("User-Agent" to USER_AGENT)
+                                    server.setM3U8(rewriteM3U8(content, proxyBase))
+                                    callback(newExtractorLink("NguonC", serverName, "$proxyBase/stream.m3u8", ExtractorLinkType.M3U8) {
+                                        quality = Qualities.P1080.value
+                                        headers = mapOf("User-Agent" to USER_AGENT)
                                     })
                                     linkFound = true
                                 } else {
-                                    // Encrypted stream - return direct URL with headers
-                                    callback(newExtractorLink(
-                                        source = "NguonC",
-                                        name   = serverName,
-                                        url    = m3u8Url,
-                                        type   = ExtractorLinkType.M3U8
-                                    ) {
-                                        this.quality = Qualities.P1080.value
-                                        this.headers = m3u8Headers
+                                    // Encrypted - try decrypt
+                                    val token = findToken(content) ?: findTokenDeep(content, embedDomain, targetUrl, m3u8Resp.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" })
+                                    val decrypted = token?.let { tryDecryptAesGcm(content, deriveKey(it)) }
+
+                                    if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
+                                        val server = NguonCProxyServer("", targetUrl)
+                                        server.start(); activeServers.add(server)
+                                        val proxyBase = "http://127.0.0.1:${server.port}"
+                                        server.setM3U8(rewriteM3U8(decrypted, proxyBase))
+                                        callback(newExtractorLink("NguonC", "$serverName (Decrypted)", "$proxyBase/stream.m3u8", ExtractorLinkType.M3U8) {
+                                            quality = Qualities.P1080.value
+                                            headers = mapOf("User-Agent" to USER_AGENT)
+                                        })
+                                        linkFound = true
+                                    } else {
+                                        // Fallback: direct encrypted link
+                                        callback(newExtractorLink("NguonC", "$serverName (Encrypted)", targetUrl, ExtractorLinkType.M3U8) {
+                                            quality = Qualities.P1080.value
+                                            headers = mapOf(
+                                                "User-Agent" to USER_AGENT,
+                                                "Referer" to targetUrl,
+                                                "Origin" to embedDomain
+                                            )
+                                        })
+                                        linkFound = true
+                                    }
+                                }
+                            }
+                        } catch (e: Exception) { e.printStackTrace() }
+                        return@async
+                    }
+
+                    // Case 2: Embed page (embed.php?hash=...)
+                    if (targetUrl.contains("embed.php") && targetUrl.contains("hash=")) {
+                        val hash = Regex("""hash=([a-f0-9]+)""").find(targetUrl)?.groupValues?.get(1)
+                        if (hash == null) return@async
+
+                        // Fetch embed page
+                        val embedRes = try {
+                            app.get(targetUrl, interceptor = cfInterceptor, headers = mapOf(
+                                "Referer" to "$mainUrl/", "User-Agent" to USER_AGENT
+                            ))
+                        } catch (e: Exception) { return@async }
+
+                        val html = embedRes.text
+                        val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+
+                        // Strategy 1: Find direct m3u8 in HTML
+                        var m3u8Url = findDirectM3u8(html, targetUrl)
+
+                        // Strategy 2: Build from token
+                        if (m3u8Url.isNullOrEmpty()) {
+                            val token = findTokenDeep(html, embedDomain, targetUrl, cookies)
+                            if (token != null) {
+                                m3u8Url = buildM3u8Url(embedDomain, hash, token)
+                            }
+                        }
+
+                        // Strategy 3: Direct hash URL
+                        if (m3u8Url.isNullOrEmpty()) {
+                            m3u8Url = "$embedDomain/$hash.m3u8"
+                        }
+
+                        if (!m3u8Url.isNullOrEmpty()) {
+                            val m3u8Headers = mapOf(
+                                "User-Agent" to USER_AGENT,
+                                "Referer" to targetUrl,
+                                "Origin" to embedDomain,
+                                "Cookie" to cookies,
+                                "Accept" to "*/*"
+                            )
+
+                            try {
+                                val m3u8Resp = app.get(m3u8Url, headers = m3u8Headers, interceptor = cfInterceptor)
+                                val m3u8Content = m3u8Resp.text
+
+                                if (m3u8Content.contains("#EXTM3U")) {
+                                    val isEncrypted = m3u8Content.contains("#ENC-AESGCM") || m3u8Content.contains("#EXT-X-KEY")
+
+                                    if (!isEncrypted) {
+                                        val server = NguonCProxyServer("", targetUrl)
+                                        server.start(); activeServers.add(server)
+                                        val proxyBase = "http://127.0.0.1:${server.port}"
+                                        server.setM3U8(rewriteM3U8(m3u8Content, proxyBase))
+                                        callback(newExtractorLink("NguonC", serverName, "$proxyBase/stream.m3u8", ExtractorLinkType.M3U8) {
+                                            quality = Qualities.P1080.value
+                                            headers = mapOf("User-Agent" to USER_AGENT)
+                                        })
+                                        linkFound = true
+                                    } else {
+                                        // Try decrypt with multiple key derivations
+                                        val token = findTokenDeep(html, embedDomain, targetUrl, cookies)
+                                        var decrypted: String? = null
+
+                                        if (token != null) {
+                                            val key = deriveKey(token)
+                                            decrypted = tryDecryptAesGcm(m3u8Content, key)
+                                        }
+
+                                        if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
+                                            val server = NguonCProxyServer("", targetUrl)
+                                            server.start(); activeServers.add(server)
+                                            val proxyBase = "http://127.0.0.1:${server.port}"
+                                            server.setM3U8(rewriteM3U8(decrypted, proxyBase))
+                                            callback(newExtractorLink("NguonC", "$serverName (Decrypted)", "$proxyBase/stream.m3u8", ExtractorLinkType.M3U8) {
+                                                quality = Qualities.P1080.value
+                                                headers = mapOf("User-Agent" to USER_AGENT)
+                                            })
+                                            linkFound = true
+                                        } else {
+                                            // Return encrypted with headers - let player handle it
+                                            callback(newExtractorLink("NguonC", "$serverName (Encrypted)", m3u8Url, ExtractorLinkType.M3U8) {
+                                                quality = Qualities.P1080.value
+                                                headers = m3u8Headers
+                                            })
+                                            linkFound = true
+                                        }
+                                    }
+                                }
+                            } catch (e: Exception) { e.printStackTrace() }
+                        }
+                        return@async
+                    }
+
+                    // Case 3: Other embed pages
+                    try {
+                        val embedRes = app.get(targetUrl, interceptor = cfInterceptor, headers = mapOf(
+                            "Referer" to "$mainUrl/", "User-Agent" to USER_AGENT
+                        ))
+                        val html = embedRes.text
+                        val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+
+                        var m3u8Url = findDirectM3u8(html, targetUrl)
+                        if (m3u8Url.isNullOrEmpty()) {
+                            m3u8Url = Regex("""https?://[^\s"']+\.(?:m3u8|m3u9)[^\s"']*""").find(html)?.value
+                        }
+
+                        if (!m3u8Url.isNullOrEmpty()) {
+                            val m3u8Headers = mapOf(
+                                "User-Agent" to USER_AGENT, "Referer" to targetUrl,
+                                "Origin" to Regex("""https?://[^/]+""").find(targetUrl)?.value ?: "",
+                                "Cookie" to cookies, "Accept" to "*/*"
+                            )
+
+                            val m3u8Resp = app.get(m3u8Url, headers = m3u8Headers, interceptor = cfInterceptor)
+                            val m3u8Content = m3u8Resp.text
+
+                            if (m3u8Content.contains("#EXTM3U")) {
+                                val isEncrypted = m3u8Content.contains("#ENC-AESGCM") || m3u8Content.contains("#EXT-X-KEY")
+
+                                if (!isEncrypted) {
+                                    val server = NguonCProxyServer("", targetUrl)
+                                    server.start(); activeServers.add(server)
+                                    val proxyBase = "http://127.0.0.1:${server.port}"
+                                    server.setM3U8(rewriteM3U8(m3u8Content, proxyBase))
+                                    callback(newExtractorLink("NguonC", serverName, "$proxyBase/stream.m3u8", ExtractorLinkType.M3U8) {
+                                        quality = Qualities.P1080.value
+                                        headers = mapOf("User-Agent" to USER_AGENT)
+                                    })
+                                    linkFound = true
+                                } else {
+                                    callback(newExtractorLink("NguonC", "$serverName (Encrypted)", m3u8Url, ExtractorLinkType.M3U8) {
+                                        quality = Qualities.P1080.value
+                                        headers = m3u8Headers
                                     })
                                     linkFound = true
                                 }
                             }
                         }
-
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
+                    } catch (e: Exception) { e.printStackTrace() }
                 }
             }.awaitAll()
         }
         return linkFound
+    }
+
+    private fun findDirectM3u8(html: String, referer: String): String? {
+        val patterns = listOf(
+            Regex("""jwplayer\s*\(\s*\{[^}]*?file\s*:\s*["']([^"']+)["']""", RegexOption.DOT_MATCHES_ALL),
+            Regex("""sources\s*:\s*\[\s*\{[^}]*?file\s*:\s*["']([^"']+)["']""", RegexOption.DOT_MATCHES_ALL),
+            Regex("""data-m3u8\s*=\s*["']([^"']+)["']"""),
+            Regex("""(https?://[^\s"']+\.m3u8[^\s"']*)"""),
+            Regex("""var\s+(?:url|m3u8|source|src)\s*=\s*["'](https?://[^"']+)["']""", RegexOption.IGNORE_CASE),
+            Regex("""(?:fetch|xhr\.open)\(["'][^"']*["'],\s*["'](https?://[^"']*\.m3u8[^"']*)["']"""),
+            Regex("""(?:url|m3u8|source|src)\s*[:=]\s*["'](https?://[^"']*\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE)
+        )
+
+        for (pattern in patterns) {
+            val match = pattern.find(html)
+            if (match != null) {
+                var url = match.groupValues.getOrNull(1)?.replace("\\/", "/")?.trim()
+                if (!url.isNullOrEmpty() && !url.startsWith("blob:")) {
+                    if (url.startsWith("/")) {
+                        val domain = Regex("""https?://[^/]+""").find(referer)?.value ?: return url
+                        url = domain + url
+                    }
+                    return url
+                }
+            }
+        }
+        return null
     }
 
     // ── Data classes ──────────────────────────────────────────────────────────
