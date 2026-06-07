@@ -162,7 +162,8 @@ class PhimNguonCProvider : MainAPI() {
                 if (!directM3u8.isNullOrBlank()) {
                     epMap.getOrPut(ep.name ?: "0") { mutableListOf() }.add("$serverName::$directM3u8")
                 } else {
-                    val embed = ep.embed?.replace("\/", "/") ?: ""
+                    // FIX: Use raw string to avoid escape sequence issue
+                    val embed = ep.embed?.replace("\\/", "/") ?: ""
                     if (embed.isNotBlank()) {
                         epMap.getOrPut(ep.name ?: "0") { mutableListOf() }.add("$serverName::$embed")
                     }
@@ -374,15 +375,10 @@ class PhimNguonCProvider : MainAPI() {
     // ── Encryption helpers ────────────────────────────────────────────────────
 
     private fun deriveKey(token: String): ByteArray {
-        // Try multiple derivation methods
         val methods = listOf(
-            // Method 1: SHA-256 of token string, take first 16 bytes
             { MessageDigest.getInstance("SHA-256").digest(token.toByteArray()).copyOf(16) },
-            // Method 2: MD5 of token string
             { MessageDigest.getInstance("MD5").digest(token.toByteArray()) },
-            // Method 3: First 32 hex chars as direct key
             { token.take(32).chunked(2).map { it.toInt(16).toByte() }.toByteArray() },
-            // Method 4: SHA-256 of hex-decoded token
             { 
                 val hexBytes = token.chunked(2).mapNotNull { it.toIntOrNull(16)?.toByte() }.toByteArray()
                 MessageDigest.getInstance("SHA-256").digest(hexBytes).copyOf(16) 
@@ -394,11 +390,9 @@ class PhimNguonCProvider : MainAPI() {
 
     private fun tryDecryptAesGcm(content: String, keyBytes: ByteArray): String? {
         return try {
-            // Parse IV from #ENC-AESGCM;iv=...
             val ivHex = Regex("""#ENC-AESGCM;iv=([a-f0-9]+)""").find(content)?.groupValues?.getOrNull(1) ?: return null
             val iv = ivHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 
-            // Extract base64 data after headers
             val lines = content.lines()
             val dataLines = lines.dropWhile { it.startsWith("#") || it.isBlank() }
             val b64Data = dataLines.joinToString("").trim()
@@ -406,7 +400,6 @@ class PhimNguonCProvider : MainAPI() {
 
             val encryptedData = Base64.decode(b64Data, Base64.DEFAULT)
 
-            // AES-128-GCM with 128-bit tag (default for GCM)
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             val spec = GCMParameterSpec(128, iv)
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), spec)
@@ -441,7 +434,6 @@ class PhimNguonCProvider : MainAPI() {
         var token = findToken(html)
         if (token != null) return token
 
-        // Search in JS files
         val jsFiles = Regex("""["']([^"']*(?:player1|debug|player|embed|stream)[^"']*\.js[^"']*)["']""", RegexOption.IGNORE_CASE)
             .findAll(html).map { it.groupValues[1] }.distinct().toList()
 
@@ -489,7 +481,6 @@ class PhimNguonCProvider : MainAPI() {
                     if (url.contains("sing.phimmoi.net")) {
                         val hash = Regex("""/([^/]+)/hls\.m3u8""").find(url)?.groupValues?.get(1)
                         if (hash != null) {
-                            // Use embed domain from API or default
                             targetUrl = "https://embed15.streamc.xyz/embed.php?hash=$hash"
                         } else return@async
                     }
@@ -510,7 +501,6 @@ class PhimNguonCProvider : MainAPI() {
 
                             if (content.contains("#EXTM3U")) {
                                 if (!content.contains("#ENC-AESGCM") && !content.contains("#EXT-X-KEY")) {
-                                    // Plain m3u8
                                     val server = NguonCProxyServer("", targetUrl)
                                     server.start(); activeServers.add(server)
                                     val proxyBase = "http://127.0.0.1:${server.port}"
@@ -521,7 +511,6 @@ class PhimNguonCProvider : MainAPI() {
                                     })
                                     linkFound = true
                                 } else {
-                                    // Encrypted - try decrypt
                                     val token = findToken(content) ?: findTokenDeep(content, embedDomain, targetUrl, m3u8Resp.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" })
                                     val decrypted = token?.let { tryDecryptAesGcm(content, deriveKey(it)) }
 
@@ -536,7 +525,6 @@ class PhimNguonCProvider : MainAPI() {
                                         })
                                         linkFound = true
                                     } else {
-                                        // Fallback: direct encrypted link
                                         callback(newExtractorLink("NguonC", "$serverName (Encrypted)", targetUrl, ExtractorLinkType.M3U8) {
                                             quality = Qualities.P1080.value
                                             headers = mapOf(
@@ -555,10 +543,9 @@ class PhimNguonCProvider : MainAPI() {
 
                     // Case 2: Embed page (embed.php?hash=...)
                     if (targetUrl.contains("embed.php") && targetUrl.contains("hash=")) {
-                        val hash = Regex("""hash=([a-f0-9]+)""").find(targetUrl)?.groupValues?.get(1)
+                        val hash = Regex("""hash=([a-f0-9]+)""").find(targetUrl)?.groupValues?.getOrNull(1)
                         if (hash == null) return@async
 
-                        // Fetch embed page
                         val embedRes = try {
                             app.get(targetUrl, interceptor = cfInterceptor, headers = mapOf(
                                 "Referer" to "$mainUrl/", "User-Agent" to USER_AGENT
@@ -585,10 +572,12 @@ class PhimNguonCProvider : MainAPI() {
                         }
 
                         if (!m3u8Url.isNullOrEmpty()) {
+                            // FIX: Explicitly type all values as String to avoid type mismatch
+                            val originValue: String = Regex("""https?://[^/]+""").find(targetUrl)?.value ?: ""
                             val m3u8Headers = mapOf(
                                 "User-Agent" to USER_AGENT,
                                 "Referer" to targetUrl,
-                                "Origin" to embedDomain,
+                                "Origin" to originValue,
                                 "Cookie" to cookies,
                                 "Accept" to "*/*"
                             )
@@ -611,7 +600,6 @@ class PhimNguonCProvider : MainAPI() {
                                         })
                                         linkFound = true
                                     } else {
-                                        // Try decrypt with multiple key derivations
                                         val token = findTokenDeep(html, embedDomain, targetUrl, cookies)
                                         var decrypted: String? = null
 
@@ -631,7 +619,6 @@ class PhimNguonCProvider : MainAPI() {
                                             })
                                             linkFound = true
                                         } else {
-                                            // Return encrypted with headers - let player handle it
                                             callback(newExtractorLink("NguonC", "$serverName (Encrypted)", m3u8Url, ExtractorLinkType.M3U8) {
                                                 quality = Qualities.P1080.value
                                                 headers = m3u8Headers
@@ -659,10 +646,14 @@ class PhimNguonCProvider : MainAPI() {
                         }
 
                         if (!m3u8Url.isNullOrEmpty()) {
+                            // FIX: Explicitly type all values as String
+                            val originValue2: String = Regex("""https?://[^/]+""").find(targetUrl)?.value ?: ""
                             val m3u8Headers = mapOf(
-                                "User-Agent" to USER_AGENT, "Referer" to targetUrl,
-                                "Origin" to Regex("""https?://[^/]+""").find(targetUrl)?.value ?: "",
-                                "Cookie" to cookies, "Accept" to "*/*"
+                                "User-Agent" to USER_AGENT,
+                                "Referer" to targetUrl,
+                                "Origin" to originValue2,
+                                "Cookie" to cookies,
+                                "Accept" to "*/*"
                             )
 
                             val m3u8Resp = app.get(m3u8Url, headers = m3u8Headers, interceptor = cfInterceptor)
