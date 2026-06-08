@@ -1060,11 +1060,11 @@ class PhimNguonCProvider : MainAPI() {
                                     if (jsResult != null) {
                                         if (jsResult.first != null) {
                                             token = jsResult.first
-                                            println("[NguonC] Found token in JS: ${token.take(20)}...")
+                                            println("[NguonC] Found token in JS: ${token?.take(20)}...")
                                         }
                                         if (jsResult.second != null && kX == null) {
                                             kX = jsResult.second
-                                            println("[NguonC] Found kX in JS: ${kX.take(20)}...")
+                                            println("[NguonC] Found kX in JS: ${kX?.take(20)}...")
                                         }
                                     }
                                 }
@@ -1072,7 +1072,7 @@ class PhimNguonCProvider : MainAPI() {
                                 // ── STEP 3: Try using hD from data-obf as token if sUb is null ──
                                 if (token == null && obfData != null && obfData.second != null) {
                                     val hD = obfData.second
-                                    println("[NguonC] Trying hD as token: ${hD.take(20)}...")
+                                    println("[NguonC] Trying hD as token: ${hD?.take(20)}...")
                                     token = hD
                                 }
                             }
