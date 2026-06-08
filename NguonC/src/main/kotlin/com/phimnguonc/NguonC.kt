@@ -33,7 +33,20 @@ class PhimNguonCProvider : MainAPI() {
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-    private val cfInterceptor = WebViewResolver(Regex(""".*streamc\.xyz|.*amass\d+\.top|.*hihihoho\d+\.top|.*phimmoi\.net|.*seouls\d+\.amass\d+\.top"""))
+    // Interceptors for CloudFlare bypass
+    // Broad m3u8/m3u9 interceptor - matches on ANY domain
+    private val broadM3u8Interceptor = WebViewResolver(
+        Regex(""".*\.(m3u8|m3u9)(\?|$)""")
+    )
+    private val m3u8Interceptor = WebViewResolver(
+        Regex(""".*streamc\.xyz/[^?]*\.(m3u8|m3u9)(\?|$)""")
+    )
+    private val cfInterceptor = WebViewResolver(
+        Regex(""".*streamc\.xyz|.*amass\d+\.top|.*hihihoho\d+\.top|.*phimmoi\.net|.*seouls\d+\.amass\d+\.top""")
+    )
+    private val embedPageInterceptor = WebViewResolver(
+        Regex(""".*streamc\.xyz/embed\.php""")
+    )
 
     private val commonHeaders = mapOf(
         "User-Agent"      to USER_AGENT,
@@ -157,14 +170,14 @@ class PhimNguonCProvider : MainAPI() {
             val serverName = server.server_name ?: server.name ?: if (idx == 0) "Vietsub" else "Thuy\u1EBFt minh"
             val items = server.items ?: server.list
             items?.forEach { ep ->
-                val directM3u8 = ep.m3u8
-                if (!directM3u8.isNullOrBlank()) {
+                val embed = ep.embed?.replace("\\/", "/") ?: ""
+                val directM3u8 = ep.m3u8?.replace("\\/", "/") ?: ""
+
+                if (embed.isNotBlank()) {
+                    epMap.getOrPut(ep.name ?: "0") { mutableListOf() }.add("$serverName::$embed")
+                }
+                if (directM3u8.isNotBlank() && directM3u8 != embed) {
                     epMap.getOrPut(ep.name ?: "0") { mutableListOf() }.add("$serverName::$directM3u8")
-                } else {
-                    val embed = ep.embed?.replace("\\/", "/") ?: ""
-                    if (embed.isNotBlank()) {
-                        epMap.getOrPut(ep.name ?: "0") { mutableListOf() }.add("$serverName::$embed")
-                    }
                 }
             }
         }
@@ -377,10 +390,9 @@ class PhimNguonCProvider : MainAPI() {
                 line
             } else if (trimmed.startsWith("http")) {
                 "$proxyBase/seg/${java.net.URLEncoder.encode(trimmed, "UTF-8")}"
-            } else if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
+            } else if (trimmed.isNotEmpty()) {
                 val resolvedUrl = if (m3u8BaseUrl.isNotEmpty()) {
-                    val base = m3u8BaseUrl.trimEnd('/')
-                    "$base/$trimmed"
+                    "${m3u8BaseUrl.trimEnd('/')}/$trimmed"
                 } else {
                     trimmed
                 }
@@ -395,7 +407,7 @@ class PhimNguonCProvider : MainAPI() {
         }
     }
 
-    /** Create proxy server and register m3u8 link - returns true if link was added */
+    /** Create proxy server and register m3u8 link */
     private suspend fun registerM3U8Link(
         m3u8Content: String, referer: String, m3u8BaseUrl: String,
         serverName: String, callback: (ExtractorLink) -> Unit
@@ -413,174 +425,172 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  Streamc.xyz token & key extraction
+    //  Token & key extraction helpers
     // ═══════════════════════════════════════════════════════════════════════════
-    //
-    //  The embed page uses JWPlayer with file parameter:
-    //    OLD way: {"file":"BASE64_TOKEN.m3u9"}   → token directly in HTML
-    //    NEW way: {"file":"blob:https://..."}     → JS constructs blob from XHR to TOKEN.m3u9
-    //
-    //  BASE64_TOKEN = Base64URL of {"h":"32hex_hash","t":"40hex_token"}
-    //  .m3u9 extension → plain m3u8 response
-    //  .m3u8 extension → AES-256-GCM encrypted response (#ENC-AESGCM header)
 
-    /** Search HTML for the JWPlayer file token.
-     *  Returns Pair(token, hadBlobUrl):
-     *    token = the base64 string WITHOUT .m3u8/.m3u9 extension, or null
-     *    hadBlobUrl = true if a blob: URL was detected (need WebView approach) */
-    private fun findTokenInHTML(html: String): Pair<String?, Boolean> {
-        var hadBlobUrl = false
+    private fun hexToBytes(hex: String): ByteArray =
+        hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 
-        // Pattern 1: JWPlayer file with blob URL
-        val blobMatch = Regex(""""file"\s*:\s*"(blob:[^"]+)"""").find(html)
-        if (blobMatch != null) {
-            println("[NguonC] Found blob URL in jwplayer: ${blobMatch.groupValues[1].take(40)}...")
-            hadBlobUrl = true
-        }
-
-        // Pattern 2: JWPlayer file with token.m3u9 or token.m3u8
-        // Use permissive regex to catch all base64 variants (standard + url-safe + padding)
-        val tokenPatterns = listOf(
-            Regex(""""file"\s*:\s*"([A-Za-z0-9_+/=\\-]+)\.(m3u8|m3u9)""""),
-            Regex("""file\s*[:=]\s*["']([A-Za-z0-9_+/=\\-]+)\.(m3u8|m3u9)["']"""),
-            Regex("""["']([A-Za-z0-9_+/=\\-]{20,})\.(m3u8|m3u9)["']"""),
-            // Also catch: var xxx = "TOKEN.m3u9" or url: "TOKEN.m3u9"
-            Regex("""(?:var|let|const)\s+\w+\s*=\s*["']([A-Za-z0-9_+/=\\-]+)\.(m3u8|m3u9)["']"""),
-            Regex("""(?:url|src|source|stream)\s*[:=]\s*["']([A-Za-z0-9_+/=\\-]+)\.(m3u8|m3u9)["']""")
-        )
-
-        for (pattern in tokenPatterns) {
-            val match = pattern.find(html)
-            if (match != null) {
-                val token = match.groupValues.getOrNull(1)
-                if (token != null && token.length > 10 && !token.startsWith("blob:")) {
-                    println("[NguonC] Found token in HTML: ${token.take(20)}... (length=${token.length})")
-                    return Pair(token, hadBlobUrl)
-                }
-            }
-        }
-        return Pair(null, hadBlobUrl)
+    private fun padBase64(s: String): String {
+        val padNeeded = (4 - s.length % 4) % 4
+        return s + "=".repeat(padNeeded)
     }
 
-    /** Try to find token in data-obf attribute (older embed pages) */
-    private fun parseStreamcObf(html: String): String? {
+    /** Convert token to URL-safe base64 (no + / =) for use in URL paths */
+    private fun toUrlSafeBase64(token: String): String {
+        return token.replace('+', '-').replace('/', '_').trimEnd('=')
+    }
+
+    /** Decode the token (base64 JSON) -> {"h":"32hex","t":"39-40hex"} */
+    private fun decodeStreamcToken(token: String): Triple<String, String, String>? {
+        val normalized = token.replace('-', '+').replace('_', '/').let { padBase64(it) }
+        val decoders = listOf(
+            Pair("URL_SAFE") { Base64.decode(token, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP) },
+            Pair("DEFAULT")  { Base64.decode(normalized, Base64.DEFAULT) }
+        )
+        for ((method, decoder) in decoders) {
+            try {
+                val decoded = String(decoder(), Charsets.UTF_8)
+                val h = Regex(""""h"\s*:\s*"([a-fA-F0-9]+)"""").find(decoded)?.groupValues?.get(1)
+                val t = Regex(""""t"\s*:\s*"([a-fA-F0-9]+)"""").find(decoded)?.groupValues?.get(1)
+                if (h != null && t != null) {
+                    println("[NguonC] Decoded token ($method): h=${h.length}hex, t=${t.length}hex")
+                    return Triple(decoded, h, t)
+                }
+            } catch (_: Exception) { continue }
+        }
+        return null
+    }
+
+    /** Extract sUb (token), hD (hash), kX (encryption key) from data-obf attribute
+     *  Tries both standard and URL-safe base64 decoding */
+    private fun extractObfData(html: String): Triple<String?, String?, String?>? {
         val obfBase64 = Regex("""data-obf="([^"]+)"""").find(html)?.groupValues?.getOrNull(1)
             ?: Regex("""data-obf='([^']+)'""").find(html)?.groupValues?.getOrNull(1)
             ?: return null
-        try {
-            val obfJson = String(Base64.decode(obfBase64, Base64.DEFAULT), Charsets.UTF_8)
-            // Try sUb first (it's the URL slug/token)
-            val sUb = Regex(""""sUb"\s*:\s*"([^"]+)"""").find(obfJson)?.groupValues?.get(1)
-            if (sUb != null && sUb.length > 10) {
-                println("[NguonC] Found sUb from data-obf: ${sUb.take(20)}...")
-                return sUb
-            }
-            // Also try "file" or "url" inside obf JSON
-            val fileToken = Regex(""""(?:file|url)"\s*:\s*"([A-Za-z0-9_+/=\\-]+)\.(m3u8|m3u9)"""").find(obfJson)
-            if (fileToken != null) {
-                val t = fileToken.groupValues.getOrNull(1)
-                if (t != null && t.length > 10) {
-                    println("[NguonC] Found token from data-obf file field: ${t.take(20)}...")
-                    return t
-                }
-            }
-        } catch (_: Exception) {}
-        return null
-    }
 
-    /** Find AES-GCM encryption key (kX) from multiple sources:
-     *  1. data-obf attribute in HTML
-     *  2. Inline <script> tags
-     *  3. player1.js
-     *  4. debug.js */
-    private suspend fun findEncryptionKey(html: String, embedDomain: String, referer: String): String? {
-        // Source 1: data-obf attribute
-        val obfBase64 = Regex("""data-obf="([^"]+)"""").find(html)?.groupValues?.getOrNull(1)
-            ?: Regex("""data-obf='([^']+)'""").find(html)?.groupValues?.getOrNull(1)
-        if (obfBase64 != null) {
+        // Try multiple base64 decode methods
+        val decodeMethods = listOf<Pair<String, () -> ByteArray>>(
+            "DEFAULT" to { Base64.decode(obfBase64, Base64.DEFAULT) },
+            "URL_SAFE" to { Base64.decode(obfBase64, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP) },
+            "NORMALIZED" to {
+                val normalized = padBase64(obfBase64.replace('-', '+').replace('_', '/'))
+                Base64.decode(normalized, Base64.DEFAULT)
+            }
+        )
+
+        for ((methodName, decoder) in decodeMethods) {
             try {
-                val obfJson = String(Base64.decode(obfBase64, Base64.DEFAULT), Charsets.UTF_8)
-                val kX = Regex(""""kX"\s*:\s*"([^"]+)"""").find(obfJson)?.groupValues?.get(1)
-                if (kX != null && kX.length >= 16) {
-                    println("[NguonC] Found kX from data-obf: length=${kX.length}, value=${kX}")
-                    return kX
+                val obfJson = String(decoder(), Charsets.UTF_8)
+                println("[NguonC] data-obf decoded ($methodName): ${obfJson.take(200)}")
+
+                // Try multiple field name patterns (site may use different names)
+                val tokenPatterns = listOf("sUb", "sub", "token", "tkn", "sU", "Su")
+                val hashPatterns = listOf("hD", "hd", "hash", "hsh")
+                val keyPatterns = listOf("kX", "kx", "key", "aesKey", "encKey", "kE", "Ke")
+
+                var sUb: String? = null
+                var hD: String? = null
+                var kX: String? = null
+
+                for (p in tokenPatterns) {
+                    val match = Regex(""""${Regex.escape(p)}"\s*:\s*"([^"]+)"""").find(obfJson)
+                    if (match != null) { sUb = match.groupValues[1]; break }
                 }
-            } catch (_: Exception) {}
-        }
-
-        // Source 2: Inline <script> tags - look for key patterns
-        val scriptContents = Regex("""<script[^>]*>([\s\S]*?)</script>""", RegexOption.IGNORE_CASE)
-            .findAll(html).map { it.groupValues[1] }.toList()
-        for (script in scriptContents) {
-            // Look for kX, key, or aesKey variable assignments
-            val keyPatterns = listOf(
-                Regex("""(?:kX|key|aesKey|encKey)\s*[:=]\s*["']([a-fA-F0-9]{32,})["']"""),
-                Regex("""["'](kX|key|aesKey)["']\s*:\s*["']([a-fA-F0-9]{32,})["']""")
-            )
-            for (pattern in keyPatterns) {
-                val match = pattern.find(script)
-                if (match != null) {
-                    val key = match.groupValues.last()  // last group has the actual key value
-                    if (key.length >= 32) {
-                        println("[NguonC] Found encryption key in inline script: ${key.take(20)}...")
-                        return key
-                    }
+                for (p in hashPatterns) {
+                    val match = Regex(""""${Regex.escape(p)}"\s*:\s*"([^"]+)"""").find(obfJson)
+                    if (match != null) { hD = match.groupValues[1]; break }
                 }
-            }
-        }
+                for (p in keyPatterns) {
+                    val match = Regex(""""${Regex.escape(p)}"\s*:\s*"([^"]+)"""").find(obfJson)
+                    if (match != null) { kX = match.groupValues[1]; break }
+                }
 
-        // Source 3: player1.js
-        val kXFromPlayer = findKeyInJS(html, embedDomain, referer, "player1")
-        if (kXFromPlayer != null) return kXFromPlayer
+                if (sUb != null || hD != null || kX != null) {
+                    println("[NguonC] data-obf ($methodName): sUb=${sUb?.take(20)}... hD=${hD?.take(20)}... kX=${kX?.take(20)}...")
+                    return Triple(sUb, hD, kX)
+                }
 
-        // Source 4: debug.js
-        val kXFromDebug = findKeyInJS(html, embedDomain, referer, "debug")
-        if (kXFromDebug != null) return kXFromDebug
-
-        return null
-    }
-
-    /** Search a JS file for encryption key patterns */
-    private suspend fun findKeyInJS(html: String, embedDomain: String, referer: String, jsName: String): String? {
-        val jsMatch = Regex("""src=["']([^"']*${jsName}[^"']*\.js[^"']*)["']""", RegexOption.IGNORE_CASE).find(html)
-        if (jsMatch != null) {
-            val jsPath = jsMatch.groupValues[1]
-            val jsUrl = if (jsPath.startsWith("http")) jsPath else "$embedDomain/$jsPath"
-            try {
-                val jsContent = app.get(jsUrl, headers = mapOf(
-                    "Referer" to referer, "User-Agent" to USER_AGENT
-                )).text
-
-                val keyPatterns = listOf(
-                    Regex("""(?:kX|key|aesKey|encKey)\s*[:=]\s*["']([a-fA-F0-9]{32,})["']"""),
-                    Regex("""["'](kX|key|aesKey|encKey)["']\s*:\s*["']([a-fA-F0-9]{32,})["']"""),
-                    // Also look for the key as a hex string in variable assignments
-                    Regex("""(?:var|let|const)\s+\w*[Kk]ey\w*\s*=\s*["']([a-fA-F0-9]{32,})["']"""),
-                    // Look for key derivation patterns
-                    Regex("""decrypt\s*\(\s*(?:data|encrypted|enc)\s*,\s*["']([a-fA-F0-9]{32,})["']""")
-                )
-
-                for (pattern in keyPatterns) {
-                    val match = pattern.find(jsContent)
-                    if (match != null) {
-                        val key = match.groupValues.last()
-                        if (key.length >= 32) {
-                            println("[NguonC] Found encryption key in $jsName.js: ${key.take(20)}...")
-                            return key
+                // If no named fields found, try to extract any JSON value that looks like a token
+                if (sUb == null && hD == null && kX == null) {
+                    // Look for any base64-like string that could be a token
+                    val allValues = Regex(""""(\w+)"\s*:\s*"([A-Za-z0-9_+/=-]{20,})"""").findAll(obfJson).toList()
+                    for (match in allValues) {
+                        val key = match.groupValues[1]
+                        val value = match.groupValues[2]
+                        println("[NguonC] data-obf found field: $key = ${value.take(20)}...")
+                        // Heuristic: if value looks like base64 JSON token, use it as sUb
+                        if (value.length > 30 && (value.contains("=") || value.any { it in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" })) {
+                            if (sUb == null) {
+                                sUb = value
+                                println("[NguonC] data-obf heuristic: using $key as sUb")
+                            }
                         }
                     }
+                    if (sUb != null) return Triple(sUb, hD, kX)
                 }
             } catch (e: Exception) {
-                println("[NguonC] Failed to fetch $jsName.js: ${e.message}")
+                println("[NguonC] data-obf decode error ($methodName): ${e.message}")
             }
         }
         return null
     }
 
-    /** Find token from external JS files (player1.js, debug.js) */
-    private suspend fun findTokenInJS(html: String, embedDomain: String, referer: String): String? {
-        val jsNames = listOf("player1", "player", "debug", "config")
-        for (jsName in jsNames) {
+    /** Find token in HTML - returns token string (without .m3u8/.m3u9 extension) or null */
+    private fun findTokenInHTML(html: String): String? {
+        val patterns = listOf(
+            // JWPlayer file config with token
+            Regex(""""file"\s*:\s*"([A-Za-z0-9_+/=\\-]+)\.(m3u8|m3u9)""""),
+            Regex("""file\s*[:=]\s*["']([A-Za-z0-9_+/=\\-]+)\.(m3u8|m3u9)["']"""),
+            // Any quoted string ending in .m3u8/.m3u9
+            Regex("""["']([A-Za-z0-9_+/=\\-]{20,})\.(m3u8|m3u9)["']"""),
+            // Variable assignment
+            Regex("""(?:var|let|const)\s+\w+\s*=\s*["']([A-Za-z0-9_+/=\\-]+)\.(m3u8|m3u9)["']"""),
+            // URL in HTML src/href
+            Regex("""(?:src|href)\s*=\s*["']([^"']*?(m3u8|m3u9))["']"""),
+            // JWPlayer setup with sources array
+            Regex(""""file"\s*:\s*"([^"]+\.(m3u8|m3u9))""""),
+            // Any URL-like path ending in .m3u8/.m3u9
+            Regex("""/([A-Za-z0-9_+/=\\-]{20,})\.(m3u8|m3u9)""")
+        )
+        for (pattern in patterns) {
+            val matches = pattern.findAll(html)
+            for (match in matches) {
+                val token = match.groupValues.getOrNull(1)
+                if (token != null && token.length > 10 && !token.startsWith("blob:") && !token.startsWith("http")) {
+                    println("[NguonC] Found token in HTML: ${token.take(20)}... (len=${token.length}, pattern=${pattern.pattern.take(40)})")
+                    return token
+                }
+            }
+        }
+        return null
+    }
+
+    /** Find kX (encryption key) from data-obf, inline scripts, or JS files */
+    private suspend fun findEncryptionKey(html: String, embedDomain: String, referer: String): String? {
+        // Source 1: data-obf
+        val obfData = extractObfData(html)
+        if (obfData != null && obfData.third != null) {
+            println("[NguonC] Found kX from data-obf: ${obfData.third}")
+            return obfData.third
+        }
+
+        // Source 2: Inline scripts
+        val scripts = Regex("""<script[^>]*>([\s\S]*?)</script>""", RegexOption.IGNORE_CASE)
+            .findAll(html).map { it.groupValues[1] }.toList()
+        for (script in scripts) {
+            val match = Regex("""(?:kX|key|aesKey|encKey)\s*[:=]\s*["']([a-fA-F0-9]{32,})["']""").find(script)
+            if (match != null) {
+                val key = match.groupValues[1]
+                if (key.length >= 32) {
+                    println("[NguonC] Found kX in inline script: ${key.take(20)}...")
+                    return key
+                }
+            }
+        }
+
+        // Source 3: External JS files
+        for (jsName in listOf("player1", "debug", "player", "config", "app")) {
             val jsMatch = Regex("""src=["']([^"']*${jsName}[^"']*\.js[^"']*)["']""", RegexOption.IGNORE_CASE).find(html)
             if (jsMatch != null) {
                 val jsPath = jsMatch.groupValues[1]
@@ -589,351 +599,370 @@ class PhimNguonCProvider : MainAPI() {
                     val jsContent = app.get(jsUrl, headers = mapOf(
                         "Referer" to referer, "User-Agent" to USER_AGENT
                     )).text
-
-                    val jsTokenPatterns = listOf(
-                        Regex(""""file"\s*:\s*"([A-Za-z0-9_+/=\\-]+)\.(m3u8|m3u9)""""),
-                        Regex("""(?:streamURL|fileUrl|videoUrl|sourceUrl)\s*=\s*["']([A-Za-z0-9_+/=\\-]{20,})"""),
-                        Regex("""["']([A-Za-z0-9_+/=\\-]{20,})\.(m3u8|m3u9)["']"""),
-                        // Look for URL construction patterns
-                        Regex("""(?:url|src)\s*[+=]\s*["']([A-Za-z0-9_+/=\\-]{20,})"""),
-                        Regex("""["']([A-Za-z0-9_+/=\\-]{20,})\.(m3u8|m3u9)""""),
-                        // Look for base64-looking strings that could be the token
-                        Regex("""(?:var|let|const)\s+\w*[Tt]oken\w*\s*=\s*["']([A-Za-z0-9_+/=\\-]{20,})["']""")
-                    )
-                    for (pattern in jsTokenPatterns) {
+                    // Try different key patterns
+                    for (pattern in listOf(
+                        Regex("""(?:kX|key|aesKey|encKey|secretKey|decryptKey)\s*[:=]\s*["']([a-fA-F0-9]{32,})["']"""),
+                        Regex("""["']([a-fA-F0-9]{32})["']\s*,?\s*//\s*(?:key|aes|encrypt|decrypt)""", RegexOption.IGNORE_CASE)
+                    )) {
                         val match = pattern.find(jsContent)
                         if (match != null) {
-                            val candidate = match.groupValues.getOrNull(1)
-                            if (candidate != null && candidate.length > 10) {
-                                println("[NguonC] Found token in $jsName.js: ${candidate.take(20)}...")
-                                return candidate
-                            }
+                            println("[NguonC] Found kX in $jsName.js: ${match.groupValues[1].take(20)}...")
+                            return match.groupValues[1]
                         }
                     }
-                } catch (e: Exception) {
-                    println("[NguonC] Failed to fetch $jsName.js for token: ${e.message}")
-                }
+                } catch (_: Exception) {}
             }
         }
         return null
     }
 
-    private fun hexToBytes(hex: String): ByteArray {
-        return hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
-    }
+    /** Parse player1.js to find token construction logic and extract token data */
+    private suspend fun extractTokenFromJS(html: String, embedDomain: String, referer: String, urlHash: String?): Pair<String?, String?>? {
+        // Find all script src URLs
+        val scriptSrcs = Regex("""src=["']([^"']*\.js[^"']*)["']""", RegexOption.IGNORE_CASE)
+            .findAll(html).map { it.groupValues[1] }.toList()
 
-    /** Decode the sUb token (base64 JSON) and extract h and t fields for key derivation.
-     *  sUb = base64({"h":"32hex_hash","t":"64hex_token"}) */
-    private fun decodeStreamcToken(token: String): Triple<String, String, String>? {
-        return try {
-            val decoded = String(Base64.decode(token, Base64.DEFAULT), Charsets.UTF_8)
-            val h = Regex(""""h"\s*:\s*"([a-fA-F0-9]+)"""").find(decoded)?.groupValues?.get(1)
-            val t = Regex(""""t"\s*:\s*"([a-fA-F0-9]+)"""").find(decoded)?.groupValues?.get(1)
-            if (h != null && t != null) {
-                println("[NguonC] Decoded token: h=${h.take(16)}... (${h.length}hex), t=${t.take(16)}... (${t.length}hex)")
-                Triple(decoded, h, t)
-            } else null
-        } catch (_: Exception) { null }
-    }
+        println("[NguonC] Found ${scriptSrcs.size} script sources in HTML")
 
-    /** Derive AES key from token using multiple methods.
-     *  CRITICAL: The token is a base64 JSON with h and t hex fields.
-     *  The JavaScript player likely uses these fields directly as AES keys. */
-    private fun deriveKeyFromToken(token: String): List<Pair<String, ByteArray>> {
-        val keys = mutableListOf<Pair<String, ByteArray>>()
-
-        // === Method A: Decode token and use h/t fields directly ===
-        val decoded = decodeStreamcToken(token)
-        if (decoded != null) {
-            val (_, h, t) = decoded
-
-            // t is 64 hex = 32 bytes → AES-256-GCM (most likely the actual key!)
-            if (t.length == 64) {
-                try { keys.add(Pair("t-hexBytes(AES256)", hexToBytes(t))) } catch (_: Exception) {}
-            }
-            // h is 32 hex = 16 bytes → AES-128-GCM
-            if (h.length == 32) {
-                try { keys.add(Pair("h-hexBytes(AES128)", hexToBytes(h))) } catch (_: Exception) {}
-            }
-            // t first 32 hex = 16 bytes → AES-128
-            if (t.length >= 32) {
-                try { keys.add(Pair("t-first16bytes(AES128)", hexToBytes(t.take(32)))) } catch (_: Exception) {}
-            }
-            // t last 32 hex = 16 bytes → AES-128
-            if (t.length >= 32) {
-                try { keys.add(Pair("t-last16bytes(AES128)", hexToBytes(t.takeLast(32)))) } catch (_: Exception) {}
-            }
-            // SHA-256 of t hex bytes
+        for (jsPath in scriptSrcs) {
+            val jsUrl = if (jsPath.startsWith("http")) jsPath else "$embedDomain/$jsPath"
             try {
-                val sha256 = MessageDigest.getInstance("SHA-256").digest(hexToBytes(t))
-                keys.add(Pair("SHA-256(t-hexBytes).16", sha256.copyOf(16)))
-                keys.add(Pair("SHA-256(t-hexBytes).32", sha256))
-            } catch (_: Exception) {}
-            // SHA-256 of h hex bytes
-            try {
-                val sha256 = MessageDigest.getInstance("SHA-256").digest(hexToBytes(h))
-                keys.add(Pair("SHA-256(h-hexBytes).16", sha256.copyOf(16)))
+                val jsContent = app.get(jsUrl, headers = mapOf(
+                    "Referer" to referer, "User-Agent" to USER_AGENT
+                )).text
+                println("[NguonC] Downloaded JS: ${jsPath.take(40)} (${jsContent.length} chars)")
+
+                // Look for token-like patterns: base64 strings that end up in URLs
+                // Pattern 1: variable = "BASE64STRING" where BASE64 is long enough to be a token
+                val b64Matches = Regex("""["']([A-Za-z0-9_+/=-]{40,})["']""").findAll(jsContent)
+                for (match in b64Matches) {
+                    val candidate = match.groupValues[1]
+                    // Check if this could be a base64 JSON token
+                    try {
+                        val decoded = String(Base64.decode(padBase64(candidate.replace('-', '+').replace('_', '/')), Base64.DEFAULT), Charsets.UTF_8)
+                        if (decoded.contains("\"h\"") && decoded.contains("\"t\"")) {
+                            println("[NguonC] Found token in JS: ${candidate.take(20)}... (decoded: ${decoded.take(50)})")
+                            // Also try to find kX in the same JS
+                            val kXMatch = Regex("""(?:kX|key|aesKey)\s*[:=]\s*["']([a-fA-F0-9]{32,})["']""").find(jsContent)
+                            return Pair(candidate, kXMatch?.groupValues?.get(1))
+                        }
+                    } catch (_: Exception) {}
+                }
+
+                // Pattern 2: URL construction like "/${token}.m3u9"
+                val urlPattern = Regex("""["']/([A-Za-z0-9_+/=-]+)\.(m3u8|m3u9)["']""").find(jsContent)
+                if (urlPattern != null) {
+                    val tokenStr = urlPattern.groupValues[1]
+                    if (tokenStr.length > 20) {
+                        println("[NguonC] Found token-like URL in JS: ${tokenStr.take(20)}...")
+                        val kXMatch = Regex("""(?:kX|key|aesKey)\s*[:=]\s*["']([a-fA-F0-9]{32,})["']""").find(jsContent)
+                        return Pair(tokenStr, kXMatch?.groupValues?.get(1))
+                    }
+                }
+
+                // Pattern 3: Look for btoa/atob usage with token construction
+                val tokenConstruct = Regex("""(?:btoa|atob|Base64)\s*\(\s*(?:JSON\.stringify\s*\(\s*\{[^}]*"h"[^}]*\})""").find(jsContent)
+                if (tokenConstruct != null) {
+                    println("[NguonC] Found token construction in JS: ${tokenConstruct.value.take(60)}...")
+                }
             } catch (_: Exception) {}
         }
-
-        // === Method B: Token string hash-based derivations ===
-        // SHA-256 of token UTF-8, take first 16 bytes (AES-128)
-        try {
-            val sha256 = MessageDigest.getInstance("SHA-256").digest(token.toByteArray(Charsets.UTF_8))
-            keys.add(Pair("SHA-256(token-utf8).16", sha256.copyOf(16)))
-            keys.add(Pair("SHA-256(token-utf8).32", sha256))
-        } catch (_: Exception) {}
-
-        // MD5 of token UTF-8 (16 bytes = AES-128)
-        try {
-            val md5 = MessageDigest.getInstance("MD5").digest(token.toByteArray(Charsets.UTF_8))
-            keys.add(Pair("MD5(token-utf8)", md5))
-        } catch (_: Exception) {}
-
-        // === Method C: Token as raw bytes ===
-        // Raw UTF-8 bytes of base64 token string
-        val tokenBytes = token.toByteArray(Charsets.UTF_8)
-        if (tokenBytes.size >= 32) {
-            keys.add(Pair("token-utf8-first32", tokenBytes.copyOf(32)))
-        }
-        if (tokenBytes.size >= 16) {
-            keys.add(Pair("token-utf8-first16", tokenBytes.copyOf(16)))
-        }
-
-        return keys
+        return null
     }
 
-    /** Decrypt AES-GCM encrypted m3u8 content.
-     *  Format: #ENC-AESGCM;iv=HEX12BYTES\n#EXT-X-B65:offset\nBASE64_CIPHERTEXT
-     *  Tries kX in various forms AND derived keys from token */
-    private fun decryptStreamcM3u8(content: String, keyHex: String, token: String? = null): String? {
-        return try {
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  AES-GCM Decryption
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private fun decryptStreamcM3u8(content: String, kX: String, token: String? = null): String? {
+        try {
             val ivMatch = Regex("""#ENC-AESGCM;iv=([a-f0-9A-F]+)""").find(content) ?: return null
             val ivHex = ivMatch.groupValues[1]
-            println("[NguonC] Decryption: iv=${ivHex} (${ivHex.length}hex), kX=${keyHex} (${keyHex.length}hex)")
-            if (ivHex.length != 24) {
-                println("[NguonC] WARNING: IV length ${ivHex.length} != 24 (12 bytes), trying anyway...")
-            }
             val iv = hexToBytes(ivHex)
+            println("[NguonC] Decrypt: iv=${ivHex.take(16)}... (${ivHex.length}hex), kX=$kX")
 
-            // Parse #EXT-X-B65 header
+            // Parse B65 header - supports both #EXT-X-B65:offset-length and #EXT-X-B65:offset
             val b65Match = Regex("""#EXT-X-B65:(\d+)(?:-(\d+))?""").find(content)
             val offset = b65Match?.groupValues?.get(1)?.toIntOrNull() ?: 0
             val length = b65Match?.groupValues?.get(2)?.toIntOrNull() ?: 0
-            println("[NguonC] B65: offset=$offset, length=$length")
 
-            // Extract base64 ciphertext (all non-comment, non-blank lines)
-            val lines = content.lines()
-            val dataLines = lines.dropWhile { it.startsWith("#") || it.isBlank() }
+            // Extract base64 ciphertext
+            val dataLines = content.lines().dropWhile { it.startsWith("#") || it.isBlank() }
             val b64Data = dataLines.joinToString("").trim()
-            if (b64Data.isEmpty()) return null
+            if (b64Data.isEmpty()) {
+                println("[NguonC] Decrypt: no data after headers")
+                return null
+            }
 
-            var encryptedData = Base64.decode(b64Data, Base64.DEFAULT)
-            println("[NguonC] Encrypted data size=${encryptedData.size} bytes, b64 length=${b64Data.length}")
-
-            // Apply offset/length if specified
+            var encData = Base64.decode(b64Data, Base64.DEFAULT)
             if (offset > 0 || length > 0) {
-                if (length > 0) {
-                    encryptedData = encryptedData.copyOfRange(offset, offset + length)
-                } else if (offset > 0) {
-                    encryptedData = encryptedData.copyOfRange(offset, encryptedData.size)
-                }
-                println("[NguonC] After offset/length: data size=${encryptedData.size}")
+                encData = if (length > 0) encData.copyOfRange(offset, minOf(offset + length, encData.size))
+                          else if (offset > 0) encData.copyOfRange(offset, encData.size)
+                          else encData
             }
 
-            // Build comprehensive list of key attempts
-            val keyAttempts = mutableListOf<Pair<String, ByteArray>>()
+            println("[NguonC] Decrypt: encData size=${encData.size}, offset=$offset, length=$length")
 
-            // ===== kX-based keys =====
-            // kX as raw UTF-8 bytes → AES-256 (MOST LIKELY for JS: TextEncoder.encode(kX))
-            val kxUtf8 = keyHex.toByteArray(Charsets.UTF_8)
-            if (kxUtf8.size == 16 || kxUtf8.size == 24 || kxUtf8.size == 32) {
-                keyAttempts.add(Pair("kX-utf8-raw(AES${kxUtf8.size*8})", kxUtf8))
-            }
-            // Also try trimming if kX is longer
-            if (kxUtf8.size > 32) {
-                keyAttempts.add(Pair("kX-utf8-first32", kxUtf8.copyOf(32)))
-            }
-            if (kxUtf8.size > 16) {
-                keyAttempts.add(Pair("kX-utf8-first16", kxUtf8.copyOf(16)))
-            }
+            // Build key candidates - ordered by likelihood
+            val keyCandidates = mutableListOf<Pair<String, ByteArray>>()
 
-            // kX as hex-decoded bytes → AES-128 (16 bytes from 32 hex chars)
-            if (keyHex.length >= 16 && keyHex.length % 2 == 0) {
+            // 1. kX as UTF-8 bytes (JS: TextEncoder.encode(kX))
+            val kxUtf8 = kX.toByteArray(Charsets.UTF_8)
+            if (kxUtf8.size == 16 || kxUtf8.size == 32) keyCandidates.add(Pair("kX-utf8", kxUtf8))
+            if (kxUtf8.size > 32) keyCandidates.add(Pair("kX-utf8-first32", kxUtf8.copyOf(32)))
+            if (kxUtf8.size > 16) keyCandidates.add(Pair("kX-utf8-first16", kxUtf8.copyOf(16)))
+
+            // 2. kX as hex-decoded bytes
+            if (kX.length >= 32 && kX.length % 2 == 0 && kX.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }) {
                 try {
-                    val hexBytes = hexToBytes(keyHex)
-                    if (hexBytes.size == 16 || hexBytes.size == 24 || hexBytes.size == 32) {
-                        keyAttempts.add(Pair("kX-hexBytes(AES${hexBytes.size*8})", hexBytes))
-                    }
+                    val hexBytes = hexToBytes(kX)
+                    if (hexBytes.size == 16 || hexBytes.size == 32) keyCandidates.add(Pair("kX-hexBytes", hexBytes))
                 } catch (_: Exception) {}
             }
 
-            // SHA-256 and MD5 of kX UTF-8
-            try {
-                val sha256 = MessageDigest.getInstance("SHA-256").digest(kxUtf8)
-                keyAttempts.add(Pair("SHA-256(kX-utf8).16", sha256.copyOf(16)))
-                keyAttempts.add(Pair("SHA-256(kX-utf8).32", sha256))
-            } catch (_: Exception) {}
-            try {
-                keyAttempts.add(Pair("MD5(kX-utf8)", MessageDigest.getInstance("MD5").digest(kxUtf8)))
-            } catch (_: Exception) {}
-
-            // SHA-256 of kX hex-decoded bytes
-            try {
-                val kxHexBytes = hexToBytes(keyHex)
-                val sha256hex = MessageDigest.getInstance("SHA-256").digest(kxHexBytes)
-                keyAttempts.add(Pair("SHA-256(kX-hexBytes).16", sha256hex.copyOf(16)))
-                keyAttempts.add(Pair("SHA-256(kX-hexBytes).32", sha256hex))
-            } catch (_: Exception) {}
-
-            // ===== Token-based keys =====
-            if (token != null && token.length > 10) {
-                keyAttempts.addAll(deriveKeyFromToken(token))
-            }
-
-            // ===== Combined keys (kX + h, kX XOR h, etc.) =====
-            val decodedToken = if (token != null) decodeStreamcToken(token) else null
-            if (decodedToken != null) {
-                val (_, h, t) = decodedToken
-                // kX XOR h (both 16 bytes if hex-decoded)
-                try {
-                    val kxBytes = hexToBytes(keyHex)
-                    val hBytes = hexToBytes(h)
-                    if (kxBytes.size == hBytes.size) {
-                        val xorBytes = ByteArray(kxBytes.size) { i -> (kxBytes[i].toInt() xor hBytes[i].toInt()).toByte() }
-                        keyAttempts.add(Pair("kX-XOR-h(AES${xorBytes.size*8})", xorBytes))
-                    }
-                } catch (_: Exception) {}
-                // kX + h concatenated as hex → 32 bytes → AES-256
-                try {
-                    val combined = hexToBytes(keyHex + h)
-                    if (combined.size == 32) {
-                        keyAttempts.add(Pair("kX+h-concat(AES256)", combined))
-                    }
-                } catch (_: Exception) {}
-                // SHA-256 of kX+h concatenated string
-                try {
-                    val sha256 = MessageDigest.getInstance("SHA-256").digest((keyHex + h).toByteArray(Charsets.UTF_8))
-                    keyAttempts.add(Pair("SHA-256(kX+h-utf8).16", sha256.copyOf(16)))
-                    keyAttempts.add(Pair("SHA-256(kX+h-utf8).32", sha256))
-                } catch (_: Exception) {}
-                // t field as raw UTF-8 bytes (if 32 bytes = AES-256)
-                val tUtf8 = t.toByteArray(Charsets.UTF_8)
-                if (tUtf8.size == 16 || tUtf8.size == 24 || tUtf8.size == 32) {
-                    keyAttempts.add(Pair("t-utf8-raw(AES${tUtf8.size*8})", tUtf8))
-                }
-            }
-
-            println("[NguonC] kX=${keyHex.take(20)}... (${keyHex.length}hex), token=${if (token != null) "${token.length}chars" else "null"}, key attempts: ${keyAttempts.size}")
-
-            // Build AAD (Additional Authenticated Data) candidates for AES-GCM
-            // The JavaScript player might use AAD for integrity verification
-            val aadCandidates = mutableListOf<Pair<String, ByteArray?>>()
-            aadCandidates.add(Pair("no-AAD", null))
-            // kX as UTF-8 AAD
-            aadCandidates.add(Pair("AAD=kX-utf8", keyHex.toByteArray(Charsets.UTF_8)))
-            // kX as hex bytes AAD
-            try { aadCandidates.add(Pair("AAD=kX-hexBytes", hexToBytes(keyHex))) } catch (_: Exception) {}
-            // IV as AAD (some implementations use IV as AAD)
-            aadCandidates.add(Pair("AAD=iv", iv))
-            // Token as AAD
+            // 3. Token-derived keys
             if (token != null) {
-                aadCandidates.add(Pair("AAD=token-utf8", token.toByteArray(Charsets.UTF_8)))
-            }
-            // h value as AAD
-            if (decodedToken != null) {
-                try { aadCandidates.add(Pair("AAD=h-hexBytes", hexToBytes(decodedToken.second))) } catch (_: Exception) {}
-            }
-
-            // Try all keys with AES-GCM (with and without AAD)
-            for (tagBits in listOf(128, 96)) {
-                for ((keyDesc, keyBytes) in keyAttempts) {
-                    if (keyBytes.size != 16 && keyBytes.size != 24 && keyBytes.size != 32) continue
-                    for ((aadDesc, aadBytes) in aadCandidates) {
-                        try {
-                            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-                            val spec = GCMParameterSpec(tagBits, iv)
-                            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), spec)
-                            if (aadBytes != null) {
-                                cipher.updateAAD(aadBytes)
-                            }
-                            val decrypted = cipher.doFinal(encryptedData)
-                            val result = String(decrypted, Charsets.UTF_8)
-                            if (result.contains("#EXTM3U")) {
-                                val tagInfo = if (tagBits != 128) " (GCM-${tagBits})" else ""
-                                val aadInfo = if (aadBytes != null) " + $aadDesc" else ""
-                                println("[NguonC] ✓ Decryption OK using $keyDesc$aadInfo$tagInfo")
-                                return result
-                            }
-                        } catch (_: Exception) {
-                            // Try next combination
-                        }
-                    }
+                val decoded = decodeStreamcToken(token)
+                if (decoded != null) {
+                    val (_, h, t) = decoded
+                    if (t.length == 64) try { keyCandidates.add(Pair("t-hexBytes(AES256)", hexToBytes(t))) } catch (_: Exception) {}
+                    if (h.length == 32) try { keyCandidates.add(Pair("h-hexBytes(AES128)", hexToBytes(h))) } catch (_: Exception) {}
+                    if (t.length >= 32) try { keyCandidates.add(Pair("t-first16", hexToBytes(t.take(32)))) } catch (_: Exception) {}
+                    if (t.length == 80) try { keyCandidates.add(Pair("t-hexBytes40-first32", hexToBytes(t.take(64)))) } catch (_: Exception) {}
                 }
+                try {
+                    val sha256 = MessageDigest.getInstance("SHA-256").digest(token.toByteArray(Charsets.UTF_8))
+                    keyCandidates.add(Pair("SHA256(token).16", sha256.copyOf(16)))
+                    keyCandidates.add(Pair("SHA256(token).32", sha256))
+                } catch (_: Exception) {}
+                // Also try token itself as UTF-8 key
+                val tokenUtf8 = token.toByteArray(Charsets.UTF_8)
+                if (tokenUtf8.size == 16 || tokenUtf8.size == 32) keyCandidates.add(Pair("token-utf8", tokenUtf8))
+                if (tokenUtf8.size > 16) keyCandidates.add(Pair("token-utf8-first16", tokenUtf8.copyOf(16)))
+                if (tokenUtf8.size > 32) keyCandidates.add(Pair("token-utf8-first32", tokenUtf8.copyOf(32)))
             }
 
-            // Last resort: try stripping last 16 bytes (maybe tag is separate)
-            // or trying with different ciphertext boundaries
-            if (encryptedData.size > 16) {
-                for ((keyDesc, keyBytes) in keyAttempts) {
-                    if (keyBytes.size != 16 && keyBytes.size != 24 && keyBytes.size != 32) continue
+            // 4. If kX is short, try padding it
+            if (kX.length in 17..31) {
+                // Pad kX hex to 32 chars
+                val padded = kX.padEnd(32, '0')
+                try { keyCandidates.add(Pair("kX-padded-32hex", hexToBytes(padded))) } catch (_: Exception) {}
+            }
+
+            println("[NguonC] Trying ${keyCandidates.size} key candidates...")
+
+            for ((desc, keyBytes) in keyCandidates) {
+                if (keyBytes.size != 16 && keyBytes.size != 32) continue
+                try {
+                    val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                    cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, iv))
+                    val result = String(cipher.doFinal(encData), Charsets.UTF_8)
+                    if (result.contains("#EXTM3U")) {
+                        println("[NguonC] Decryption OK with $desc!")
+                        return result
+                    }
+                } catch (_: Exception) {}
+            }
+
+            // 5. Try with different IV sizes (96 bits = 12 bytes is standard for GCM)
+            // But some implementations might use different IV sizes
+            if (iv.size != 12) {
+                println("[NguonC] IV size is ${iv.size} bytes (expected 12), trying standard size...")
+                for ((desc, keyBytes) in keyCandidates) {
+                    if (keyBytes.size != 16 && keyBytes.size != 32) continue
                     try {
-                        // Try without the last 16 bytes (maybe they're metadata, not part of ciphertext)
+                        // Use first 12 bytes of IV
+                        val truncatedIv = iv.copyOf(12)
                         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-                        val spec = GCMParameterSpec(128, iv)
-                        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), spec)
-                        val decrypted = cipher.doFinal(encryptedData.copyOf(encryptedData.size - 16))
-                        val result = String(decrypted, Charsets.UTF_8)
+                        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, truncatedIv))
+                        val result = String(cipher.doFinal(encData), Charsets.UTF_8)
                         if (result.contains("#EXTM3U")) {
-                            println("[NguonC] ✓ Decryption OK using $keyDesc (trimmed last 16)")
+                            println("[NguonC] Decryption OK with $desc (truncated IV)!")
                             return result
                         }
                     } catch (_: Exception) {}
                 }
             }
 
-            println("[NguonC] All ${keyAttempts.size}×${aadCandidates.size} key+AAD combinations failed for kX=${keyHex.take(20)}...")
-            null
+            println("[NguonC] All decryption attempts failed")
         } catch (e: Exception) {
-            println("[NguonC] Decryption FAILED: ${e.message}")
-            null
-        }
-    }
-
-    /** Use WebView to intercept the .m3u9/.m3u8 XHR request.
-     *  When JWPlayer uses a blob URL, the JS (player1.js) makes an XHR to TOKEN.m3u9.
-     *  We intercept this request via WebViewResolver to get the m3u8 content. */
-    private suspend fun captureViaWebView(
-        embedUrl: String, embedDomain: String
-    ): Pair<String, String>? {
-        // Regex to match the streamc.xyz m3u9/m3u8 URL
-        val m3u8Interceptor = WebViewResolver(
-            Regex(""".*streamc\.xyz.*\.(m3u8|m3u9)""")
-        )
-        try {
-            println("[NguonC] Trying WebView interception for: $embedUrl")
-            val resp = app.get(embedUrl, interceptor = m3u8Interceptor, headers = mapOf(
-                "Referer" to "$mainUrl/",
-                "User-Agent" to USER_AGENT
-            ))
-            val content = resp.text
-            val capturedUrl = resp.url ?: ""
-
-            if (content.isNotEmpty() && (content.contains("#EXTM3U") || content.contains("#ENC-AESGCM") || content.contains("m3u8"))) {
-                println("[NguonC] WebView captured response: length=${content.length}, starts=${content.take(40)}")
-                return Pair(content, capturedUrl)
-            } else {
-                println("[NguonC] WebView response doesn't look like m3u8: ${content.take(80)}")
-            }
-        } catch (e: Exception) {
-            println("[NguonC] WebView interception failed: ${e.message}")
+            println("[NguonC] Decryption error: ${e.message}")
         }
         return null
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    //  HTTP fetch helpers
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /** Fetch embed page HTML - tries multiple methods for maximum reliability */
+    private suspend fun fetchEmbedHTML(embedUrl: String, embedDomain: String): String? {
+        // Method 1: Direct HTTP GET (fastest, no WebView overhead)
+        try {
+            val resp = app.get(embedUrl, headers = mapOf(
+                "Referer" to "$mainUrl/", "User-Agent" to USER_AGENT,
+                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            ))
+            val html = resp.text
+            // Very lenient check - accept HTML if it has any sign of being an embed page
+            if (html.contains("data-obf") || html.contains("jwplayer") || html.contains("player1") ||
+                html.contains("streamc") || html.contains("embed") || html.contains("<video") ||
+                html.contains("m3u8") || html.contains("m3u9")) {
+                println("[NguonC] Direct HTML OK: ${html.length} chars")
+                return html
+            }
+            // Even if no known markers, return it if it's a substantial HTML page
+            if (html.length > 500 && html.contains("<")) {
+                println("[NguonC] Direct HTML (no markers but substantial): ${html.take(200)}")
+                return html
+            }
+            println("[NguonC] Direct HTML not embed page: ${html.take(100)}")
+        } catch (e: Exception) {
+            println("[NguonC] Direct HTML failed: ${e.message}")
+        }
+
+        // Method 2: WebView with embedPageInterceptor (for CloudFlare bypass)
+        try {
+            val resp = app.get(embedUrl, interceptor = embedPageInterceptor, headers = mapOf(
+                "Referer" to "$mainUrl/", "User-Agent" to USER_AGENT
+            ))
+            val html = resp.text
+            if (html.contains("data-obf") || html.contains("jwplayer") || html.contains("player1") ||
+                html.contains("streamc") || html.contains("embed") || html.contains("<video") ||
+                html.contains("m3u8") || html.contains("m3u9") || html.length > 500) {
+                println("[NguonC] WebView embed HTML OK: ${html.length} chars")
+                return html
+            }
+        } catch (e: Exception) {
+            println("[NguonC] WebView embed HTML failed: ${e.message}")
+        }
+
+        // Method 3: WebView with cfInterceptor (broader, for tough CloudFlare)
+        try {
+            val resp = app.get(embedUrl, interceptor = cfInterceptor, headers = mapOf(
+                "Referer" to "$mainUrl/", "User-Agent" to USER_AGENT
+            ))
+            val html = resp.text
+            if (html.contains("data-obf") || html.contains("jwplayer") || html.contains("player1") ||
+                html.contains("streamc") || html.contains("embed") || html.contains("<video") ||
+                html.contains("m3u8") || html.contains("m3u9") || html.length > 500) {
+                println("[NguonC] cfInterceptor HTML OK: ${html.length} chars")
+                return html
+            }
+        } catch (e: Exception) {
+            println("[NguonC] cfInterceptor HTML failed: ${e.message}")
+        }
+
+        println("[NguonC] All HTML fetch methods failed for: $embedUrl")
+        return null
+    }
+
+    /** Direct HTTP fetch of m3u8/m3u9 URL */
+    private suspend fun fetchDirect(url: String, referer: String, origin: String): String? {
+        val headers = mapOf(
+            "User-Agent" to USER_AGENT,
+            "Referer" to referer,
+            "Origin" to origin,
+            "Accept" to "*/*"
+        )
+        // Try direct fetch
+        try {
+            val resp = app.get(url, headers = headers)
+            val content = resp.text
+            if (content.contains("#EXTM3U") || content.contains("#ENC-AESGCM")) {
+                println("[NguonC] Direct fetch OK: ${url.take(60)}")
+                return content
+            }
+            println("[NguonC] Direct fetch response: ${content.take(80)}")
+        } catch (_: Exception) {}
+        // Try with cfInterceptor
+        try {
+            val resp = app.get(url, headers = headers, interceptor = cfInterceptor)
+            val content = resp.text
+            if (content.contains("#EXTM3U") || content.contains("#ENC-AESGCM")) {
+                println("[NguonC] cfInterceptor fetch OK: ${url.take(60)}")
+                return content
+            }
+        } catch (_: Exception) {}
+        return null
+    }
+
+    /** Try fetching m3u8 with various token formats */
+    private suspend fun tryFetchWithToken(
+        token: String, embedDomain: String, referer: String,
+        kX: String?, serverName: String, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        // Generate all possible URL variations for the token
+        val urlVariations = mutableListOf<Pair<String, String>>()
+
+        // 1. URL-safe base64 (standard for streamc.xyz)
+        val urlSafeToken = toUrlSafeBase64(token)
+        urlVariations.add(Pair(urlSafeToken, "urlSafe"))
+
+        // 2. URL-encoded original token (in case + and / need encoding)
+        if (token != urlSafeToken) {
+            urlVariations.add(Pair(URLEncoder.encode(token, "UTF-8"), "urlEncoded"))
+        }
+
+        // 3. Original token as-is (in case it's already URL-safe)
+        if (token != urlSafeToken) {
+            urlVariations.add(Pair(token, "original"))
+        }
+
+        // 4. Normalized base64 (with + and / instead of - and _)
+        val normalizedToken = token.replace('-', '+').replace('_', '/')
+        if (normalizedToken != token && normalizedToken != urlSafeToken) {
+            urlVariations.add(Pair(URLEncoder.encode(normalizedToken, "UTF-8"), "normalized"))
+        }
+
+        for ((tokenVariant, desc) in urlVariations) {
+            for (ext in listOf(".m3u9", ".m3u8")) {
+                val m3u8Url = "$embedDomain/$tokenVariant$ext"
+                println("[NguonC] Trying $desc token: ${m3u8Url.take(80)}")
+                val m3u8Content = fetchDirect(m3u8Url, referer, embedDomain)
+
+                if (m3u8Content != null) {
+                    // Plain m3u8
+                    if (m3u8Content.contains("#EXTM3U") && !m3u8Content.contains("#ENC-AESGCM")) {
+                        println("[NguonC] Got plain m3u8 with $desc + $ext!")
+                        val m3u8Base = m3u8Url.substringBeforeLast("/") + "/"
+                        if (registerM3U8Link(m3u8Content, referer, m3u8Base, serverName, callback)) {
+                            return true
+                        }
+                    }
+                    // Encrypted m3u8
+                    if (m3u8Content.contains("#ENC-AESGCM")) {
+                        println("[NguonC] Got encrypted m3u8 with $desc + $ext, trying decrypt...")
+                        if (kX != null) {
+                            val decrypted = decryptStreamcM3u8(m3u8Content, kX, tokenVariant)
+                            if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
+                                println("[NguonC] Decrypted m3u8 OK!")
+                                if (registerM3U8Link(decrypted, referer, "", serverName, callback)) {
+                                    return true
+                                }
+                            }
+                        } else {
+                            println("[NguonC] No kX for decryption")
+                        }
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     //  Main link loading logic
     // ═══════════════════════════════════════════════════════════════════════════
+    //
+    //  STRATEGY (ordered by reliability):
+    //  1. Get embed HTML, extract token from data-obf, fetch m3u8
+    //  2. If token in HTML but not data-obf, use findTokenInHTML
+    //  3. If no token found, parse JS files (player1.js etc.) for token
+    //  4. WebView interception - let JS run and capture m3u8 request
+    //  5. Broader WebView interception (broadM3u8Interceptor) on any domain
+    //  6. Try URL hash-based token construction
+    //  7. Last resort: broader cfInterceptor
 
     override suspend fun loadLinks(
         data:             String,
@@ -966,286 +995,380 @@ class PhimNguonCProvider : MainAPI() {
                         ?: Regex("""(https?://[^/]+)""").find(targetUrl)?.groupValues?.getOrNull(1)
                         ?: "https://embed15.streamc.xyz"
 
-                    // ══════════════════════════════════════════════════════════════
-                    // Case 1: streamc.xyz embed page
-                    // ══════════════════════════════════════════════════════════════
-                    if (targetUrl.contains("streamc.xyz") && targetUrl.contains("embed.php") && targetUrl.contains("hash=")) {
-                        try {
-                            val embedRes = app.get(targetUrl, interceptor = cfInterceptor, headers = mapOf(
-                                "Referer" to "$mainUrl/", "User-Agent" to USER_AGENT
-                            ))
-                            val html = embedRes.text
-                            println("[NguonC] Embed page HTML length=${html.length}")
+                    // Extract hash from URL for fallback use
+                    val urlHash = Regex("""[?&]hash=([a-fA-F0-9]+)""").find(targetUrl)?.groupValues?.getOrNull(1)
 
-                            // ── Step 1: Try to find token in HTML ──────────────
-                            val (tokenFromHTML, hadBlobUrl) = findTokenInHTML(html)
-                            var token = tokenFromHTML
+                    try {
+                        // ══════════════════════════════════════════════════════════════
+                        // Streamc.xyz embed URL processing
+                        // ══════════════════════════════════════════════════════════════
+                        if (targetUrl.contains("streamc.xyz") || targetUrl.contains("phimmoi.net")) {
+                            println("[NguonC] === Processing: ${targetUrl.take(80)} ===")
 
-                            // ── Step 2: Try data-obf attribute ─────────────────
-                            if (token == null) {
-                                token = parseStreamcObf(html)
+                            var token: String? = null
+                            var kX: String? = null
+
+                            // ── STEP 1: Get embed HTML and extract token ──
+                            val html = fetchEmbedHTML(targetUrl, embedDomain)
+
+                            if (html != null) {
+                                // Extract from data-obf (primary method)
+                                val obfData = extractObfData(html)
+                                if (obfData != null) {
+                                    token = obfData.first   // sUb
+                                    kX = obfData.third      // kX
+                                    // Also use hD as fallback token if sUb is null
+                                    if (token == null && obfData.second != null) {
+                                        println("[NguonC] sUb is null, trying hD as token")
+                                    }
+                                    println("[NguonC] From data-obf: token=${token?.take(20)}... kX=${kX?.take(20)}... hD=${obfData.second?.take(20)}...")
+                                }
+
+                                // Fallback: find token in HTML source
+                                if (token == null) {
+                                    token = findTokenInHTML(html)
+                                    println("[NguonC] Fallback token from HTML: ${token?.take(20)}...")
+                                }
+
+                                // Fallback: try to find token from full URL in HTML
+                                if (token == null) {
+                                    val fullUrlMatch = Regex("""https?://embed\d+\.streamc\.xyz/([A-Za-z0-9_+/=\\-]+)\.(m3u8|m3u9)""").find(html)
+                                    if (fullUrlMatch != null) {
+                                        token = fullUrlMatch.groupValues[1]
+                                        println("[NguonC] Found token from full URL in HTML: ${token.take(20)}...")
+                                    }
+                                }
+
+                                // Fallback: try to find token from any path ending in .m3u8/.m3u9
+                                if (token == null) {
+                                    val pathMatch = Regex("""/([A-Za-z0-9_+/=\\-]{20,})\.(m3u8|m3u9)""").find(html)
+                                    if (pathMatch != null) {
+                                        token = pathMatch.groupValues[1]
+                                        println("[NguonC] Found token from path in HTML: ${token.take(20)}...")
+                                    }
+                                }
+
+                                // Get kX if not yet found
+                                if (kX == null) {
+                                    kX = findEncryptionKey(html, embedDomain, targetUrl)
+                                }
+
+                                // ── STEP 2: Parse JS files for token if not found in HTML ──
+                                if (token == null) {
+                                    println("[NguonC] Token not in HTML, trying JS files...")
+                                    val jsResult = extractTokenFromJS(html, embedDomain, targetUrl, urlHash)
+                                    if (jsResult != null) {
+                                        if (jsResult.first != null) {
+                                            token = jsResult.first
+                                            println("[NguonC] Found token in JS: ${token.take(20)}...")
+                                        }
+                                        if (jsResult.second != null && kX == null) {
+                                            kX = jsResult.second
+                                            println("[NguonC] Found kX in JS: ${kX.take(20)}...")
+                                        }
+                                    }
+                                }
+
+                                // ── STEP 3: Try using hD from data-obf as token if sUb is null ──
+                                if (token == null && obfData != null && obfData.second != null) {
+                                    val hD = obfData.second
+                                    println("[NguonC] Trying hD as token: ${hD.take(20)}...")
+                                    token = hD
+                                }
                             }
 
-                            // ── Step 3: Try external JS files ──────────────────
-                            if (token == null) {
-                                println("[NguonC] Token not in HTML/data-obf, trying JS files...")
-                                token = findTokenInJS(html, embedDomain, targetUrl)
+                            // ── STEP 4: Try fetching with extracted token ──
+                            if (token != null) {
+                                if (tryFetchWithToken(token, embedDomain, targetUrl, kX, serverName, callback)) {
+                                    linkFound = true; return@async
+                                }
                             }
 
-                            // ── Step 4: Direct fetch approach (if token found) ─
-                            if (token != null && !hadBlobUrl) {
-                                println("[NguonC] Using token: ${token!!.take(20)}... (length=${token!!.length})")
-                                val originValue: String = Regex("""https?://[^/]+""").find(targetUrl)?.value ?: ""
-                                val m3u8Headers = mapOf(
-                                    "User-Agent" to USER_AGENT,
-                                    "Referer" to targetUrl,
-                                    "Origin" to originValue,
-                                    "Accept" to "*/*"
-                                )
+                            // ── STEP 5: WebView interception - capture m3u8 directly ──
+                            if (!linkFound) {
+                                println("[NguonC] Step 5: WebView interception for m3u8/m3u9")
+                                try {
+                                    val resp = app.get(targetUrl, interceptor = m3u8Interceptor, headers = mapOf(
+                                        "Referer" to "$mainUrl/", "User-Agent" to USER_AGENT
+                                    ))
+                                    val content = resp.text
+                                    val capturedUrl = resp.url ?: ""
 
-                                // Try .m3u9 FIRST (returns plain m3u8), then .m3u8 (may be encrypted)
-                                for (ext in listOf(".m3u9", ".m3u8")) {
-                                    val m3u8Url = "$embedDomain/${token}$ext"
-                                    println("[NguonC] Trying direct fetch: $m3u8Url")
-                                    try {
-                                        val m3u8Resp = app.get(m3u8Url, headers = m3u8Headers, interceptor = cfInterceptor)
-                                        val m3u8Content = m3u8Resp.text
-                                        println("[NguonC] Response length=${m3u8Content.length}, starts: ${m3u8Content.take(60)}")
+                                    // Plain m3u8
+                                    if (content.contains("#EXTM3U") && !content.contains("#ENC-AESGCM")) {
+                                        println("[NguonC] WebView captured plain m3u8!")
+                                        val m3u8Base = if (capturedUrl.isNotEmpty()) capturedUrl.substringBeforeLast("/") + "/" else ""
+                                        if (registerM3U8Link(content, targetUrl, m3u8Base, serverName, callback)) {
+                                            linkFound = true; return@async
+                                        }
+                                    }
 
-                                        // Check if response is HTML error page (not m3u8 at all)
-                                        if (m3u8Content.contains("<!DOCTYPE") || m3u8Content.contains("<html") || m3u8Content.contains("<HTML")) {
-                                            println("[NguonC] Got HTML error page instead of m3u8 (token may be expired)")
-                                            continue
+                                    // Encrypted m3u8 captured via WebView
+                                    if (content.contains("#ENC-AESGCM")) {
+                                        println("[NguonC] WebView captured encrypted m3u8, trying decrypt...")
+                                        val capToken = Regex("""/([A-Za-z0-9+/=_-]+)\.(m3u8|m3u9)""").find(capturedUrl)?.groupValues?.get(1)
+
+                                        val encKX = kX ?: html?.let {
+                                            extractObfData(it)?.third ?: findEncryptionKey(it, embedDomain, targetUrl)
                                         }
 
-                                        if (m3u8Content.contains("#EXTM3U") && !m3u8Content.contains("#ENC-AESGCM")) {
-                                            // Plain m3u8!
-                                            println("[NguonC] Plain m3u8 found with $ext")
-                                            val m3u8Base = m3u8Url.substringBeforeLast("/") + "/"
-                                            if (registerM3U8Link(m3u8Content, targetUrl, m3u8Base, serverName, callback)) {
-                                                linkFound = true
-                                                break
-                                            }
-                                        } else if (m3u8Content.contains("#ENC-AESGCM")) {
-                                            // Encrypted m3u8 - need decryption key
-                                            println("[NguonC] Encrypted m3u8 with $ext, searching for key...")
-                                            val kX = findEncryptionKey(html, embedDomain, targetUrl)
-                                            if (kX != null) {
-                                                val decrypted = decryptStreamcM3u8(m3u8Content, kX, token)
-                                                if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
-                                                    println("[NguonC] Decrypted OK")
-                                                    if (registerM3U8Link(decrypted, targetUrl, "", serverName, callback)) {
-                                                        linkFound = true
-                                                        break
-                                                    }
+                                        if (encKX != null) {
+                                            val decrypted = decryptStreamcM3u8(content, encKX, capToken)
+                                            if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
+                                                println("[NguonC] Decrypted WebView m3u8 OK!")
+                                                if (registerM3U8Link(decrypted, targetUrl, "", serverName, callback)) {
+                                                    linkFound = true; return@async
                                                 }
-                                            } else {
-                                                println("[NguonC] No encryption key found")
                                             }
                                         }
-                                    } catch (e: Exception) {
-                                        println("[NguonC] Error fetching $ext: ${e.message}")
-                                        continue
+
+                                        // Try .m3u9 alternative (plain) from captured token
+                                        if (capToken != null && !linkFound) {
+                                            val altExt = if (capturedUrl.contains(".m3u8")) ".m3u9" else ".m3u8"
+                                            val altUrl = "$embedDomain/$capToken$altExt"
+                                            println("[NguonC] Trying alternative: ${altUrl.take(60)}")
+                                            val altContent = fetchDirect(altUrl, targetUrl, embedDomain)
+                                            if (altContent != null && altContent.contains("#EXTM3U") && !altContent.contains("#ENC-AESGCM")) {
+                                                val m3u8Base = altUrl.substringBeforeLast("/") + "/"
+                                                if (registerM3U8Link(altContent, targetUrl, m3u8Base, serverName, callback)) {
+                                                    linkFound = true; return@async
+                                                }
+                                            }
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    println("[NguonC] WebView interception failed: ${e.message}")
+                                }
+                            }
+
+                            // ── STEP 6: Broader WebView interception (any domain) ──
+                            if (!linkFound) {
+                                println("[NguonC] Step 6: Broad WebView interception")
+                                try {
+                                    val resp = app.get(targetUrl, interceptor = broadM3u8Interceptor, headers = mapOf(
+                                        "Referer" to "$mainUrl/", "User-Agent" to USER_AGENT
+                                    ))
+                                    val content = resp.text
+                                    val capturedUrl = resp.url ?: ""
+
+                                    if (content.contains("#EXTM3U") && !content.contains("#ENC-AESGCM")) {
+                                        println("[NguonC] Broad WebView captured plain m3u8!")
+                                        val m3u8Base = if (capturedUrl.isNotEmpty()) capturedUrl.substringBeforeLast("/") + "/" else ""
+                                        if (registerM3U8Link(content, targetUrl, m3u8Base, serverName, callback)) {
+                                            linkFound = true; return@async
+                                        }
+                                    }
+
+                                    if (content.contains("#ENC-AESGCM")) {
+                                        println("[NguonC] Broad WebView captured encrypted m3u8")
+                                        val capToken = Regex("""/([A-Za-z0-9+/=_-]+)\.(m3u8|m3u9)""").find(capturedUrl)?.groupValues?.get(1)
+                                        val encKX = kX ?: html?.let {
+                                            extractObfData(it)?.third ?: findEncryptionKey(it, embedDomain, targetUrl)
+                                        }
+                                        if (encKX != null) {
+                                            val decrypted = decryptStreamcM3u8(content, encKX, capToken)
+                                            if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
+                                                if (registerM3U8Link(decrypted, targetUrl, "", serverName, callback)) {
+                                                    linkFound = true; return@async
+                                                }
+                                            }
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    println("[NguonC] Broad WebView failed: ${e.message}")
+                                }
+                            }
+
+                            // ── STEP 7: Try URL hash-based token construction ──
+                            if (!linkFound && urlHash != null) {
+                                println("[NguonC] Step 7: Trying URL hash as token: ${urlHash.take(20)}...")
+
+                                // 7a: Try hash directly as m3u8 URL path
+                                for (ext in listOf(".m3u9", ".m3u8")) {
+                                    val m3u8Url = "$embedDomain/$urlHash$ext"
+                                    val m3u8Content = fetchDirect(m3u8Url, targetUrl, embedDomain)
+                                    if (m3u8Content != null) {
+                                        if (m3u8Content.contains("#EXTM3U") && !m3u8Content.contains("#ENC-AESGCM")) {
+                                            if (registerM3U8Link(m3u8Content, targetUrl, "", serverName, callback)) {
+                                                linkFound = true; return@async
+                                            }
+                                        }
+                                        if (m3u8Content.contains("#ENC-AESGCM") && kX != null) {
+                                            val decrypted = decryptStreamcM3u8(m3u8Content, kX, urlHash)
+                                            if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
+                                                if (registerM3U8Link(decrypted, targetUrl, "", serverName, callback)) {
+                                                    linkFound = true; return@async
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // 7b: Try constructing token from hash (base64 of JSON with h=hash)
+                                if (!linkFound) {
+                                    try {
+                                        val tokenJson = """{"h":"$urlHash","t":"$urlHash"}"""
+                                        val constructedToken = toUrlSafeBase64(
+                                            String(Base64.encode(tokenJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP), Charsets.UTF_8)
+                                        )
+                                        println("[NguonC] Constructed token: ${constructedToken.take(20)}...")
+                                        if (tryFetchWithToken(constructedToken, embedDomain, targetUrl, kX, serverName, callback)) {
+                                            linkFound = true; return@async
+                                        }
+                                    } catch (_: Exception) {}
+                                }
+
+                                // 7c: Try other embed domain numbers
+                                if (!linkFound) {
+                                    for (embedNum in listOf(11, 12, 13, 14, 15, 16, 17, 18, 19, 20)) {
+                                        val altDomain = "https://embed${embedNum}.streamc.xyz"
+                                        if (altDomain == embedDomain) continue
+                                        val altUrl = "$altDomain/embed.php?hash=$urlHash"
+                                        println("[NguonC] Trying alt domain: $altDomain")
+                                        val altHtml = fetchEmbedHTML(altUrl, altDomain)
+                                        if (altHtml != null) {
+                                            val altObfData = extractObfData(altHtml)
+                                            val altToken = altObfData?.first ?: findTokenInHTML(altHtml)
+                                            val altKX = altObfData?.third ?: findEncryptionKey(altHtml, altDomain, altUrl)
+                                            if (altToken != null) {
+                                                println("[NguonC] Found token on alt domain $altDomain!")
+                                                if (tryFetchWithToken(altToken, altDomain, altUrl, altKX, serverName, callback)) {
+                                                    linkFound = true; return@async
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
 
-                            // ── Step 5: WebView interception fallback ─────────
-                            //    Used when: token not found, blob URL detected,
-                            //    or direct fetch approach failed
+                            // ── STEP 8: Last resort - broader cfInterceptor ──
                             if (!linkFound) {
-                                println("[NguonC] Direct approach failed or blob URL detected, trying WebView interception...")
-                                val captured = captureViaWebView(targetUrl, embedDomain)
-                                if (captured != null) {
-                                    val (m3u8Content, capturedUrl) = captured
+                                println("[NguonC] Step 8: Last resort cfInterceptor")
+                                try {
+                                    val resp = app.get(targetUrl, interceptor = cfInterceptor, headers = mapOf(
+                                        "Referer" to "$mainUrl/", "User-Agent" to USER_AGENT
+                                    ))
+                                    val content = resp.text
+                                    val capUrl = resp.url ?: ""
 
-                                    if (m3u8Content.contains("#EXTM3U") && !m3u8Content.contains("#ENC-AESGCM")) {
-                                        // Plain m3u8 from WebView
-                                        println("[NguonC] WebView captured plain m3u8")
-                                        val m3u8Base = if (capturedUrl.isNotEmpty()) capturedUrl.substringBeforeLast("/") + "/" else ""
-                                        if (registerM3U8Link(m3u8Content, targetUrl, m3u8Base, serverName, callback)) {
+                                    if (content.contains("#EXTM3U") && !content.contains("#ENC-AESGCM")) {
+                                        val m3u8Base = if (capUrl.isNotEmpty()) capUrl.substringBeforeLast("/") + "/" else ""
+                                        if (registerM3U8Link(content, targetUrl, m3u8Base, serverName, callback)) {
                                             linkFound = true
                                         }
-                                    } else if (m3u8Content.contains("#ENC-AESGCM")) {
-                                        // Encrypted m3u8 from WebView
-                                        println("[NguonC] WebView captured encrypted m3u8, searching for key...")
-                                        val kX = findEncryptionKey(html, embedDomain, targetUrl)
-                                        if (kX != null) {
-                                            val decrypted = decryptStreamcM3u8(m3u8Content, kX, token)
-                                            if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
-                                                println("[NguonC] Decrypted WebView content OK")
-                                                if (registerM3U8Link(decrypted, targetUrl, "", serverName, callback)) {
-                                                    linkFound = true
-                                                }
-                                            }
-                                        } else {
-                                            println("[NguonC] No encryption key found for WebView content")
-                                        }
                                     }
-                                }
+                                } catch (_: Exception) {}
                             }
 
-                            // ── Step 6: Last resort - try token with blob URL ──
-                            //    Even if blob URL was detected, the token might still work
-                            if (!linkFound && token != null && hadBlobUrl) {
-                                println("[NguonC] Last resort: trying token despite blob URL...")
-                                val originValue: String = Regex("""https?://[^/]+""").find(targetUrl)?.value ?: ""
-                                val m3u8Headers = mapOf(
-                                    "User-Agent" to USER_AGENT,
-                                    "Referer" to targetUrl,
-                                    "Origin" to originValue,
-                                    "Accept" to "*/*"
-                                )
-                                for (ext in listOf(".m3u9", ".m3u8")) {
-                                    val m3u8Url = "$embedDomain/${token}$ext"
-                                    try {
-                                        val m3u8Resp = app.get(m3u8Url, headers = m3u8Headers, interceptor = cfInterceptor)
-                                        val m3u8Content = m3u8Resp.text
-                                        if (m3u8Content.contains("#EXTM3U") && !m3u8Content.contains("#ENC-AESGCM")) {
-                                            val m3u8Base = m3u8Url.substringBeforeLast("/") + "/"
-                                            if (registerM3U8Link(m3u8Content, targetUrl, m3u8Base, serverName, callback)) {
-                                                linkFound = true
-                                                break
-                                            }
-                                        } else if (m3u8Content.contains("#ENC-AESGCM")) {
-                                            val kX = findEncryptionKey(html, embedDomain, targetUrl)
-                                            if (kX != null) {
-                                                val decrypted = decryptStreamcM3u8(m3u8Content, kX, token)
-                                                if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
-                                                    if (registerM3U8Link(decrypted, targetUrl, "", serverName, callback)) {
-                                                        linkFound = true
-                                                        break
+                            if (!linkFound) {
+                                println("[NguonC] FAILED - all approaches exhausted for: $targetUrl")
+                            }
+                            return@async
+                        }
+
+                        // ══════════════════════════════════════════════════════════════
+                        // Direct m3u8/m3u9 URL (from API m3u8 field)
+                        // ══════════════════════════════════════════════════════════════
+                        if ((targetUrl.contains(".m3u8") || targetUrl.contains(".m3u9")) && targetUrl.contains("streamc.xyz")) {
+                            println("[NguonC] Processing direct m3u8/m3u9 URL: ${targetUrl.take(80)}")
+                            // Try .m3u9 first (plain), then .m3u8
+                            val urlsToTry = mutableListOf(targetUrl)
+                            if (targetUrl.endsWith(".m3u8")) {
+                                urlsToTry.add(targetUrl.replace(".m3u8", ".m3u9"))
+                            } else if (targetUrl.endsWith(".m3u9")) {
+                                urlsToTry.add(targetUrl.replace(".m3u9", ".m3u8"))
+                            }
+                            for (m3u8Url in urlsToTry) {
+                                val content = fetchDirect(m3u8Url, "$mainUrl/", embedDomain)
+                                if (content != null) {
+                                    if (content.contains("#EXTM3U") && !content.contains("#ENC-AESGCM")) {
+                                        val m3u8Base = m3u8Url.substringBeforeLast("/") + "/"
+                                        registerM3U8Link(content, targetUrl, m3u8Base, serverName, callback)
+                                        linkFound = true; break
+                                    }
+                                    if (content.contains("#ENC-AESGCM")) {
+                                        // Need kX - try to get from embed page
+                                        val urlToken = Regex("""/([A-Za-z0-9+/=_-]+)\.(m3u8|m3u9)""").find(targetUrl)?.groupValues?.get(1)
+                                        var encKX: String? = null
+                                        if (urlToken != null) {
+                                            val decoded = decodeStreamcToken(urlToken)
+                                            if (decoded != null) {
+                                                val (_, h, _) = decoded
+                                                // Try to find embed page using hash from token
+                                                for (embedNum in listOf(11, 12, 13, 14, 15, 16)) {
+                                                    val embedPageUrl = "https://embed${embedNum}.streamc.xyz/embed.php?hash=$h"
+                                                    val embedHtml = fetchEmbedHTML(embedPageUrl, "https://embed${embedNum}.streamc.xyz")
+                                                    if (embedHtml != null) {
+                                                        encKX = extractObfData(embedHtml)?.third ?: findEncryptionKey(embedHtml, "https://embed${embedNum}.streamc.xyz", embedPageUrl)
+                                                        if (encKX != null) break
                                                     }
                                                 }
                                             }
                                         }
-                                    } catch (_: Exception) { continue }
-                                }
-                            }
-
-                            if (!linkFound) {
-                                println("[NguonC] All methods failed for streamc.xyz embed: $targetUrl")
-                            }
-                        } catch (e: Exception) {
-                            println("[NguonC] Error loading embed page: ${e.message}")
-                            e.printStackTrace()
-                        }
-                        return@async
-                    }
-
-                    // ══════════════════════════════════════════════════════════════
-                    // Case 2: Direct m3u8/m3u9 URL (from API m3u8 field)
-                    // ══════════════════════════════════════════════════════════════
-                    if (targetUrl.contains(".m3u8") || targetUrl.contains(".m3u9")) {
-                        try {
-                            val m3u8Resp = app.get(targetUrl, headers = mapOf(
-                                "User-Agent" to USER_AGENT,
-                                "Referer" to "$mainUrl/"
-                            ), interceptor = cfInterceptor)
-                            val content = m3u8Resp.text
-                            val m3u8Base = targetUrl.substringBeforeLast("/") + "/"
-
-                            if (content.contains("#EXTM3U") && !content.contains("#ENC-AESGCM")) {
-                                registerM3U8Link(content, targetUrl, m3u8Base, serverName, callback)
-                                linkFound = true
-                            } else if (content.contains("#ENC-AESGCM")) {
-                                // Even direct URLs can be encrypted
-                                println("[NguonC] Direct URL returned encrypted content, trying to find key...")
-                                // Try to derive key from URL domain
-                                val kX = findEncryptionKey("", embedDomain, targetUrl)
-                                if (kX != null) {
-                                    val decrypted = decryptStreamcM3u8(content, kX, null)
-                                    if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
-                                        registerM3U8Link(decrypted, targetUrl, "", serverName, callback)
-                                        linkFound = true
+                                        if (encKX != null) {
+                                            val decrypted = decryptStreamcM3u8(content, encKX, urlToken)
+                                            if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
+                                                registerM3U8Link(decrypted, targetUrl, "", serverName, callback)
+                                                linkFound = true; break
+                                            }
+                                        }
                                     }
                                 }
                             }
-                        } catch (e: Exception) { e.printStackTrace() }
-                        return@async
-                    }
+                            return@async
+                        }
 
-                    // ══════════════════════════════════════════════════════════════
-                    // Case 3: Other embed pages (non-streamc)
-                    // ══════════════════════════════════════════════════════════════
-                    try {
+                        // ══════════════════════════════════════════════════════════════
+                        // Non-streamc embed pages
+                        // ══════════════════════════════════════════════════════════════
+                        println("[NguonC] Processing other embed: ${targetUrl.take(80)}")
                         val embedRes = app.get(targetUrl, interceptor = cfInterceptor, headers = mapOf(
                             "Referer" to "$mainUrl/", "User-Agent" to USER_AGENT
                         ))
-                        val html = embedRes.text
+                        val otherHtml = embedRes.text
 
-                        // Try to find m3u8 URL in the page
-                        val m3u8Patterns = listOf(
-                            Regex("""https?://[^\s"'<>]+\.(?:m3u8|m3u9)[^\s"'<>]*"""),
-                            Regex("""["'](https?://[^\s"']+)["']""").let { pattern ->
-                                pattern.findAll(html).map { it.groupValues[1] }.firstOrNull {
-                                    it.contains(".m3u8") || it.contains(".m3u9") || it.contains("streamc")
-                                }
-                            }?.let { Regex(Regex.escape(it)) } ?: Regex("""$^""") // never-match fallback
-                        )
-
-                        var m3u8Url: String? = null
-                        var streamcToken: String? = null
-                        for (pattern in m3u8Patterns) {
-                            val match = pattern.find(html)?.value
-                            if (!match.isNullOrEmpty() && !match.startsWith("blob:")) {
-                                m3u8Url = match
-                                break
+                        // Check if cfInterceptor already captured m3u8
+                        if (otherHtml.contains("#EXTM3U") && !otherHtml.contains("#ENC-AESGCM")) {
+                            val capUrl = embedRes.url ?: ""
+                            val m3u8Base = if (capUrl.isNotEmpty()) capUrl.substringBeforeLast("/") + "/" else ""
+                            if (registerM3U8Link(otherHtml, targetUrl, m3u8Base, serverName, callback)) {
+                                linkFound = true; return@async
                             }
                         }
 
-                        // Also check if this is a streamc-style embed without the standard pattern
-                        if (m3u8Url == null && (html.contains("streamc") || html.contains("jwplayer"))) {
-                            val (tokenFromHTML3, hadBlob3) = findTokenInHTML(html)
-                            streamcToken = tokenFromHTML3
-                            if (streamcToken == null) streamcToken = parseStreamcObf(html)
-                            if (streamcToken != null && !hadBlob3) {
-                                val domain = Regex("""(https?://[^/]+)""").find(targetUrl)?.groupValues?.get(1) ?: embedDomain
-                                m3u8Url = "$domain/${streamcToken}.m3u9"
+                        // Try to find m3u8 URL in HTML
+                        var m3u8Url: String? = null
+                        var extractedToken: String? = null
+                        var extractedKX: String? = null
+
+                        val urlMatch = Regex("""https?://[^\s"'<>]+\.(?:m3u8|m3u9)[^\s"'<>]*""").find(otherHtml)?.value
+                        if (!urlMatch.isNullOrEmpty() && !urlMatch.startsWith("blob:")) {
+                            m3u8Url = urlMatch
+                        }
+
+                        if (m3u8Url == null && (otherHtml.contains("streamc") || otherHtml.contains("jwplayer") || otherHtml.contains("data-obf"))) {
+                            val obfData = extractObfData(otherHtml)
+                            if (obfData != null) {
+                                extractedToken = obfData.first
+                                extractedKX = obfData.third
+                            }
+                            if (extractedToken == null) extractedToken = findTokenInHTML(otherHtml)
+                            if (extractedToken != null) {
+                                m3u8Url = "$embedDomain/${toUrlSafeBase64(extractedToken)}.m3u9"
                             }
                         }
 
                         if (!m3u8Url.isNullOrEmpty() && !m3u8Url.startsWith("blob:")) {
-                            val originValue2: String = Regex("""https?://[^/]+""").find(targetUrl)?.value ?: ""
-                            val m3u8Headers = mapOf(
-                                "User-Agent" to USER_AGENT,
-                                "Referer" to targetUrl,
-                                "Origin" to originValue2,
-                                "Accept" to "*/*"
-                            )
-
-                            val m3u8Resp = app.get(m3u8Url, headers = m3u8Headers, interceptor = cfInterceptor)
-                            val m3u8Content = m3u8Resp.text
-
-                            if (m3u8Content.contains("#EXTM3U") && !m3u8Content.contains("#ENC-AESGCM")) {
-                                registerM3U8Link(m3u8Content, targetUrl, "", serverName, callback)
-                                linkFound = true
-                            } else if (m3u8Content.contains("#ENC-AESGCM")) {
-                                val kX = findEncryptionKey(html, embedDomain, targetUrl)
-                                if (kX != null) {
-                                    val decrypted = decryptStreamcM3u8(m3u8Content, kX, streamcToken)
-                                    if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
-                                        registerM3U8Link(decrypted, targetUrl, "", serverName, callback)
-                                        linkFound = true
-                                    }
-                                }
-                            }
-                        } else if (m3u8Url == null && (html.contains("streamc") || html.contains("jwplayer"))) {
-                            // Last resort: try WebView interception for non-standard streamc embeds
-                            println("[NguonC] Non-standard streamc embed, trying WebView...")
-                            val captured = captureViaWebView(targetUrl, embedDomain)
-                            if (captured != null) {
-                                val (m3u8Content, capturedUrl) = captured
-                                // Try to extract token from captured URL for decryption
-                                val capturedToken = Regex("""/([A-Za-z0-9+/=_-]+)\.m3u9?""").find(capturedUrl)?.groupValues?.get(1)
-                                val decryptToken = capturedToken ?: streamcToken
+                            val originValue = Regex("""https?://[^/]+""").find(targetUrl)?.value ?: ""
+                            val m3u8Content = fetchDirect(m3u8Url, targetUrl, originValue)
+                            if (m3u8Content != null) {
                                 if (m3u8Content.contains("#EXTM3U") && !m3u8Content.contains("#ENC-AESGCM")) {
                                     registerM3U8Link(m3u8Content, targetUrl, "", serverName, callback)
                                     linkFound = true
                                 } else if (m3u8Content.contains("#ENC-AESGCM")) {
-                                    val kX = findEncryptionKey(html, embedDomain, targetUrl)
-                                    if (kX != null) {
-                                        val decrypted = decryptStreamcM3u8(m3u8Content, kX, decryptToken)
+                                    val encKey = extractedKX ?: findEncryptionKey(otherHtml, embedDomain, targetUrl)
+                                    if (encKey != null) {
+                                        val decrypted = decryptStreamcM3u8(m3u8Content, encKey, extractedToken)
                                         if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
                                             registerM3U8Link(decrypted, targetUrl, "", serverName, callback)
                                             linkFound = true
@@ -1254,7 +1377,10 @@ class PhimNguonCProvider : MainAPI() {
                                 }
                             }
                         }
-                    } catch (e: Exception) { e.printStackTrace() }
+
+                    } catch (e: Exception) {
+                        println("[NguonC] Error processing $targetUrl: ${e.message}")
+                    }
                 }
             }.awaitAll()
         }
@@ -1262,25 +1388,21 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  Data classes
+    //  Data classes for API responses
     // ═══════════════════════════════════════════════════════════════════════════
 
     data class NguonCApiResponse(
-        @JsonProperty("status")     val status:     String?              = null,
-        @JsonProperty("total_page") val total_page: Int?                 = null,
-        @JsonProperty("items")      val items:      List<NguonCApiItem>? = null
+        @JsonProperty("items") val items: List<NguonCApiItem>? = null
     )
 
     data class NguonCApiItem(
-        @JsonProperty("name")            val name:             String? = null,
-        @JsonProperty("slug")            val slug:             String? = null,
-        @JsonProperty("original_name")   val original_name:   String? = null,
-        @JsonProperty("thumb_url")       val thumb_url:       String? = null,
-        @JsonProperty("poster_url")      val poster_url:      String? = null,
-        @JsonProperty("total_episodes")  val total_episodes:  Int?    = null,
-        @JsonProperty("current_episode") val current_episode: String? = null,
-        @JsonProperty("quality")         val quality:         String? = null,
-        @JsonProperty("language")        val language:        String? = null
+        @JsonProperty("slug")             val slug: String? = null,
+        @JsonProperty("name")             val name: String? = null,
+        @JsonProperty("poster_url")       val poster_url: String? = null,
+        @JsonProperty("thumb_url")        val thumb_url: String? = null,
+        @JsonProperty("current_episode")  val current_episode: String? = null,
+        @JsonProperty("quality")          val quality: String? = null,
+        @JsonProperty("language")         val language: String? = null
     )
 
     data class NguonCDetailResponse(
@@ -1288,50 +1410,47 @@ class PhimNguonCProvider : MainAPI() {
     )
 
     data class NguonCMovie(
-        @JsonProperty("id")               val id:               String?                      = null,
-        @JsonProperty("name")             val name:             String?                      = null,
-        @JsonProperty("slug")             val slug:             String?                      = null,
-        @JsonProperty("original_name")    val original_name:    String?                      = null,
-        @JsonProperty("description")      val description:      String?                      = null,
-        @JsonProperty("thumb_url")        val thumb_url:        String?                      = null,
-        @JsonProperty("poster_url")       val poster_url:       String?                      = null,
-        @JsonProperty("total_episodes")   val total_episodes:   Int?                         = null,
-        @JsonProperty("current_episode")  val current_episode:  String?                      = null,
-        @JsonProperty("time")             val time:             String?                      = null,
-        @JsonProperty("quality")          val quality:          String?                      = null,
-        @JsonProperty("language")         val language:         String?                      = null,
-        @JsonProperty("director")         val director:         String?                      = null,
-        @JsonProperty("casts")            val casts:            String?                      = null,
-        @JsonProperty("category")         val category:         Map<String, NguonCCategory>? = null,
-        @JsonProperty("episodes")         val episodes:         List<NguonCServer>?          = null
+        @JsonProperty("name")             val name: String? = null,
+        @JsonProperty("original_name")    val original_name: String? = null,
+        @JsonProperty("slug")             val slug: String? = null,
+        @JsonProperty("poster_url")       val poster_url: String? = null,
+        @JsonProperty("thumb_url")        val thumb_url: String? = null,
+        @JsonProperty("description")      val description: String? = null,
+        @JsonProperty("quality")          val quality: String? = null,
+        @JsonProperty("language")         val language: String? = null,
+        @JsonProperty("director")         val director: String? = null,
+        @JsonProperty("casts")            val casts: String? = null,
+        @JsonProperty("time")             val time: String? = null,
+        @JsonProperty("current_episode")  val current_episode: String? = null,
+        @JsonProperty("total_episodes")   val total_episodes: Int? = null,
+        @JsonProperty("category")         val category: Map<String, NguonCCategory>? = null,
+        @JsonProperty("episodes")         val episodes: List<NguonCServer>? = null
     )
 
     data class NguonCCategory(
-        @JsonProperty("group") val group: NguonCGroup?       = null,
-        @JsonProperty("list")  val list:  List<NguonCGroupItem>? = null
+        @JsonProperty("group") val group: NguonCGroup? = null,
+        @JsonProperty("list")  val list: List<NguonCGroupItem>? = null
     )
 
     data class NguonCGroup(
-        @JsonProperty("id")   val id:   String? = null,
         @JsonProperty("name") val name: String? = null
     )
 
     data class NguonCGroupItem(
-        @JsonProperty("id")   val id:   String? = null,
+        @JsonProperty("id")   val id: String? = null,
         @JsonProperty("name") val name: String? = null
     )
 
     data class NguonCServer(
-        @JsonProperty("server_name") val server_name: String?              = null,
-        @JsonProperty("name")        val name:        String?              = null,
-        @JsonProperty("items")       val items:       List<NguonCEpisode>? = null,
-        @JsonProperty("list")        val list:        List<NguonCEpisode>? = null
+        @JsonProperty("server_name") val server_name: String? = null,
+        @JsonProperty("name")        val name: String? = null,
+        @JsonProperty("items")       val items: List<NguonCEpisode>? = null,
+        @JsonProperty("list")        val list: List<NguonCEpisode>? = null
     )
 
     data class NguonCEpisode(
-        @JsonProperty("name")  val name:  String? = null,
-        @JsonProperty("slug")  val slug:  String? = null,
-        @JsonProperty("embed") val embed: String? = null,
-        @JsonProperty("m3u8")  val m3u8:  String? = null
+        @JsonProperty("name")   val name: String? = null,
+        @JsonProperty("embed")  val embed: String? = null,
+        @JsonProperty("m3u8")   val m3u8: String? = null
     )
 }
