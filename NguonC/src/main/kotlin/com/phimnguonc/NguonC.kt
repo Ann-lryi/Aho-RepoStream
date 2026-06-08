@@ -395,7 +395,7 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     /** Create proxy server and register m3u8 link - returns true if link was added */
-    private fun registerM3U8Link(
+    private suspend fun registerM3U8Link(
         m3u8Content: String, referer: String, m3u8BaseUrl: String,
         serverName: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
