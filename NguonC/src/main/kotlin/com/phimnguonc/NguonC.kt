@@ -1055,6 +1055,7 @@ class PhimNguonCProvider : MainAPI() {
                         )
 
                         var m3u8Url: String? = null
+                        var streamcToken: String? = null
                         for (pattern in m3u8Patterns) {
                             val match = pattern.find(html)?.value
                             if (!match.isNullOrEmpty() && !match.startsWith("blob:")) {
@@ -1066,11 +1067,11 @@ class PhimNguonCProvider : MainAPI() {
                         // Also check if this is a streamc-style embed without the standard pattern
                         if (m3u8Url == null && (html.contains("streamc") || html.contains("jwplayer"))) {
                             val (tokenFromHTML3, hadBlob3) = findTokenInHTML(html)
-                            var token3 = tokenFromHTML3
-                            if (token3 == null) token3 = parseStreamcObf(html)
-                            if (token3 != null && !hadBlob3) {
+                            streamcToken = tokenFromHTML3
+                            if (streamcToken == null) streamcToken = parseStreamcObf(html)
+                            if (streamcToken != null && !hadBlob3) {
                                 val domain = Regex("""(https?://[^/]+)""").find(targetUrl)?.groupValues?.get(1) ?: embedDomain
-                                m3u8Url = "$domain/${token3}.m3u9"
+                                m3u8Url = "$domain/${streamcToken}.m3u9"
                             }
                         }
 
@@ -1092,7 +1093,7 @@ class PhimNguonCProvider : MainAPI() {
                             } else if (m3u8Content.contains("#ENC-AESGCM")) {
                                 val kX = findEncryptionKey(html, embedDomain, targetUrl)
                                 if (kX != null) {
-                                    val decrypted = decryptStreamcM3u8(m3u8Content, kX, token3)
+                                    val decrypted = decryptStreamcM3u8(m3u8Content, kX, streamcToken)
                                     if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
                                         registerM3U8Link(decrypted, targetUrl, "", serverName, callback)
                                         linkFound = true
@@ -1104,14 +1105,17 @@ class PhimNguonCProvider : MainAPI() {
                             println("[NguonC] Non-standard streamc embed, trying WebView...")
                             val captured = captureViaWebView(targetUrl, embedDomain)
                             if (captured != null) {
-                                val (m3u8Content, _) = captured
+                                val (m3u8Content, capturedUrl) = captured
+                                // Try to extract token from captured URL for decryption
+                                val capturedToken = Regex("""/([A-Za-z0-9+/=_-]+)\.m3u9?""").find(capturedUrl)?.groupValues?.get(1)
+                                val decryptToken = capturedToken ?: streamcToken
                                 if (m3u8Content.contains("#EXTM3U") && !m3u8Content.contains("#ENC-AESGCM")) {
                                     registerM3U8Link(m3u8Content, targetUrl, "", serverName, callback)
                                     linkFound = true
                                 } else if (m3u8Content.contains("#ENC-AESGCM")) {
                                     val kX = findEncryptionKey(html, embedDomain, targetUrl)
                                     if (kX != null) {
-                                        val decrypted = decryptStreamcM3u8(m3u8Content, kX, token3)
+                                        val decrypted = decryptStreamcM3u8(m3u8Content, kX, decryptToken)
                                         if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
                                             registerM3U8Link(decrypted, targetUrl, "", serverName, callback)
                                             linkFound = true
