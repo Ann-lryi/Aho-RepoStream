@@ -21,7 +21,7 @@ class HentaiZProvider : MainAPI() {
     override var lang = "vi"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
-    override val nsfw = true  // Mark as NSFW plugin
+    val nsfw = true  // NSFW plugin
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
@@ -495,7 +495,7 @@ class HentaiZProvider : MainAPI() {
                             headers = mapOf(
                                 "User-Agent" to USER_AGENT,
                                 "Referer" to embedUrl,
-                                "Origin" to embedUrl.substringBefore("/", embedUrl.length - 8)
+                                "Origin" to Regex("""(https?://[^/]+)""").find(embedUrl)?.groupValues?.get(1).orEmpty()
                             )
                         })
                         return true
