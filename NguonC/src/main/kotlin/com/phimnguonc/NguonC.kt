@@ -622,106 +622,163 @@ class PhimNguonCProvider : MainAPI() {
         return hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
     }
 
-    /** Derive AES key from token using multiple methods (SHA-256, MD5, hex parse, etc.)
-     *  Key insight: the AES key is NOT kX directly, but a HASH of the token.
-     *  The player1.js derives the key this way. */
+    /** Decode the sUb token (base64 JSON) and extract h and t fields for key derivation.
+     *  sUb = base64({"h":"32hex_hash","t":"64hex_token"}) */
+    private fun decodeStreamcToken(token: String): Triple<String, String, String>? {
+        return try {
+            val decoded = String(Base64.decode(token, Base64.DEFAULT), Charsets.UTF_8)
+            val h = Regex(""""h"\s*:\s*"([a-fA-F0-9]+)"""").find(decoded)?.groupValues?.get(1)
+            val t = Regex(""""t"\s*:\s*"([a-fA-F0-9]+)"""").find(decoded)?.groupValues?.get(1)
+            if (h != null && t != null) {
+                println("[NguonC] Decoded token: h=${h.take(16)}... (${h.length}hex), t=${t.take(16)}... (${t.length}hex)")
+                Triple(decoded, h, t)
+            } else null
+        } catch (_: Exception) { null }
+    }
+
+    /** Derive AES key from token using multiple methods.
+     *  CRITICAL: The token is a base64 JSON with h and t hex fields.
+     *  The JavaScript player likely uses these fields directly as AES keys. */
     private fun deriveKeyFromToken(token: String): List<Pair<String, ByteArray>> {
         val keys = mutableListOf<Pair<String, ByteArray>>()
 
+        // === Method A: Decode token and use h/t fields directly ===
+        val decoded = decodeStreamcToken(token)
+        if (decoded != null) {
+            val (_, h, t) = decoded
+
+            // t is 64 hex = 32 bytes → AES-256-GCM (most likely the actual key!)
+            if (t.length == 64) {
+                try { keys.add(Pair("t-hexBytes(AES256)", hexToBytes(t))) } catch (_: Exception) {}
+            }
+            // h is 32 hex = 16 bytes → AES-128-GCM
+            if (h.length == 32) {
+                try { keys.add(Pair("h-hexBytes(AES128)", hexToBytes(h))) } catch (_: Exception) {}
+            }
+            // t first 32 hex = 16 bytes → AES-128
+            if (t.length >= 32) {
+                try { keys.add(Pair("t-first16bytes(AES128)", hexToBytes(t.take(32)))) } catch (_: Exception) {}
+            }
+            // t last 32 hex = 16 bytes → AES-128
+            if (t.length >= 32) {
+                try { keys.add(Pair("t-last16bytes(AES128)", hexToBytes(t.takeLast(32)))) } catch (_: Exception) {}
+            }
+            // SHA-256 of t hex bytes
+            try {
+                val sha256 = MessageDigest.getInstance("SHA-256").digest(hexToBytes(t))
+                keys.add(Pair("SHA-256(t-hexBytes).16", sha256.copyOf(16)))
+                keys.add(Pair("SHA-256(t-hexBytes).32", sha256))
+            } catch (_: Exception) {}
+            // SHA-256 of h hex bytes
+            try {
+                val sha256 = MessageDigest.getInstance("SHA-256").digest(hexToBytes(h))
+                keys.add(Pair("SHA-256(h-hexBytes).16", sha256.copyOf(16)))
+            } catch (_: Exception) {}
+        }
+
+        // === Method B: Token string hash-based derivations ===
         // SHA-256 of token UTF-8, take first 16 bytes (AES-128)
         try {
             val sha256 = MessageDigest.getInstance("SHA-256").digest(token.toByteArray(Charsets.UTF_8))
-            keys.add(Pair("SHA-256(utf8).16", sha256.copyOf(16)))
-            keys.add(Pair("SHA-256(utf8).32", sha256))
+            keys.add(Pair("SHA-256(token-utf8).16", sha256.copyOf(16)))
+            keys.add(Pair("SHA-256(token-utf8).32", sha256))
         } catch (_: Exception) {}
 
         // MD5 of token UTF-8 (16 bytes = AES-128)
         try {
             val md5 = MessageDigest.getInstance("MD5").digest(token.toByteArray(Charsets.UTF_8))
-            keys.add(Pair("MD5(utf8)", md5))
+            keys.add(Pair("MD5(token-utf8)", md5))
         } catch (_: Exception) {}
 
-        // SHA-256 of hex-decoded token bytes
-        try {
-            val hexBytes = hexToBytes(token)
-            val sha256hex = MessageDigest.getInstance("SHA-256").digest(hexBytes)
-            keys.add(Pair("SHA-256(hexBytes).16", sha256hex.copyOf(16)))
-            keys.add(Pair("SHA-256(hexBytes).32", sha256hex))
-        } catch (_: Exception) {}
-
-        // First 32 hex chars as bytes → 16 bytes AES-128
-        if (token.length >= 32) {
-            try { keys.add(Pair("hex(first32)", hexToBytes(token.take(32)))) } catch (_: Exception) {}
+        // === Method C: Token as raw bytes ===
+        // Raw UTF-8 bytes of base64 token string
+        val tokenBytes = token.toByteArray(Charsets.UTF_8)
+        if (tokenBytes.size >= 32) {
+            keys.add(Pair("token-utf8-first32", tokenBytes.copyOf(32)))
         }
-
-        // Full token as hex bytes
-        if (token.length >= 16 && token.length % 2 == 0) {
-            try {
-                val fullBytes = hexToBytes(token)
-                if (fullBytes.size == 16 || fullBytes.size == 24 || fullBytes.size == 32) {
-                    keys.add(Pair("hex(full)", fullBytes))
-                }
-            } catch (_: Exception) {}
+        if (tokenBytes.size >= 16) {
+            keys.add(Pair("token-utf8-first16", tokenBytes.copyOf(16)))
         }
 
         return keys
     }
 
     /** Decrypt AES-GCM encrypted m3u8 content.
-     *  Format: #ENC-AESGCM;iv=HEX12BYTES\n#EXT-X-B65:offset-length\nBASE64_CIPHERTEXT
-     *  Tries kX directly AND derived keys from token */
+     *  Format: #ENC-AESGCM;iv=HEX12BYTES\n#EXT-X-B65:offset\nBASE64_CIPHERTEXT
+     *  Tries kX in various forms AND derived keys from token */
     private fun decryptStreamcM3u8(content: String, keyHex: String, token: String? = null): String? {
         return try {
             val ivMatch = Regex("""#ENC-AESGCM;iv=([a-f0-9A-F]+)""").find(content) ?: return null
             val ivHex = ivMatch.groupValues[1]
+            println("[NguonC] Decryption: iv=${ivHex} (${ivHex.length}hex), kX=${keyHex} (${keyHex.length}hex)")
             if (ivHex.length != 24) {
-                println("[NguonC] IV length ${ivHex.length} != 24, trying anyway...")
+                println("[NguonC] WARNING: IV length ${ivHex.length} != 24 (12 bytes), trying anyway...")
             }
             val iv = hexToBytes(ivHex)
 
-            // Parse #EXT-X-B65 header for offset-length if present
-            val b65Match = Regex("""#EXT-X-B65:(\d+)-(\d+)""").find(content)
-            val (offset, length) = if (b65Match != null) {
-                Pair(b65Match.groupValues[1].toIntOrNull() ?: 0, b65Match.groupValues[2].toIntOrNull() ?: 0)
-            } else {
-                Pair(0, 0)
-            }
+            // Parse #EXT-X-B65 header
+            val b65Match = Regex("""#EXT-X-B65:(\d+)(?:-(\d+))?""").find(content)
+            val offset = b65Match?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            val length = b65Match?.groupValues?.get(2)?.toIntOrNull() ?: 0
+            println("[NguonC] B65: offset=$offset, length=$length")
 
+            // Extract base64 ciphertext (all non-comment, non-blank lines)
             val lines = content.lines()
             val dataLines = lines.dropWhile { it.startsWith("#") || it.isBlank() }
             val b64Data = dataLines.joinToString("").trim()
             if (b64Data.isEmpty()) return null
 
-            val encryptedData = Base64.decode(b64Data, Base64.DEFAULT)
+            var encryptedData = Base64.decode(b64Data, Base64.DEFAULT)
+            println("[NguonC] Encrypted data size=${encryptedData.size} bytes, b64 length=${b64Data.length}")
 
-            // Build list of key attempts from multiple sources
+            // Apply offset/length if specified
+            if (offset > 0 || length > 0) {
+                if (length > 0) {
+                    encryptedData = encryptedData.copyOfRange(offset, offset + length)
+                } else if (offset > 0) {
+                    encryptedData = encryptedData.copyOfRange(offset, encryptedData.size)
+                }
+                println("[NguonC] After offset/length: data size=${encryptedData.size}")
+            }
+
+            // Build comprehensive list of key attempts
             val keyAttempts = mutableListOf<Pair<String, ByteArray>>()
 
-            // Source 1: kX from data-obf - try various interpretations
+            // ===== kX-based keys =====
+            // kX as raw UTF-8 bytes → AES-256 (MOST LIKELY for JS: TextEncoder.encode(kX))
+            val kxUtf8 = keyHex.toByteArray(Charsets.UTF_8)
+            if (kxUtf8.size == 16 || kxUtf8.size == 24 || kxUtf8.size == 32) {
+                keyAttempts.add(Pair("kX-utf8-raw(AES${kxUtf8.size*8})", kxUtf8))
+            }
+            // Also try trimming if kX is longer
+            if (kxUtf8.size > 32) {
+                keyAttempts.add(Pair("kX-utf8-first32", kxUtf8.copyOf(32)))
+            }
+            if (kxUtf8.size > 16) {
+                keyAttempts.add(Pair("kX-utf8-first16", kxUtf8.copyOf(16)))
+            }
+
+            // kX as hex-decoded bytes → AES-128 (16 bytes from 32 hex chars)
             if (keyHex.length >= 16 && keyHex.length % 2 == 0) {
                 try {
-                    val fullBytes = hexToBytes(keyHex)
-                    if (fullBytes.size == 16 || fullBytes.size == 24 || fullBytes.size == 32) {
-                        keyAttempts.add(Pair("kX-hex(full)", fullBytes))
+                    val hexBytes = hexToBytes(keyHex)
+                    if (hexBytes.size == 16 || hexBytes.size == 24 || hexBytes.size == 32) {
+                        keyAttempts.add(Pair("kX-hexBytes(AES${hexBytes.size*8})", hexBytes))
                     }
                 } catch (_: Exception) {}
             }
-            if (keyHex.length >= 32) {
-                try { keyAttempts.add(Pair("kX-hex(first32)", hexToBytes(keyHex.take(32)))) } catch (_: Exception) {}
-            }
-            if (keyHex.length >= 64) {
-                try { keyAttempts.add(Pair("kX-hex(first64)", hexToBytes(keyHex.take(64)))) } catch (_: Exception) {}
-            }
-            // SHA-256 and MD5 of kX
+
+            // SHA-256 and MD5 of kX UTF-8
             try {
-                val sha256 = MessageDigest.getInstance("SHA-256").digest(keyHex.toByteArray(Charsets.UTF_8))
+                val sha256 = MessageDigest.getInstance("SHA-256").digest(kxUtf8)
                 keyAttempts.add(Pair("SHA-256(kX-utf8).16", sha256.copyOf(16)))
                 keyAttempts.add(Pair("SHA-256(kX-utf8).32", sha256))
             } catch (_: Exception) {}
             try {
-                keyAttempts.add(Pair("MD5(kX-utf8)", MessageDigest.getInstance("MD5").digest(keyHex.toByteArray(Charsets.UTF_8))))
+                keyAttempts.add(Pair("MD5(kX-utf8)", MessageDigest.getInstance("MD5").digest(kxUtf8)))
             } catch (_: Exception) {}
-            // SHA-256 of kX hex bytes
+
+            // SHA-256 of kX hex-decoded bytes
             try {
                 val kxHexBytes = hexToBytes(keyHex)
                 val sha256hex = MessageDigest.getInstance("SHA-256").digest(kxHexBytes)
@@ -729,40 +786,113 @@ class PhimNguonCProvider : MainAPI() {
                 keyAttempts.add(Pair("SHA-256(kX-hexBytes).32", sha256hex))
             } catch (_: Exception) {}
 
-            // Source 2: Derived keys from token (the correct approach per original plugin!)
+            // ===== Token-based keys =====
             if (token != null && token.length > 10) {
                 keyAttempts.addAll(deriveKeyFromToken(token))
             }
 
-            // Source 3: Also try deriving from sUb (the URL slug token)
-            if (token != null && token.length > 10) {
-                // The sUb is the base64 token used in the URL - derive key from it too
+            // ===== Combined keys (kX + h, kX XOR h, etc.) =====
+            val decodedToken = if (token != null) decodeStreamcToken(token) else null
+            if (decodedToken != null) {
+                val (_, h, t) = decodedToken
+                // kX XOR h (both 16 bytes if hex-decoded)
                 try {
-                    val sha256 = MessageDigest.getInstance("SHA-256").digest(token.toByteArray(Charsets.UTF_8))
-                    keyAttempts.add(Pair("SHA-256(token-utf8).16", sha256.copyOf(16)))
-                    keyAttempts.add(Pair("SHA-256(token-utf8).32", sha256))
-                } catch (_: Exception) {}
-            }
-
-            println("[NguonC] kX length=${keyHex.length}, token=${if (token != null) token.length else "null"}, key attempts: ${keyAttempts.size}")
-
-            for ((desc, keyBytes) in keyAttempts) {
-                try {
-                    if (keyBytes.size != 16 && keyBytes.size != 24 && keyBytes.size != 32) continue
-                    val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-                    val spec = GCMParameterSpec(128, iv)
-                    cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), spec)
-                    val decrypted = cipher.doFinal(encryptedData)
-                    val result = String(decrypted, Charsets.UTF_8)
-                    if (result.contains("#EXTM3U")) {
-                        println("[NguonC] Decryption OK using $desc")
-                        return result
+                    val kxBytes = hexToBytes(keyHex)
+                    val hBytes = hexToBytes(h)
+                    if (kxBytes.size == hBytes.size) {
+                        val xorBytes = ByteArray(kxBytes.size) { i -> (kxBytes[i].toInt() xor hBytes[i].toInt()).toByte() }
+                        keyAttempts.add(Pair("kX-XOR-h(AES${xorBytes.size*8})", xorBytes))
                     }
-                } catch (_: Exception) {
-                    // Try next method
+                } catch (_: Exception) {}
+                // kX + h concatenated as hex → 32 bytes → AES-256
+                try {
+                    val combined = hexToBytes(keyHex + h)
+                    if (combined.size == 32) {
+                        keyAttempts.add(Pair("kX+h-concat(AES256)", combined))
+                    }
+                } catch (_: Exception) {}
+                // SHA-256 of kX+h concatenated string
+                try {
+                    val sha256 = MessageDigest.getInstance("SHA-256").digest((keyHex + h).toByteArray(Charsets.UTF_8))
+                    keyAttempts.add(Pair("SHA-256(kX+h-utf8).16", sha256.copyOf(16)))
+                    keyAttempts.add(Pair("SHA-256(kX+h-utf8).32", sha256))
+                } catch (_: Exception) {}
+                // t field as raw UTF-8 bytes (if 32 bytes = AES-256)
+                val tUtf8 = t.toByteArray(Charsets.UTF_8)
+                if (tUtf8.size == 16 || tUtf8.size == 24 || tUtf8.size == 32) {
+                    keyAttempts.add(Pair("t-utf8-raw(AES${tUtf8.size*8})", tUtf8))
                 }
             }
-            println("[NguonC] All ${keyAttempts.size} key methods failed for kX=${keyHex.take(20)}...")
+
+            println("[NguonC] kX=${keyHex.take(20)}... (${keyHex.length}hex), token=${if (token != null) "${token.length}chars" else "null"}, key attempts: ${keyAttempts.size}")
+
+            // Build AAD (Additional Authenticated Data) candidates for AES-GCM
+            // The JavaScript player might use AAD for integrity verification
+            val aadCandidates = mutableListOf<Pair<String, ByteArray?>>()
+            aadCandidates.add(Pair("no-AAD", null))
+            // kX as UTF-8 AAD
+            aadCandidates.add(Pair("AAD=kX-utf8", keyHex.toByteArray(Charsets.UTF_8)))
+            // kX as hex bytes AAD
+            try { aadCandidates.add(Pair("AAD=kX-hexBytes", hexToBytes(keyHex))) } catch (_: Exception) {}
+            // IV as AAD (some implementations use IV as AAD)
+            aadCandidates.add(Pair("AAD=iv", iv))
+            // Token as AAD
+            if (token != null) {
+                aadCandidates.add(Pair("AAD=token-utf8", token.toByteArray(Charsets.UTF_8)))
+            }
+            // h value as AAD
+            if (decodedToken != null) {
+                try { aadCandidates.add(Pair("AAD=h-hexBytes", hexToBytes(decodedToken.second))) } catch (_: Exception) {}
+            }
+
+            // Try all keys with AES-GCM (with and without AAD)
+            for (tagBits in listOf(128, 96)) {
+                for ((keyDesc, keyBytes) in keyAttempts) {
+                    if (keyBytes.size != 16 && keyBytes.size != 24 && keyBytes.size != 32) continue
+                    for ((aadDesc, aadBytes) in aadCandidates) {
+                        try {
+                            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                            val spec = GCMParameterSpec(tagBits, iv)
+                            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), spec)
+                            if (aadBytes != null) {
+                                cipher.updateAAD(aadBytes)
+                            }
+                            val decrypted = cipher.doFinal(encryptedData)
+                            val result = String(decrypted, Charsets.UTF_8)
+                            if (result.contains("#EXTM3U")) {
+                                val tagInfo = if (tagBits != 128) " (GCM-${tagBits})" else ""
+                                val aadInfo = if (aadBytes != null) " + $aadDesc" else ""
+                                println("[NguonC] ✓ Decryption OK using $keyDesc$aadInfo$tagInfo")
+                                return result
+                            }
+                        } catch (_: Exception) {
+                            // Try next combination
+                        }
+                    }
+                }
+            }
+
+            // Last resort: try stripping last 16 bytes (maybe tag is separate)
+            // or trying with different ciphertext boundaries
+            if (encryptedData.size > 16) {
+                for ((keyDesc, keyBytes) in keyAttempts) {
+                    if (keyBytes.size != 16 && keyBytes.size != 24 && keyBytes.size != 32) continue
+                    try {
+                        // Try without the last 16 bytes (maybe they're metadata, not part of ciphertext)
+                        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                        val spec = GCMParameterSpec(128, iv)
+                        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), spec)
+                        val decrypted = cipher.doFinal(encryptedData.copyOf(encryptedData.size - 16))
+                        val result = String(decrypted, Charsets.UTF_8)
+                        if (result.contains("#EXTM3U")) {
+                            println("[NguonC] ✓ Decryption OK using $keyDesc (trimmed last 16)")
+                            return result
+                        }
+                    } catch (_: Exception) {}
+                }
+            }
+
+            println("[NguonC] All ${keyAttempts.size}×${aadCandidates.size} key+AAD combinations failed for kX=${keyHex.take(20)}...")
             null
         } catch (e: Exception) {
             println("[NguonC] Decryption FAILED: ${e.message}")
