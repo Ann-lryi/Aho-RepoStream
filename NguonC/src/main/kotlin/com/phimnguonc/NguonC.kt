@@ -8,6 +8,7 @@ import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
+import java.security.MessageDigest
 import android.util.Base64
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -501,7 +502,7 @@ class PhimNguonCProvider : MainAPI() {
                 val obfJson = String(Base64.decode(obfBase64, Base64.DEFAULT), Charsets.UTF_8)
                 val kX = Regex(""""kX"\s*:\s*"([^"]+)"""").find(obfJson)?.groupValues?.get(1)
                 if (kX != null && kX.length >= 16) {
-                    println("[NguonC] Found kX from data-obf: ${kX.take(20)}...")
+                    println("[NguonC] Found kX from data-obf: length=${kX.length}, value=${kX}")
                     return kX
                 }
             } catch (_: Exception) {}
@@ -621,10 +622,55 @@ class PhimNguonCProvider : MainAPI() {
         return hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
     }
 
+    /** Derive AES key from token using multiple methods (SHA-256, MD5, hex parse, etc.)
+     *  Key insight: the AES key is NOT kX directly, but a HASH of the token.
+     *  The player1.js derives the key this way. */
+    private fun deriveKeyFromToken(token: String): List<Pair<String, ByteArray>> {
+        val keys = mutableListOf<Pair<String, ByteArray>>()
+
+        // SHA-256 of token UTF-8, take first 16 bytes (AES-128)
+        try {
+            val sha256 = MessageDigest.getInstance("SHA-256").digest(token.toByteArray(Charsets.UTF_8))
+            keys.add(Pair("SHA-256(utf8).16", sha256.copyOf(16)))
+            keys.add(Pair("SHA-256(utf8).32", sha256))
+        } catch (_: Exception) {}
+
+        // MD5 of token UTF-8 (16 bytes = AES-128)
+        try {
+            val md5 = MessageDigest.getInstance("MD5").digest(token.toByteArray(Charsets.UTF_8))
+            keys.add(Pair("MD5(utf8)", md5))
+        } catch (_: Exception) {}
+
+        // SHA-256 of hex-decoded token bytes
+        try {
+            val hexBytes = hexToBytes(token)
+            val sha256hex = MessageDigest.getInstance("SHA-256").digest(hexBytes)
+            keys.add(Pair("SHA-256(hexBytes).16", sha256hex.copyOf(16)))
+            keys.add(Pair("SHA-256(hexBytes).32", sha256hex))
+        } catch (_: Exception) {}
+
+        // First 32 hex chars as bytes → 16 bytes AES-128
+        if (token.length >= 32) {
+            try { keys.add(Pair("hex(first32)", hexToBytes(token.take(32)))) } catch (_: Exception) {}
+        }
+
+        // Full token as hex bytes
+        if (token.length >= 16 && token.length % 2 == 0) {
+            try {
+                val fullBytes = hexToBytes(token)
+                if (fullBytes.size == 16 || fullBytes.size == 24 || fullBytes.size == 32) {
+                    keys.add(Pair("hex(full)", fullBytes))
+                }
+            } catch (_: Exception) {}
+        }
+
+        return keys
+    }
+
     /** Decrypt AES-GCM encrypted m3u8 content.
      *  Format: #ENC-AESGCM;iv=HEX12BYTES\n#EXT-X-B65:offset-length\nBASE64_CIPHERTEXT
-     *  Key can be 16 bytes (AES-128) or 32 bytes (AES-256) */
-    private fun decryptStreamcM3u8(content: String, keyHex: String): String? {
+     *  Tries kX directly AND derived keys from token */
+    private fun decryptStreamcM3u8(content: String, keyHex: String, token: String? = null): String? {
         return try {
             val ivMatch = Regex("""#ENC-AESGCM;iv=([a-f0-9A-F]+)""").find(content) ?: return null
             val ivHex = ivMatch.groupValues[1]
@@ -648,18 +694,61 @@ class PhimNguonCProvider : MainAPI() {
 
             val encryptedData = Base64.decode(b64Data, Base64.DEFAULT)
 
-            // Try both AES-128 (key as hex bytes = 16 bytes) and AES-256 (key as UTF-8 string = 32 bytes)
-            val keyAttempts = listOf(
-                Pair("AES-128 (hex bytes)", hexToBytes(keyHex.take(32))),  // first 32 hex chars = 16 bytes
-                Pair("AES-256 (UTF-8)", keyHex.toByteArray(Charsets.UTF_8)) // 32 hex chars as UTF-8 = 32 bytes
-            )
+            // Build list of key attempts from multiple sources
+            val keyAttempts = mutableListOf<Pair<String, ByteArray>>()
+
+            // Source 1: kX from data-obf - try various interpretations
+            if (keyHex.length >= 16 && keyHex.length % 2 == 0) {
+                try {
+                    val fullBytes = hexToBytes(keyHex)
+                    if (fullBytes.size == 16 || fullBytes.size == 24 || fullBytes.size == 32) {
+                        keyAttempts.add(Pair("kX-hex(full)", fullBytes))
+                    }
+                } catch (_: Exception) {}
+            }
+            if (keyHex.length >= 32) {
+                try { keyAttempts.add(Pair("kX-hex(first32)", hexToBytes(keyHex.take(32)))) } catch (_: Exception) {}
+            }
+            if (keyHex.length >= 64) {
+                try { keyAttempts.add(Pair("kX-hex(first64)", hexToBytes(keyHex.take(64)))) } catch (_: Exception) {}
+            }
+            // SHA-256 and MD5 of kX
+            try {
+                val sha256 = MessageDigest.getInstance("SHA-256").digest(keyHex.toByteArray(Charsets.UTF_8))
+                keyAttempts.add(Pair("SHA-256(kX-utf8).16", sha256.copyOf(16)))
+                keyAttempts.add(Pair("SHA-256(kX-utf8).32", sha256))
+            } catch (_: Exception) {}
+            try {
+                keyAttempts.add(Pair("MD5(kX-utf8)", MessageDigest.getInstance("MD5").digest(keyHex.toByteArray(Charsets.UTF_8))))
+            } catch (_: Exception) {}
+            // SHA-256 of kX hex bytes
+            try {
+                val kxHexBytes = hexToBytes(keyHex)
+                val sha256hex = MessageDigest.getInstance("SHA-256").digest(kxHexBytes)
+                keyAttempts.add(Pair("SHA-256(kX-hexBytes).16", sha256hex.copyOf(16)))
+                keyAttempts.add(Pair("SHA-256(kX-hexBytes).32", sha256hex))
+            } catch (_: Exception) {}
+
+            // Source 2: Derived keys from token (the correct approach per original plugin!)
+            if (token != null && token.length > 10) {
+                keyAttempts.addAll(deriveKeyFromToken(token))
+            }
+
+            // Source 3: Also try deriving from sUb (the URL slug token)
+            if (token != null && token.length > 10) {
+                // The sUb is the base64 token used in the URL - derive key from it too
+                try {
+                    val sha256 = MessageDigest.getInstance("SHA-256").digest(token.toByteArray(Charsets.UTF_8))
+                    keyAttempts.add(Pair("SHA-256(token-utf8).16", sha256.copyOf(16)))
+                    keyAttempts.add(Pair("SHA-256(token-utf8).32", sha256))
+                } catch (_: Exception) {}
+            }
+
+            println("[NguonC] kX length=${keyHex.length}, token=${if (token != null) token.length else "null"}, key attempts: ${keyAttempts.size}")
 
             for ((desc, keyBytes) in keyAttempts) {
                 try {
-                    if (keyBytes.size != 16 && keyBytes.size != 24 && keyBytes.size != 32) {
-                        println("[NguonC] Key size ${keyBytes.size} not valid for AES, skipping $desc")
-                        continue
-                    }
+                    if (keyBytes.size != 16 && keyBytes.size != 24 && keyBytes.size != 32) continue
                     val cipher = Cipher.getInstance("AES/GCM/NoPadding")
                     val spec = GCMParameterSpec(128, iv)
                     cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), spec)
@@ -669,10 +758,11 @@ class PhimNguonCProvider : MainAPI() {
                         println("[NguonC] Decryption OK using $desc")
                         return result
                     }
-                } catch (e: Exception) {
-                    println("[NguonC] Decryption with $desc failed: ${e.message}")
+                } catch (_: Exception) {
+                    // Try next method
                 }
             }
+            println("[NguonC] All ${keyAttempts.size} key methods failed for kX=${keyHex.take(20)}...")
             null
         } catch (e: Exception) {
             println("[NguonC] Decryption FAILED: ${e.message}")
@@ -792,6 +882,12 @@ class PhimNguonCProvider : MainAPI() {
                                         val m3u8Content = m3u8Resp.text
                                         println("[NguonC] Response length=${m3u8Content.length}, starts: ${m3u8Content.take(60)}")
 
+                                        // Check if response is HTML error page (not m3u8 at all)
+                                        if (m3u8Content.contains("<!DOCTYPE") || m3u8Content.contains("<html") || m3u8Content.contains("<HTML")) {
+                                            println("[NguonC] Got HTML error page instead of m3u8 (token may be expired)")
+                                            continue
+                                        }
+
                                         if (m3u8Content.contains("#EXTM3U") && !m3u8Content.contains("#ENC-AESGCM")) {
                                             // Plain m3u8!
                                             println("[NguonC] Plain m3u8 found with $ext")
@@ -805,7 +901,7 @@ class PhimNguonCProvider : MainAPI() {
                                             println("[NguonC] Encrypted m3u8 with $ext, searching for key...")
                                             val kX = findEncryptionKey(html, embedDomain, targetUrl)
                                             if (kX != null) {
-                                                val decrypted = decryptStreamcM3u8(m3u8Content, kX)
+                                                val decrypted = decryptStreamcM3u8(m3u8Content, kX, token)
                                                 if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
                                                     println("[NguonC] Decrypted OK")
                                                     if (registerM3U8Link(decrypted, targetUrl, "", serverName, callback)) {
@@ -845,7 +941,7 @@ class PhimNguonCProvider : MainAPI() {
                                         println("[NguonC] WebView captured encrypted m3u8, searching for key...")
                                         val kX = findEncryptionKey(html, embedDomain, targetUrl)
                                         if (kX != null) {
-                                            val decrypted = decryptStreamcM3u8(m3u8Content, kX)
+                                            val decrypted = decryptStreamcM3u8(m3u8Content, kX, token)
                                             if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
                                                 println("[NguonC] Decrypted WebView content OK")
                                                 if (registerM3U8Link(decrypted, targetUrl, "", serverName, callback)) {
@@ -884,7 +980,7 @@ class PhimNguonCProvider : MainAPI() {
                                         } else if (m3u8Content.contains("#ENC-AESGCM")) {
                                             val kX = findEncryptionKey(html, embedDomain, targetUrl)
                                             if (kX != null) {
-                                                val decrypted = decryptStreamcM3u8(m3u8Content, kX)
+                                                val decrypted = decryptStreamcM3u8(m3u8Content, kX, token)
                                                 if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
                                                     if (registerM3U8Link(decrypted, targetUrl, "", serverName, callback)) {
                                                         linkFound = true
@@ -928,7 +1024,7 @@ class PhimNguonCProvider : MainAPI() {
                                 // Try to derive key from URL domain
                                 val kX = findEncryptionKey("", embedDomain, targetUrl)
                                 if (kX != null) {
-                                    val decrypted = decryptStreamcM3u8(content, kX)
+                                    val decrypted = decryptStreamcM3u8(content, kX, null)
                                     if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
                                         registerM3U8Link(decrypted, targetUrl, "", serverName, callback)
                                         linkFound = true
@@ -996,7 +1092,7 @@ class PhimNguonCProvider : MainAPI() {
                             } else if (m3u8Content.contains("#ENC-AESGCM")) {
                                 val kX = findEncryptionKey(html, embedDomain, targetUrl)
                                 if (kX != null) {
-                                    val decrypted = decryptStreamcM3u8(m3u8Content, kX)
+                                    val decrypted = decryptStreamcM3u8(m3u8Content, kX, token3)
                                     if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
                                         registerM3U8Link(decrypted, targetUrl, "", serverName, callback)
                                         linkFound = true
@@ -1015,7 +1111,7 @@ class PhimNguonCProvider : MainAPI() {
                                 } else if (m3u8Content.contains("#ENC-AESGCM")) {
                                     val kX = findEncryptionKey(html, embedDomain, targetUrl)
                                     if (kX != null) {
-                                        val decrypted = decryptStreamcM3u8(m3u8Content, kX)
+                                        val decrypted = decryptStreamcM3u8(m3u8Content, kX, token3)
                                         if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
                                             registerM3U8Link(decrypted, targetUrl, "", serverName, callback)
                                             linkFound = true
