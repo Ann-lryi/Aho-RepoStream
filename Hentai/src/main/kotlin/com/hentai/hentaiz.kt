@@ -416,107 +416,117 @@ class HentaiZProvider : MainAPI() {
 
         println("[HentaiZ] Embed URL: $embedUrl")
 
-        // ── Strategy 0 (NHANH ~1-3s, 0 WebView) ──────────────────────────────
-        // x.haiten.org là SvelteKit → thử /watch/__data.json?v=UUID trực tiếp
-        // Đây là nơi player lấy stream URL, không cần render JS
         val uuid = Regex("""[?&]v=([^&\s]+)""").find(embedUrl)?.groupValues?.get(1)
+
+        // ── Strategy 0: CDN trực tiếp, không WebView (~1s) ───────────────────
+        // thumbnail URL = c2.animez.top/{uuid}/thumbnails.vtt → video cùng pattern
+        // Nếu CDN public (không token) thì lấy được ngay
         if (uuid != null) {
-            println("[HentaiZ] Strategy 0: trying embed __data.json, uuid=$uuid")
-            try {
-                val dataUrl = "https://x.haiten.org/watch/__data.json?v=$uuid"
-                val resp = app.get(dataUrl, headers = apiHeaders + mapOf(
-                    "Referer" to "$mainUrl/",
-                    "Origin" to mainUrl
-                ))
-                if (resp.isSuccessful) {
-                    val text = resp.text
-                    println("[HentaiZ] __data.json response length: ${text.length}")
-
-                    // Tìm m3u8 hoặc mp4 trong JSON
-                    val videoUrl =
-                        Regex("""["'`](https?://[^"'`\s\\]+\.m3u[89][^"'`\s\\]*)["'`]""").find(text)?.groupValues?.get(1)
-                        ?: Regex("""["'`](https?://[^"'`\s\\]+\.mp4[^"'`\s\\]*)["'`]""").find(text)?.groupValues?.get(1)
-
-                    if (!videoUrl.isNullOrBlank() && !videoUrl.startsWith("blob:")) {
-                        println("[HentaiZ] Strategy 0 SUCCESS: ${videoUrl.take(80)}")
-                        val isM3u8 = videoUrl.contains(".m3u")
-                        callback(newExtractorLink(
-                            "HentaiZ", "HentaiZ Stream", videoUrl,
-                            if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                        ) {
+            println("[HentaiZ] Strategy 0: CDN direct, uuid=$uuid")
+            val cdnBase = "https://c2.animez.top/$uuid"
+            val candidates = listOf(
+                "$cdnBase/master.m3u8",
+                "$cdnBase/index.m3u8",
+                "$cdnBase/playlist.m3u8",
+                "$cdnBase/$uuid.m3u8",
+                "$cdnBase/video.m3u8"
+            )
+            for (url in candidates) {
+                try {
+                    val resp = app.get(url, headers = mapOf(
+                        "User-Agent" to USER_AGENT,
+                        "Referer"    to "https://x.haiten.org/"
+                    ))
+                    if (resp.isSuccessful && resp.text.trimStart().startsWith("#EXTM3U")) {
+                        println("[HentaiZ] Strategy 0 SUCCESS: $url")
+                        callback(newExtractorLink("HentaiZ", "HentaiZ CDN", url, ExtractorLinkType.M3U8) {
                             quality = Qualities.P1080.value
                             headers = mapOf(
                                 "User-Agent" to USER_AGENT,
-                                "Referer" to embedUrl,
-                                "Origin" to "https://x.haiten.org"
+                                "Referer"    to "https://x.haiten.org/",
+                                "Origin"     to "https://x.haiten.org"
                             )
                         })
                         return true
                     } else {
-                        println("[HentaiZ] Strategy 0: no video URL in __data.json, response snippet: ${text.take(300)}")
+                        println("[HentaiZ] Strategy 0: $url → HTTP ${resp.code}, not m3u8")
                     }
+                } catch (e: Exception) {
+                    println("[HentaiZ] Strategy 0 skip $url: ${e.message}")
                 }
-            } catch (e: Exception) {
-                println("[HentaiZ] Strategy 0 failed: ${e.message}")
             }
         }
 
-        // ── Strategy 1 (~30-60s, 1 WebView) ──────────────────────────────────
-        // WebViewResolver bắt đúng network request đến file video
-        // Không dùng cfInterceptor — chỉ cần intercept HLS/MP4 request
-        println("[HentaiZ] Strategy 1: WebViewResolver for HLS/MP4 capture...")
+        // ── Strategy 1: WebView + bắt CDN request sau khi JS decrypt (~30-60s) ─
+        // Video dùng MSE/blob URL → không bắt được blob
+        // Nhưng trước khi tạo blob, WebView phải fetch m3u8 từ c2.animez.top
+        // → intercept bất kỳ request nào đến c2.animez.top
+        println("[HentaiZ] Strategy 1: WebView intercept c2.animez.top CDN...")
         try {
-            val videoInterceptor = WebViewResolver(
-                Regex(""".*\.(m3u8|m3u9)(\?.*)?${'$'}|.*master\.m3u8.*|.*playlist\.m3u8.*|.*index\.m3u8.*""")
+            val cdnInterceptor = WebViewResolver(
+                Regex(""".*c2\.animez\.top/[^/]+/(master|index|playlist|video)[^?]*(\?.*)?${'$'}|.*c2\.animez\.top/[^/]+/[^/]+\.m3u[89].*""")
             )
-            val resp = app.get(
-                embedUrl,
-                interceptor = videoInterceptor,
-                headers = mapOf(
-                    "Referer" to "$mainUrl/",
-                    "User-Agent" to USER_AGENT
-                )
-            )
+            val resp = app.get(embedUrl, interceptor = cdnInterceptor, headers = mapOf(
+                "Referer"    to "$mainUrl/",
+                "User-Agent" to USER_AGENT
+            ))
             val capturedUrl = resp.url ?: ""
-            val content = resp.text
+            val content     = resp.text
+            println("[HentaiZ] Strategy 1 captured: ${capturedUrl.take(120)}")
 
-            // Kiểm tra m3u8
-            val m3u8Url = when {
-                capturedUrl.contains(".m3u") -> capturedUrl
-                content.contains("#EXTM3U") ->
-                    Regex("""(https?://[^\s"']+\.m3u[89][^\s"']*)""").find(content)?.groupValues?.get(1) ?: ""
-                else -> ""
-            }
-
-            if (m3u8Url.isNotBlank()) {
-                println("[HentaiZ] Strategy 1 HLS SUCCESS: ${m3u8Url.take(80)}")
-                callback(newExtractorLink("HentaiZ", "HentaiZ HLS", m3u8Url, ExtractorLinkType.M3U8) {
+            if (capturedUrl.isNotBlank() && !capturedUrl.startsWith("blob:") && capturedUrl.contains("animez.top")) {
+                val isM3u8 = content.trimStart().startsWith("#EXTM3U") || capturedUrl.contains(".m3u")
+                println("[HentaiZ] Strategy 1 SUCCESS isM3u8=$isM3u8: ${capturedUrl.take(80)}")
+                callback(newExtractorLink(
+                    "HentaiZ", "HentaiZ CDN",
+                    capturedUrl,
+                    if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                ) {
                     quality = Qualities.P1080.value
                     headers = mapOf(
                         "User-Agent" to USER_AGENT,
-                        "Referer" to embedUrl,
-                        "Origin" to "https://x.haiten.org"
+                        "Referer"    to "https://x.haiten.org/",
+                        "Origin"     to "https://x.haiten.org"
                     )
                 })
                 return true
             }
-
-            // Kiểm tra mp4
-            if (capturedUrl.contains(".mp4")) {
-                println("[HentaiZ] Strategy 1 MP4 SUCCESS: ${capturedUrl.take(80)}")
-                callback(newExtractorLink("HentaiZ", "HentaiZ MP4", capturedUrl, ExtractorLinkType.VIDEO) {
-                    quality = Qualities.P1080.value
-                    headers = mapOf(
-                        "User-Agent" to USER_AGENT,
-                        "Referer" to embedUrl
-                    )
-                })
-                return true
-            }
-
-            println("[HentaiZ] Strategy 1: captured URL=${capturedUrl.take(80)}, content length=${content.length}")
         } catch (e: Exception) {
-            println("[HentaiZ] Strategy 1 failed: ${e.message}")
+            println("[HentaiZ] Strategy 1 exception: ${e.message}")
+        }
+
+        // ── Strategy 2: WebView rộng hơn — bắt BẤT KỲ request animez.top ─────
+        println("[HentaiZ] Strategy 2: broad animez.top capture...")
+        try {
+            val broadInterceptor = WebViewResolver(
+                Regex(""".*animez\.top/[a-f0-9\-]{20,}/.*""")
+            )
+            val resp = app.get(embedUrl, interceptor = broadInterceptor, headers = mapOf(
+                "Referer"    to "$mainUrl/",
+                "User-Agent" to USER_AGENT
+            ))
+            val capturedUrl = resp.url ?: ""
+            val content     = resp.text
+            println("[HentaiZ] Strategy 2 captured: ${capturedUrl.take(120)}")
+            println("[HentaiZ] Strategy 2 body (100): ${content.take(100)}")
+
+            if (capturedUrl.isNotBlank() && !capturedUrl.startsWith("blob:")) {
+                val isM3u8 = content.trimStart().startsWith("#EXTM3U") || capturedUrl.contains(".m3u")
+                callback(newExtractorLink(
+                    "HentaiZ", "HentaiZ HLS",
+                    capturedUrl,
+                    if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                ) {
+                    quality = Qualities.P1080.value
+                    headers = mapOf(
+                        "User-Agent" to USER_AGENT,
+                        "Referer"    to "https://x.haiten.org/"
+                    )
+                })
+                return true
+            }
+        } catch (e: Exception) {
+            println("[HentaiZ] Strategy 2 exception: ${e.message}")
         }
 
         println("[HentaiZ] All strategies exhausted for: $embedUrl")
