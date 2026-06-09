@@ -275,11 +275,13 @@ class HentaiZProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════════
 
     override val mainPage = mainPageOf(
-        "publishedAt_desc" to "Phim Mới Nhất",
-        "views_desc" to "Xem Nhiều",
-        "likes_desc" to "Thích Nhất",
-        "UNCENSORED" to "Không Che",
-        "3D" to "3D"
+        "publishedAt_desc" to "🆕 Mới Nhất",
+        "views_desc"       to "🔥 Xem Nhiều",
+        "likes_desc"       to "❤️ Yêu Thích",
+        "UNCENSORED"       to "🔞 Không Che",
+        "CENSORED"         to "📦 Có Che",
+        "3D"               to "🎮 3D",
+        "2D"               to "🎨 2D"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -301,9 +303,17 @@ class HentaiZProvider : MainAPI() {
             val title = ep.title ?: return@mapNotNull null
             val slug = ep.slug ?: return@mapNotNull null
             val poster = ep.posterPath?.let { "$imgCdn$it" }
-            newAnimeSearchResponse(title, "$mainUrl/watch/$slug", TvType.Anime) {
-                this.posterUrl = poster
-                this.quality = SearchQuality.HD
+            val epN = ep.episodeNumber ?: 1
+            if (epN <= 1) {
+                newMovieSearchResponse(title, "$mainUrl/watch/$slug", TvType.Movie) {
+                    this.posterUrl = poster
+                    this.quality   = SearchQuality.HD
+                }
+            } else {
+                newAnimeSearchResponse(title, "$mainUrl/watch/$slug", TvType.Anime) {
+                    this.posterUrl = poster
+                    this.quality   = SearchQuality.HD
+                }
             }
         }
 
@@ -320,9 +330,17 @@ class HentaiZProvider : MainAPI() {
             val title = ep.title ?: return@mapNotNull null
             val slug = ep.slug ?: return@mapNotNull null
             val poster = ep.posterPath?.let { "$imgCdn$it" }
-            newAnimeSearchResponse(title, "$mainUrl/watch/$slug", TvType.Anime) {
-                this.posterUrl = poster
-                this.quality = SearchQuality.HD
+            val epN = ep.episodeNumber ?: 1
+            if (epN <= 1) {
+                newMovieSearchResponse(title, "$mainUrl/watch/$slug", TvType.Movie) {
+                    this.posterUrl = poster
+                    this.quality   = SearchQuality.HD
+                }
+            } else {
+                newAnimeSearchResponse(title, "$mainUrl/watch/$slug", TvType.Anime) {
+                    this.posterUrl = poster
+                    this.quality   = SearchQuality.HD
+                }
             }
         }
     }
@@ -357,22 +375,29 @@ class HentaiZProvider : MainAPI() {
             if (epInfo.genres.isNotEmpty()) append("\nGenres: ${epInfo.genres.joinToString(", ")}")
         }
 
-        val embedUrl = epInfo.embedUrl
+        val embedUrl    = epInfo.embedUrl
         val episodeData = if (embedUrl != null) "$slug::EMBED::$embedUrl" else slug
+        val epNum       = epInfo.episodeNumber
+        val isMovie     = epNum == null || epNum <= 1
 
-        val episodes = listOf(
-            newEpisode(episodeData) {
-                this.name = if (epInfo.episodeNumber != null) "Tập ${epInfo.episodeNumber}" else "Full"
-                this.episode = epInfo.episodeNumber
+        return if (isMovie) {
+            newMovieLoadResponse(title, url, TvType.Movie, episodeData) {
+                this.posterUrl           = poster
+                this.backgroundPosterUrl = backdrop
+                this.plot                = plot
+                this.tags                = epInfo.genres
+                this.year                = epInfo.releaseYear
             }
-        )
-
-        return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
-            this.posterUrl = poster
-            this.backgroundPosterUrl = backdrop
-            this.plot = plot
-            this.tags = epInfo.genres
-            this.year = epInfo.releaseYear
+        } else {
+            newTvSeriesLoadResponse(title, url, TvType.Anime,
+                listOf(newEpisode(episodeData) { this.episode = epNum })
+            ) {
+                this.posterUrl           = poster
+                this.backgroundPosterUrl = backdrop
+                this.plot                = plot
+                this.tags                = epInfo.genres
+                this.year                = epInfo.releaseYear
+            }
         }
     }
 
