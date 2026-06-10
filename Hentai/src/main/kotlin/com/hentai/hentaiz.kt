@@ -307,7 +307,7 @@ class HentaiZProvider : MainAPI() {
 
     override val mainPage = mainPageOf(
         // ── Sắp xếp ─────────────────────────────────────────
-        "browse:2d" to "Mới Nhất🔥",
+        "/browse/2d" to "Mới Nhất🔥",
         "genre:loan-luan"          to "Loạn luân🥵"
     )
 
