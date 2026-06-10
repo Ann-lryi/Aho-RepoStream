@@ -19,7 +19,7 @@ class HentaiZProvider : MainAPI() {
     override val hasMainPage    = true
     override var lang           = "vi"
     override val hasDownloadSupport = true
-    override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
+    override val supportedTypes = setOf(TvType.NSFW)
     val nsfw = true
 
     private val USER_AGENT = "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
@@ -308,76 +308,7 @@ class HentaiZProvider : MainAPI() {
     override val mainPage = mainPageOf(
         // ── Sắp xếp ─────────────────────────────────────────
         "sort:publishedAt_desc" to "🆕 Mới Nhất",
-        "sort:views_desc"       to "🔥 Xem Nhiều",
-        "sort:likes_desc"       to "❤️ Yêu Thích",
-        // ── Phân loại ───────────────────────────────────────
-        "rating:UNCENSORED"     to "🔞 Không Che",
-        "rating:CENSORED"       to "📦 Có Che",
-        "type:TWO_D"            to "🎨 2D (Anime)",
-        // ── Thể loại thực từ hentaiz.chat ───────────────────
-        "genre:big-boobs"          to "Big Boobs",
-        "genre:bu-liem"            to "Bú liếm",
-        "genre:nu-sinh"            to "Nữ sinh",
-        "genre:du-vu"              to "Đụ Vú",
-        "genre:stocking"           to "Stocking",
-        "genre:hiep-dam"           to "Hiếp dâm",
-        "genre:virgin"             to "Virgin",
-        "genre:anal"               to "Anal",
-        "genre:mind-break"         to "Mind Break",
-        "genre:femdom"             to "Femdom",
-        "genre:ahegao"             to "Ahegao",
-        "genre:vanilla"            to "Vanilla",
-        "genre:threesome"          to "Threesome",
-        "genre:milf"               to "MILF",
-        "genre:sex-toy"            to "Sex Toy",
-        "genre:harem"              to "Harem",
-        "genre:plot"               to "Plot",
-        "genre:thu-dam"            to "Thủ Dâm",
-        "genre:loan-luan"          to "Loạn luân",
-        "genre:gang-bang"          to "Gang Bang",
-        "genre:bondage"            to "Bondage",
-        "genre:tsundere"           to "Tsundere",
-        "genre:ntr"                to "NTR",
-        "genre:double-penetration" to "Double Penetration",
-        "genre:giao-vien"          to "Giáo viên",
-        "genre:megane"             to "Megane",
-        "genre:yuri"               to "Yuri",
-        "genre:do-boi"             to "Đồ Bơi",
-        "genre:ugly-bastard"       to "Ugly Bastard",
-        "genre:thac-loan"          to "Thác loạn",
-        "genre:maid"               to "Maid",
-        "genre:bao-dam"            to "Bạo dâm",
-        "genre:thoi-mien"          to "Thôi miên",
-        "genre:sua-me"             to "Sữa mẹ",
-        "genre:tong-tinh"          to "Tống tình",
-        "genre:da-ngam"            to "Da ngăm",
-        "genre:3d"                 to "3D",
-        "genre:monster"            to "Monster",
-        "genre:y-ta"               to "Y Tá",
-        "genre:fantasy"            to "Fantasy",
-        "genre:xuc-tu"             to "Xúc tu",
-        "genre:foot-job"           to "Foot Job",
-        "genre:x-ray"              to "X-Ray",
-        "genre:kemonomimi"         to "Kemonomimi",
-        "genre:futanari"           to "Futanari",
-        "genre:wafuku"             to "Wafuku",
-        "genre:elf"                to "Elf",
-        "genre:softcore"           to "Softcore",
-        "genre:big-girls"          to "Big girls",
-        "genre:cong-cong"          to "Công cộng",
-        "genre:josei"              to "Josei",
-        "genre:gai-quay"           to "Gái quậy",
-        "genre:idol"               to "Idol",
-        "genre:thuoc-kich-duc"     to "Thuốc kích dục",
-        "genre:succubus"           to "Succubus",
-        "genre:cosplay"            to "Cosplay",
-        "genre:mang-thai"          to "Mang thai",
-        "genre:ngu"                to "Ngủ",
-        "genre:trap"               to "Trap",
-        "genre:yaoi"               to "Yaoi",
-        "genre:vu-lep"             to "Vú lép",
-        "genre:goblin"             to "Goblin",
-        "genre:furry"              to "Furry"
+        "genre:loan-luan"          to "Loạn luân"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
