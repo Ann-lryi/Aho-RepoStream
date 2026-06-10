@@ -313,7 +313,7 @@ class HentaiZProvider : MainAPI() {
         // ── Phân loại ───────────────────────────────────────
         "rating:UNCENSORED"     to "🔞 Không Che",
         "rating:CENSORED"       to "📦 Có Che",
-        "type:2D"               to "🎨 2D",
+        "type:TWO_D"            to "🎨 2D (Anime)",
         // ── Thể loại thực từ hentaiz.chat ───────────────────
         "genre:big-boobs"          to "Big Boobs",
         "genre:bu-liem"            to "Bú liếm",
@@ -405,7 +405,7 @@ class HentaiZProvider : MainAPI() {
         return when {
             data.startsWith("sort:")   -> buildBrowseUrl(page, sort = data.removePrefix("sort:")) to true
             data.startsWith("rating:") -> buildBrowseUrl(page, contentRating = data.removePrefix("rating:")) to true
-            data.startsWith("type:")   -> buildBrowseUrl(page, animationType = data.removePrefix("type:")) to true
+            data.startsWith("type:")   -> buildBrowseUrl(page, animationType = when(data.removePrefix("type:")) { "TWO_D" -> "TWO_D"; "THREE_D" -> "THREE_D"; else -> data.removePrefix("type:") }) to true
             data.startsWith("genre:")  -> {
                 // Genre page dùng path riêng, sort khác với browse
                 val slug = data.removePrefix("genre:")
