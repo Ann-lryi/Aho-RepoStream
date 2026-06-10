@@ -307,8 +307,8 @@ class HentaiZProvider : MainAPI() {
 
     override val mainPage = mainPageOf(
         // ── Sắp xếp ─────────────────────────────────────────
-        "sort:publishedAt_desc" to "🆕 Mới Nhất",
-        "genre:loan-luan"          to "Loạn luân"
+        "browse:2d" to "Mới Nhất🔥",
+        "genre:loan-luan"          to "Loạn luân🥵"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
