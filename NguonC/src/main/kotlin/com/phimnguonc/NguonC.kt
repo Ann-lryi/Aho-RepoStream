@@ -61,6 +61,7 @@ class PhimNguonCProvider : MainAPI() {
         "danh-sach/phim-le"                           to "Phim L\u1EBB",
         "danh-sach/phim-bo"                           to "Phim B\u1ED9",
         "danh-sach/tv-shows"                          to "Nh\u1EADt B\u1EA3n + Anime"
+        "danh-sach-phim?cats%5B1%5D=&cats%5B6%5D=144&cats%5B25%5D=&cats%5B47%5D=&sort_field=view" to "18+"
     )
 
     private fun parseCard(el: Element): SearchResponse? {
