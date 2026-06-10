@@ -383,9 +383,20 @@ class HentaiZProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val data  = request.data
         val (browseUrl, hasNext) = buildUrlFromData(data, page)
-        val nodes    = fetchSvelteData(browseUrl) ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
-        val nodeData = nodes.getOrNull(2)          ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
+        println("[HentaiZ] getMainPage data='$data' url='$browseUrl'")
+        val nodes    = fetchSvelteData(browseUrl) ?: run {
+            println("[HentaiZ] getMainPage: fetchSvelteData returned null")
+            return newHomePageResponse(request.name, emptyList(), hasNext = false)
+        }
+        println("[HentaiZ] getMainPage: nodes.size=${nodes.size}")
+        val nodeData = nodes.getOrNull(2) ?: run {
+            println("[HentaiZ] getMainPage: nodeData(2) is null, available=${nodes.size}")
+            return newHomePageResponse(request.name, emptyList(), hasNext = false)
+        }
+        println("[HentaiZ] getMainPage: nodeData.size=${nodeData.size}, types=${nodeData.take(5).map{it?.javaClass?.simpleName}}")
         val (eps, totalPages) = parseBrowse(nodeData)
+        println("[HentaiZ] getMainPage: eps=${eps.size}, totalPages=$totalPages, section='${request.name}'")
+        eps.take(2).forEach { println("[HentaiZ]   ep: ${it.title} / ${it.slug}") }
         val items = eps.mapNotNull { epToSearch(it) }
         return newHomePageResponse(request.name, items, hasNext = page < totalPages)
     }
