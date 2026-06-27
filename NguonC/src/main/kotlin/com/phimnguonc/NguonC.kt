@@ -216,26 +216,27 @@ class PhimNguonCProvider : MainAPI() {
             this.year      = namPhatHanh.toIntOrNull()
             this.plot      = beautifulPlot
             this.tags      = theLoaiItems
-            // Sửa lỗi API cũ: 'rating' đã bị CloudStream Deprecated. Chuyển sang dùng 'score'.
-            // Mức điểm từ 0.0 -> 10.0 (Thay vì 0 -> 10000 như bản cũ
+            // Lỗi API cũ của CloudStream 4
+            // Nếu không dùng được rating thì ta tạm thời vô hiệu hóa điểm đánh giá để đảm bảo load phim mượt mà.
+            // this.rating = movie.quality?.let { if (it.contains("HD", true)) 80 else 60 }
         }
     }
 
     private fun buildBeautifulDescription(movie: NguonCMovie, dinhDang: String, theLoai: String, namPhatHanh: String, quocGia: String): String {
         val b = java.lang.StringBuilder()
-        if (!movie.original_name.isNullOrBlank()) b.append("📌 Tên gốc: ${movie.original_name}\n")
-        if (quocGia.isNotBlank()) b.append("🌍 Quốc gia: $quocGia\n")
-        if (namPhatHanh.isNotBlank()) b.append("📅 Năm: $namPhatHanh\n")
+        if (!movie.original_name.isNullOrBlank()) b.append("📌 Tên gốc: ${movie.original_name}<br>")
+        if (quocGia.isNotBlank()) b.append("🌍 Quốc gia: $quocGia<br>")
+        if (namPhatHanh.isNotBlank()) b.append("📅 Năm: $namPhatHanh<br>")
         if (dinhDang.isNotBlank() || theLoai.isNotBlank()) {
             b.append("🎭 Thể loại: ")
             val t = mutableListOf<String>()
             if (dinhDang.isNotBlank()) t.add(dinhDang)
             if (theLoai.isNotBlank()) t.add(theLoai)
-            b.append(t.joinToString(" - ") + "\n")
+            b.append(t.joinToString(" - ") + "<br>")
         }
-        if (!movie.director.isNullOrBlank()) b.append("🎬 Đạo diễn: ${movie.director}\n")
-        if (!movie.casts.isNullOrBlank()) b.append("👨‍🎤 Diễn viên: ${movie.casts}\n")
-        b.append("\n📝 Nội dung:\n")
+        if (!movie.director.isNullOrBlank()) b.append("🎬 Đạo diễn: ${movie.director}<br>")
+        if (!movie.casts.isNullOrBlank()) b.append("👨‍🎤 Diễn viên: ${movie.casts}<br>")
+        b.append("<br>📝 Nội dung:<br>")
         var desc = movie.description?.replace(Regex("<[^>]*>"), "")?.trim() ?: ""
         if (desc.isBlank()) desc = "Đang cập nhật..."
         b.append(desc)
@@ -347,19 +348,22 @@ class PhimNguonCProvider : MainAPI() {
     private suspend fun registerM3U8Link(content: String, sourceUrl: String, baseUrl: String, serverName: String, callback: (ExtractorLink) -> Unit): Boolean {
         if (!content.contains("#EXTM3U")) return false
         
-        // Sửa lỗi API cũ: Lớp ExtractorLink trên các bản CloudStream mới không còn nhận tham số m3u8Data
-        // (Thay vào đó, Cloudstream sẽ tự phân tích URL).
-        // Đối với các m3u8 bị mã hóa cần dữ liệu Raw, có thể dùng thuộc tính extractorData hoặc viết HLS downloader riêng.
-        // Ở đây chúng ta sẽ thiết lập link dạng M3U8 chuẩn để CloudStream bắt được.
+        val safeUrl = if (baseUrl.isNotEmpty()) baseUrl else sourceUrl
+        
+        // GIẢI PHÁP HOTFIX: Khôi phục lại luồng phát cho M3U8 bị mã hóa (Decrypted Streamc)
+        // Khi file m3u8 bị mã hóa (AES) được tải về và giải mã trong RAM, 
+        // chúng ta không thể ném cái URL gốc (đang bị mã hóa) cho ExoPlayer chạy được.
+        // Phải dùng m3u8Data (hoặc extractorData trên các bản cũ) để ép Cloudstream tự host file m3u8 cục bộ.
         callback(
             ExtractorLink(
                 source = name,
                 name = serverName,
-                url = if (baseUrl.isNotEmpty()) baseUrl else sourceUrl,
+                url = safeUrl,
                 referer = sourceUrl,
                 quality = Qualities.P1080.value,
-                type = ExtractorLinkType.M3U8,
-                headers = mapOf("User-Agent" to USER_AGENT)
+                isM3u8 = true, // Sử dụng flag isM3u8 thay vì type = ExtractorLinkType.M3U8 (Tương thích bản cũ)
+                headers = mapOf("User-Agent" to USER_AGENT),
+                extractorData = content // Bơm dữ liệu M3U8 đã giải mã vào đây
             )
         )
         return true
