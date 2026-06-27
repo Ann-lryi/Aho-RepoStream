@@ -216,7 +216,9 @@ class PhimNguonCProvider : MainAPI() {
             this.year      = namPhatHanh.toIntOrNull()
             this.plot      = beautifulPlot
             this.tags      = theLoaiItems
-            this.rating    = movie.quality?.let { if (it.contains("HD", true)) 80 else 60 }
+            // Sửa lỗi API cũ: 'rating' đã bị CloudStream Deprecated. Chuyển sang dùng 'score'.
+            // Mức điểm từ 0.0 -> 10.0 (Thay vì 0 -> 10000 như bản cũ)
+            this.score     = movie.quality?.let { if (it.contains("HD", true)) 8.0 else 6.0 }
         }
     }
 
@@ -346,6 +348,10 @@ class PhimNguonCProvider : MainAPI() {
     private suspend fun registerM3U8Link(content: String, sourceUrl: String, baseUrl: String, serverName: String, callback: (ExtractorLink) -> Unit): Boolean {
         if (!content.contains("#EXTM3U")) return false
         
+        // Sửa lỗi API cũ: Lớp ExtractorLink trên các bản CloudStream mới không còn nhận tham số m3u8Data
+        // (Thay vào đó, Cloudstream sẽ tự phân tích URL).
+        // Đối với các m3u8 bị mã hóa cần dữ liệu Raw, có thể dùng thuộc tính extractorData hoặc viết HLS downloader riêng.
+        // Ở đây chúng ta sẽ thiết lập link dạng M3U8 chuẩn để CloudStream bắt được.
         callback(
             ExtractorLink(
                 source = name,
@@ -354,7 +360,7 @@ class PhimNguonCProvider : MainAPI() {
                 referer = sourceUrl,
                 quality = Qualities.P1080.value,
                 type = ExtractorLinkType.M3U8,
-                m3u8Data = content
+                headers = mapOf("User-Agent" to USER_AGENT)
             )
         )
         return true
@@ -548,7 +554,9 @@ class PhimNguonCProvider : MainAPI() {
                             }
 
                         } catch (e: Exception) {
-                            println("[NguonC_OPT] Lỗi xử lý luồng $targetUrl: ${e.message}")
+                            // Lỗi Unresolved reference targetUrl trước đó xảy ra vì biến targetUrl nằm trong khối try
+                            // Nhưng lại được gọi trong catch block nếu khai báo sai phạm vi. Ở đây tôi dùng println bình thường.
+                            println("[NguonC_OPT] Lỗi xử lý luồng: ${e.message}")
                         }
                     }
                 }
