@@ -222,12 +222,17 @@ class PhimNguonCProvider : MainAPI() {
 
         println("[NguonC] === Resolving: $embedUrl ===")
 
-        // ─── Strategy 1: Intercept m3u9 with ?xat= (preferred) ───
-        // From DevTools: the m3u9 URL contains the token as path and ?xat= as query
-        // Regex matches: anything on streamc.xyz ending with .m3u9 or .m3u8 (with query params)
+        // ─── Strategy 1: Intercept m3u9 WITH ?xat= auth token ───
+        // CRITICAL: streamc.xyz serves TWO m3u requests:
+        //   1st: /{token}.m3u8  (NO ?xat=) → encrypted/auth-required, ExoPlayer CANNOT replay
+        //   2nd: /{token}.m3u9?xat=XXXXX  → plaintext HLS, ExoPlayer CAN replay with this URL
+        // We MUST skip the .m3u8 (no xat) and ONLY catch .m3u9?xat= 
+        // The ?xat= token makes the URL self-authenticated (no cookie needed)
         try {
             val m3u9Interceptor = WebViewResolver(
-                Regex("""streamc\.xyz/[^?]*\.m3u[89](\?|$)""")
+                // ONLY match URLs containing xat= (the self-auth token)
+                // This skips the initial .m3u8 request that lacks auth
+                Regex("""xat=[a-f0-9]""")
             )
             val resp = app.get(
                 embedUrl,
@@ -238,15 +243,22 @@ class PhimNguonCProvider : MainAPI() {
             val capturedUrl = resp.url ?: ""
             val content = resp.text
 
-            println("[NguonC] Intercepted URL: ${capturedUrl.take(100)}")
-            println("[NguonC] Content preview: ${content.take(200)}")
+            println("[NguonC] Intercepted URL: ${capturedUrl.take(120)}")
+            println("[NguonC] Content has EXTM3U: ${content.contains("#EXTM3U")}")
+            println("[NguonC] Content preview: ${content.take(300)}")
 
-            if (content.contains("#EXTM3U")) {
-                println("[NguonC] ✓ Got plaintext m3u9!")
-                callback(newExtractorLink("NguonC", serverName, capturedUrl, INFER_TYPE) {
-                    this.referer = embedUrl
+            if (content.contains("#EXTM3U") && capturedUrl.contains("xat=")) {
+                println("[NguonC] ✓ Got m3u9 with xat token!")
+                // This URL is self-authenticated via ?xat= parameter
+                // ExoPlayer can fetch it directly without cookies
+                val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
+                callback(newExtractorLink("NguonC", serverName, capturedUrl, ExtractorLinkType.M3U8) {
+                    this.referer = embedDomain
                     this.quality = Qualities.P1080.value
-                    this.headers = mapOf("User-Agent" to UA)
+                    this.headers = mapOf(
+                        "User-Agent" to UA,
+                        "Origin" to embedDomain
+                    )
                 })
                 return true
             }
@@ -254,11 +266,12 @@ class PhimNguonCProvider : MainAPI() {
             println("[NguonC] Strategy 1 failed: ${e.message}")
         }
 
-        // ─── Strategy 2: Intercept .png segment requests ───
-        // From DevTools: segments are https://malaysXX.hlhlhoho2.top/.../streamaaa0000.png
+        // ─── Strategy 2: Intercept .png segment requests from CDN ───
+        // Segments: https://malaysXX.hlhlhoho2.top/{hash}/streamaaa0000.png
+        // If we catch a segment, we know the stream works but we need the m3u9
         try {
             val segmentInterceptor = WebViewResolver(
-                Regex("""hlhlhoho\d*\.top/.*\.png(\?|$)|streamaaa\d+\.png""")
+                Regex("""hlhlhoho\d*\.top/.*streamaaa\d+\.png""")
             )
             val resp = app.get(
                 embedUrl,
@@ -268,8 +281,9 @@ class PhimNguonCProvider : MainAPI() {
             )
             val capturedUrl = resp.url ?: ""
 
-            if (capturedUrl.contains(".png") && capturedUrl.contains("stream")) {
+            if (capturedUrl.contains("streamaaa")) {
                 println("[NguonC] ✓ Got segment URL: ${capturedUrl.take(100)}")
+                // Segments are direct CDN URLs, no auth needed
                 callback(newExtractorLink("NguonC", serverName, capturedUrl, INFER_TYPE) {
                     this.referer = embedUrl
                     this.quality = Qualities.P720.value
@@ -281,10 +295,10 @@ class PhimNguonCProvider : MainAPI() {
             println("[NguonC] Strategy 2 failed: ${e.message}")
         }
 
-        // ─── Strategy 3: Broad intercept – any video-like request ───
+        // ─── Strategy 3: Broader – catch m3u9 (any) or CDN domains ───
         try {
             val broadInterceptor = WebViewResolver(
-                Regex("""\.m3u[89]|\.png.*stream|hlhlhoho|amass\d+\.top|hihihoho\d+\.top""")
+                Regex("""\.m3u9(\?|$)|hlhlhoho|amass\d+\.top|hihihoho\d+\.top""")
             )
             val resp = app.get(
                 embedUrl,
@@ -296,12 +310,16 @@ class PhimNguonCProvider : MainAPI() {
             val content = resp.text
 
             if (capturedUrl.isNotBlank()) {
-                println("[NguonC] Broad captured: ${capturedUrl.take(100)}")
+                println("[NguonC] Broad captured: ${capturedUrl.take(120)}")
                 if (content.contains("#EXTM3U")) {
-                    callback(newExtractorLink("NguonC", serverName, capturedUrl, INFER_TYPE) {
-                        this.referer = embedUrl
+                    val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
+                    callback(newExtractorLink("NguonC", serverName, capturedUrl, ExtractorLinkType.M3U8) {
+                        this.referer = embedDomain
                         this.quality = Qualities.P1080.value
-                        this.headers = mapOf("User-Agent" to UA)
+                        this.headers = mapOf(
+                            "User-Agent" to UA,
+                            "Origin" to embedDomain
+                        )
                     })
                     return true
                 }
