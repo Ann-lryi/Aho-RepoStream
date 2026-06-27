@@ -217,8 +217,7 @@ class PhimNguonCProvider : MainAPI() {
             this.plot      = beautifulPlot
             this.tags      = theLoaiItems
             // Sửa lỗi API cũ: 'rating' đã bị CloudStream Deprecated. Chuyển sang dùng 'score'.
-            // Mức điểm từ 0.0 -> 10.0 (Thay vì 0 -> 10000 như bản cũ)
-            this.score     = movie.quality?.let { if (it.contains("HD", true)) 8.0 else 6.0 }
+            // Mức điểm từ 0.0 -> 10.0 (Thay vì 0 -> 10000 như bản cũ
         }
     }
 
