@@ -243,19 +243,11 @@ class PhimNguonCProvider : MainAPI() {
 
             if (content.contains("#EXTM3U")) {
                 println("[NguonC] ✓ Got plaintext m3u9!")
-                // Segments are full URLs (https://malaysXX.hlhlhoho2.top/...)
-                // so we can pass the m3u9 URL directly to the player
-                callback(
-                    ExtractorLink(
-                        source = "NguonC",
-                        name = serverName,
-                        url = capturedUrl,
-                        referer = embedUrl,
-                        quality = Qualities.P1080.value,
-                        type = INFER_TYPE,
-                        headers = mapOf("User-Agent" to UA)
-                    )
-                )
+                callback(newExtractorLink("NguonC", serverName, capturedUrl, INFER_TYPE) {
+                    this.referer = embedUrl
+                    this.quality = Qualities.P1080.value
+                    this.headers = mapOf("User-Agent" to UA)
+                })
                 return true
             }
         } catch (e: Exception) {
@@ -278,21 +270,11 @@ class PhimNguonCProvider : MainAPI() {
 
             if (capturedUrl.contains(".png") && capturedUrl.contains("stream")) {
                 println("[NguonC] ✓ Got segment URL: ${capturedUrl.take(100)}")
-                // From segment URL, we can reconstruct the stream
-                // But better to return a direct link and let player handle it
-                // Try to find the m3u9 URL from the base
-                val baseDir = capturedUrl.substringBeforeLast("/")
-                callback(
-                    ExtractorLink(
-                        source = "NguonC",
-                        name = serverName,
-                        url = capturedUrl,
-                        referer = embedUrl,
-                        quality = Qualities.P720.value,
-                        type = INFER_TYPE,
-                        headers = mapOf("User-Agent" to UA)
-                    )
-                )
+                callback(newExtractorLink("NguonC", serverName, capturedUrl, INFER_TYPE) {
+                    this.referer = embedUrl
+                    this.quality = Qualities.P720.value
+                    this.headers = mapOf("User-Agent" to UA)
+                })
                 return true
             }
         } catch (e: Exception) {
@@ -316,17 +298,11 @@ class PhimNguonCProvider : MainAPI() {
             if (capturedUrl.isNotBlank()) {
                 println("[NguonC] Broad captured: ${capturedUrl.take(100)}")
                 if (content.contains("#EXTM3U")) {
-                    callback(
-                        ExtractorLink(
-                            source = "NguonC",
-                            name = serverName,
-                            url = capturedUrl,
-                            referer = embedUrl,
-                            quality = Qualities.P1080.value,
-                            type = INFER_TYPE,
-                            headers = mapOf("User-Agent" to UA)
-                        )
-                    )
+                    callback(newExtractorLink("NguonC", serverName, capturedUrl, INFER_TYPE) {
+                        this.referer = embedUrl
+                        this.quality = Qualities.P1080.value
+                        this.headers = mapOf("User-Agent" to UA)
+                    })
                     return true
                 }
             }
