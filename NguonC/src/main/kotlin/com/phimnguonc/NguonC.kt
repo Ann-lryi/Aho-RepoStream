@@ -982,11 +982,7 @@ class PhimNguonCProvider : MainAPI() {
         coroutineScope {
             embedEntries.map { (serverName, url) ->
                 async {
-                    try {
-                        if (url.startsWith("//")) return@async
-
-                        val domain    = Regex("""https?://[^/]+""").find(url)?.value ?: return@async
-                        var targetUrl = url
+                    var targetUrl = url
 
                     // Fix dead sing.phimmoi.net links
                     if (url.contains("sing.phimmoi.net")) {
