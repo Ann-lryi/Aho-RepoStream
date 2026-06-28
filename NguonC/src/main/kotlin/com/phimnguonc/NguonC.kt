@@ -265,13 +265,18 @@ class PhimNguonCProvider : MainAPI() {
 
             if (capturedUrl.contains("streamaaa")) {
                 println("[NguonC] ✓ Got segment: ${capturedUrl.take(120)}")
-                val segDomain = Regex("""https?://[^/]+""").find(capturedUrl)?.value ?: ""
 
-                // Pass as direct video — the .png file IS an MPEG-TS segment
+                // CDN requires correct Referer = embed page domain (NOT CDN domain)
+                // From DevTools: segments are fetched with Referer: https://embedXX.streamc.xyz/
+                val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
+
                 callback(newExtractorLink("NguonC", serverName, capturedUrl, ExtractorLinkType.VIDEO) {
-                    this.referer = segDomain
+                    this.referer = "$embedDomain/"
                     this.quality = Qualities.P1080.value
-                    this.headers = mapOf("User-Agent" to UA)
+                    this.headers = mapOf(
+                        "User-Agent" to UA,
+                        "Origin" to embedDomain
+                    )
                 })
                 return true
             }
