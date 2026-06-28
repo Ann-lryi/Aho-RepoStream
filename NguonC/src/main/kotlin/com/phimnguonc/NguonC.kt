@@ -222,26 +222,29 @@ class PhimNguonCProvider : MainAPI() {
 
         println("[NguonC] === Resolving: $embedUrl ===")
 
-        // ─── WebView: Intercept segment OR m3u8 with segments ───
+        // ═══════════════════════════════════════════════════════════
+        //  Local Proxy Server approach (proven concept from 6 rounds)
         //
-        // From 5 rounds of testing, we know:
-        //   ✅ Segments (streamaaa*.png) are served from public CDN with correct Referer
-        //   ✅ WebView intercept of segment works — video plays (proven, 8s clip)
-        //   ❌ Intercepting .m3u8 alone fails — content is often encrypted
-        //   ❌ ExoPlayer cannot re-fetch m3u8 URL (no cookie)
+        //  WHY: ExoPlayer uses CronetDataSource which ONLY supports http/https.
+        //  - file:// URI → ERR_UNKNOWN_URL_SCHEME
+        //  - streamc.xyz m3u8 URL → needs cookie (ExoPlayer can't replay)
+        //  - CDN segment URLs → need Referer header (ExoPlayer sends wrong one)
         //
-        // Strategy: Single WebView, regex matches EITHER:
-        //   - .m3u8 that contains "streamaaa" in response body (plaintext m3u8)
-        //   - segment URL pattern streamaaa*.png (fallback, always works)
+        //  SOLUTION: Local HTTP proxy on 127.0.0.1:
+        //  1. Serve m3u8 with segment URLs rewritten to point to proxy
+        //  2. Proxy fetches real CDN segments with correct Referer
+        //  3. ExoPlayer ↔ localhost (no auth) ↔ CDN (with auth headers)
         //
-        // Using segment regex first (fastest & most reliable from testing)
+        //  FLOW:
+        //  ExoPlayer → GET http://127.0.0.1:PORT/stream.m3u8
+        //           ← m3u8 with segments as /seg?url=ENCODED_CDN_URL
+        //  ExoPlayer → GET http://127.0.0.1:PORT/seg?url=ENCODED_CDN_URL
+        //           ← proxy fetches CDN URL with Referer → returns bytes
+        // ═══════════════════════════════════════════════════════════
         try {
+            // Step 1: WebView intercept m3u8 content
             val interceptor = WebViewResolver(
-                // Match segment pattern OR m3u8 — whichever comes first
-                // From logs: .m3u8 comes before segments, but may be encrypted
-                // Segments always come ~0.5s after .m3u8
-                // Match segment directly for reliability
-                Regex("""streamaaa\d+\.png""")
+                Regex("""streamc\.xyz/[A-Za-z0-9+/=_-]+\.m3u8""")
             )
             val resp = app.get(
                 embedUrl,
@@ -249,87 +252,162 @@ class PhimNguonCProvider : MainAPI() {
                 headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to UA),
                 timeout = 30
             )
-            val capturedUrl = resp.url ?: ""
+            val m3u8Content = resp.text
+            val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
 
-            if (capturedUrl.contains("streamaaa")) {
-                println("[NguonC] ✓ Got segment: ${capturedUrl.take(120)}")
-                val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
+            // Validate: must be real m3u8 with segment URLs
+            if (!m3u8Content.contains("#EXTM3U")) {
+                println("[NguonC] m3u8 content invalid, trying segment approach")
+                // Fallback: try segment intercept directly (already proven to work for 8s)
+                return resolveViaSegment(serverName, embedUrl, callback)
+            }
 
-                // Extract base path to construct all segment URLs
-                // e.g. https://seouls11.amass11.top/78646bac.../streamaaa0000.png
-                // base: https://seouls11.amass11.top/78646bac.../
-                val segBase = capturedUrl.substringBeforeLast("/") + "/"
+            // Step 2: Start local proxy server
+            val serverSocket = java.net.ServerSocket(0)
+            val port = serverSocket.localPort
+            val proxyUrl = "http://127.0.0.1:$port/stream.m3u8"
 
-                // Now fetch m3u8 content from WebView response cache
-                // OR build m3u8 ourselves from segment pattern
-                // Since we know the pattern: streamaaa0000.png to streamaaaNNNN.png
-                // and the m3u8 has #EXTINF:~10s per segment
-                // We generate a valid m3u8 playlist with enough segments
-
-                // Build m3u8 content with segment URLs
-                val m3u8Content = buildString {
-                    appendLine("#EXTM3U")
-                    appendLine("#EXT-X-VERSION:3")
-                    appendLine("#EXT-X-TARGETDURATION:11")
-                    appendLine("#EXT-X-MEDIA-SEQUENCE:0")
-                    // Generate enough segments (most videos < 200 segments for ~30min)
-                    // If a segment 404s, player just stops (graceful end)
-                    for (i in 0..999) {
-                        val segNum = i.toString().padStart(4, '0')
-                        appendLine("#EXTINF:10.0,")
-                        appendLine("${segBase}streamaaa${segNum}.png")
-                    }
-                    appendLine("#EXT-X-ENDLIST")
+            // Rewrite m3u8: replace absolute CDN URLs with proxy URLs
+            val rewrittenM3u8 = m3u8Content.lines().joinToString("\n") { line ->
+                val trimmed = line.trim()
+                if (trimmed.startsWith("https://")) {
+                    // Rewrite CDN URL to proxy URL
+                    "http://127.0.0.1:$port/seg?url=${URLEncoder.encode(trimmed, "UTF-8")}"
+                } else {
+                    line
                 }
+            }
 
-                // Serve m3u8 via tiny local HTTP server
-                // CronetDataSource only supports http/https, not file://
-                val server = java.net.ServerSocket(0)
-                val port = server.localPort
-                val localUrl = "http://127.0.0.1:$port/stream.m3u8"
+            // Step 3: Run proxy in background thread
+            Thread {
+                try {
+                    serverSocket.soTimeout = 600_000 // 10 min for long videos
+                    while (!serverSocket.isClosed) {
+                        try {
+                            val client = serverSocket.accept()
+                            // Handle each request in separate thread
+                            Thread {
+                                handleProxyRequest(client, rewrittenM3u8, embedDomain)
+                            }.apply { isDaemon = true }.start()
+                        } catch (_: java.net.SocketTimeoutException) { break }
+                          catch (_: java.net.SocketException) { break }
+                    }
+                } catch (_: Exception) {}
+                try { serverSocket.close() } catch (_: Exception) {}
+            }.apply { isDaemon = true }.start()
 
-                // Serve in background thread — single request then close
-                Thread {
-                    try {
-                        server.soTimeout = 30000 // 30s timeout
-                        val client = server.accept()
-                        val output = client.getOutputStream()
-                        val input = client.getInputStream().bufferedReader()
-                        // Read HTTP request line
-                        input.readLine()
-                        while (input.readLine()?.isNotBlank() == true) { /* skip headers */ }
-                        // Send m3u8 response
-                        val body = m3u8Content.toByteArray(Charsets.UTF_8)
-                        val header = "HTTP/1.1 200 OK\r\n" +
-                            "Content-Type: application/vnd.apple.mpegurl\r\n" +
-                            "Content-Length: ${body.size}\r\n" +
-                            "Access-Control-Allow-Origin: *\r\n" +
-                            "\r\n"
-                        output.write(header.toByteArray())
-                        output.write(body)
-                        output.flush()
-                        client.close()
-                    } catch (_: Exception) {}
-                    try { server.close() } catch (_: Exception) {}
-                }.apply { isDaemon = true }.start()
+            println("[NguonC] ✓ Proxy server at $proxyUrl")
 
-                println("[NguonC] Serving m3u8 at: $localUrl (1000 segments)")
+            callback(newExtractorLink("NguonC", serverName, proxyUrl, ExtractorLinkType.M3U8) {
+                this.referer = ""
+                this.quality = Qualities.P1080.value
+                this.headers = mapOf("User-Agent" to UA)
+            })
+            return true
 
-                callback(newExtractorLink("NguonC", serverName, localUrl, ExtractorLinkType.M3U8) {
+        } catch (e: Exception) {
+            println("[NguonC] Proxy approach failed: ${e.message}")
+        }
+
+        // Fallback: direct segment (plays 8s at least)
+        return resolveViaSegment(serverName, embedUrl, callback)
+
+        println("[NguonC] ✗ All strategies failed for: $embedUrl")
+        return false
+    }
+
+    /** Handle a single proxy request (m3u8 or segment proxy) */
+    private fun handleProxyRequest(
+        client: java.net.Socket,
+        m3u8Content: String,
+        segReferer: String
+    ) {
+        try {
+            val input = client.getInputStream().bufferedReader()
+            val output = client.getOutputStream()
+            val requestLine = input.readLine() ?: return
+            // Read remaining headers
+            while (input.readLine()?.isNotBlank() == true) { /* skip */ }
+
+            val path = requestLine.split(" ").getOrNull(1) ?: "/"
+            val crlf = "\r\n"
+
+            when {
+                // Serve m3u8 playlist
+                path.contains("stream.m3u8") -> {
+                    val body = m3u8Content.toByteArray(Charsets.UTF_8)
+                    output.write(("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${body.size}${crlf}Access-Control-Allow-Origin: *${crlf}Connection: close${crlf}${crlf}").toByteArray())
+                    output.write(body)
+                }
+                // Proxy a CDN segment
+                path.contains("/seg") -> {
+                    val encodedUrl = path.substringAfter("url=", "")
+                    val segUrl = java.net.URLDecoder.decode(encodedUrl, "UTF-8")
+                    if (segUrl.startsWith("https://")) {
+                        try {
+                            val conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
+                            conn.connectTimeout = 15000
+                            conn.readTimeout = 30000
+                            conn.setRequestProperty("User-Agent", UA)
+                            conn.setRequestProperty("Referer", "$segReferer/")
+                            conn.setRequestProperty("Origin", segReferer)
+                            conn.connect()
+
+                            if (conn.responseCode == 200) {
+                                val bytes = conn.inputStream.readBytes()
+                                conn.disconnect()
+                                output.write(("HTTP/1.1 200 OK${crlf}Content-Type: video/mp2t${crlf}Content-Length: ${bytes.size}${crlf}Access-Control-Allow-Origin: *${crlf}Connection: close${crlf}${crlf}").toByteArray())
+                                output.write(bytes)
+                            } else {
+                                conn.disconnect()
+                                output.write("HTTP/1.1 ${conn.responseCode} Error${crlf}Connection: close${crlf}${crlf}".toByteArray())
+                            }
+                        } catch (_: Exception) {
+                            output.write("HTTP/1.1 502 Bad Gateway${crlf}Connection: close${crlf}${crlf}".toByteArray())
+                        }
+                    } else {
+                        output.write("HTTP/1.1 400 Bad Request${crlf}Connection: close${crlf}${crlf}".toByteArray())
+                    }
+                }
+                else -> {
+                    output.write("HTTP/1.1 404 Not Found${crlf}Connection: close${crlf}${crlf}".toByteArray())
+                }
+            }
+            output.flush()
+            client.close()
+        } catch (_: Exception) {
+            try { client.close() } catch (_: Exception) {}
+        }
+    }
+
+    /** Fallback: intercept single segment URL (plays ~8s, proven working) */
+    private suspend fun resolveViaSegment(
+        serverName: String,
+        embedUrl: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        try {
+            val interceptor = WebViewResolver(Regex("""streamaaa\d+\.png"""))
+            val resp = app.get(
+                embedUrl,
+                interceptor = interceptor,
+                headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to UA),
+                timeout = 30
+            )
+            val capturedUrl = resp.url ?: ""
+            if (capturedUrl.contains("streamaaa")) {
+                println("[NguonC] ✓ Fallback segment: ${capturedUrl.take(100)}")
+                val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
+                callback(newExtractorLink("NguonC", serverName, capturedUrl, ExtractorLinkType.VIDEO) {
                     this.referer = "$embedDomain/"
                     this.quality = Qualities.P1080.value
-                    this.headers = mapOf(
-                        "User-Agent" to UA,
-                        "Origin" to embedDomain
-                    )
+                    this.headers = mapOf("User-Agent" to UA, "Origin" to embedDomain)
                 })
                 return true
             }
         } catch (e: Exception) {
-            println("[NguonC] Intercept failed: ${e.message}")
+            println("[NguonC] Fallback segment failed: ${e.message}")
         }
-
-        println("[NguonC] ✗ All strategies failed for: $embedUrl")
         return false
     }
 
