@@ -223,23 +223,17 @@ class PhimNguonCProvider : MainAPI() {
         println("[NguonC] === Resolving: $embedUrl ===")
 
         // ═══════════════════════════════════════════════════════════
-        // APPROACH: Proxy server serves continuous MPEG-TS stream
+        // Intercept SEGMENT (proven reliable) → generate full segment list
+        // → stream ALL via proxy as continuous MPEG-TS
         //
-        // PROVEN FACTS from 7 rounds of testing:
-        //   ✅ ExtractorLinkType.VIDEO + single segment = plays 8s
-        //   ✅ CDN segments work with Referer: embedXX.streamc.xyz
-        //   ✅ Proxy server on 127.0.0.1 = CronetDataSource accepts
-        //   ❌ M3U8 type always fails (MALFORMED — .png extension issue)
-        //
-        // NEW APPROACH: Proxy concatenates ALL segments into one stream
-        //   ExoPlayer sees: http://127.0.0.1:PORT/video.ts (type VIDEO)
-        //   Proxy internally: fetches seg0, seg1, seg2... streams bytes
-        //   Result: full continuous video, no HLS parsing needed
+        // From 8 rounds: WebView .m3u8 is often encrypted (no segments).
+        // But segments (streamaaa*.png) are ALWAYS interceptable and public.
+        // Pattern: streamaaa0000.png, streamaaa0001.png, ...
+        // We catch segment 0 → derive base URL → generate list → proxy stream
         // ═══════════════════════════════════════════════════════════
         try {
-            // Step 1: WebView intercept m3u8 to get segment URLs
             val interceptor = WebViewResolver(
-                Regex("""streamc\.xyz/[A-Za-z0-9+/=_-]+\.m3u8""")
+                Regex("""streamaaa\d+\.png""")
             )
             val resp = app.get(
                 embedUrl,
@@ -247,57 +241,57 @@ class PhimNguonCProvider : MainAPI() {
                 headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to UA),
                 timeout = 30
             )
-            val m3u8Content = resp.text
-            val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
+            val capturedUrl = resp.url ?: ""
 
-            // Extract segment URLs from m3u8
-            val segments = m3u8Content.lines()
-                .map { it.trim() }
-                .filter { it.startsWith("https://") }
+            if (capturedUrl.contains("streamaaa")) {
+                println("[NguonC] ✓ Got segment: ${capturedUrl.take(120)}")
 
-            if (segments.isEmpty()) {
-                println("[NguonC] No segments in m3u8, trying fallback")
-                return resolveViaSegment(serverName, embedUrl, callback)
+                // Derive base URL from captured segment
+                // e.g. https://jps14.hihihoho4.top/b151241.../streamaaa0000.png
+                //  →   https://jps14.hihihoho4.top/b151241.../streamaaa
+                val segBase = capturedUrl.substringBeforeLast("streamaaa") + "streamaaa"
+                val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
+
+                // Generate segment URLs (most episodes < 500 segments = ~80min)
+                val segments = (0..499).map { i ->
+                    "${segBase}${i.toString().padStart(4, '0')}.png"
+                }
+
+                // Start proxy that streams segments as continuous video
+                val serverSocket = java.net.ServerSocket(0)
+                val port = serverSocket.localPort
+                val proxyUrl = "http://127.0.0.1:$port/video.ts"
+
+                Thread {
+                    try {
+                        serverSocket.soTimeout = 600_000
+                        while (!serverSocket.isClosed) {
+                            try {
+                                val client = serverSocket.accept()
+                                Thread {
+                                    streamSegments(client, segments, embedDomain)
+                                }.apply { isDaemon = true }.start()
+                            } catch (_: java.net.SocketTimeoutException) { break }
+                              catch (_: java.net.SocketException) { break }
+                        }
+                    } catch (_: Exception) {}
+                    try { serverSocket.close() } catch (_: Exception) {}
+                }.apply { isDaemon = true }.start()
+
+                println("[NguonC] ✓ Streaming proxy at $proxyUrl (${segments.size} segments)")
+
+                callback(newExtractorLink("NguonC", serverName, proxyUrl, ExtractorLinkType.VIDEO) {
+                    this.referer = ""
+                    this.quality = Qualities.P1080.value
+                    this.headers = mapOf("User-Agent" to UA)
+                })
+                return true
             }
-
-            println("[NguonC] Got ${segments.size} segments from m3u8")
-
-            // Step 2: Start proxy that streams segments as continuous video
-            val serverSocket = java.net.ServerSocket(0)
-            val port = serverSocket.localPort
-            val proxyUrl = "http://127.0.0.1:$port/video.ts"
-
-            Thread {
-                try {
-                    serverSocket.soTimeout = 600_000
-                    while (!serverSocket.isClosed) {
-                        try {
-                            val client = serverSocket.accept()
-                            Thread {
-                                streamSegments(client, segments, embedDomain)
-                            }.apply { isDaemon = true }.start()
-                        } catch (_: java.net.SocketTimeoutException) { break }
-                          catch (_: java.net.SocketException) { break }
-                    }
-                } catch (_: Exception) {}
-                try { serverSocket.close() } catch (_: Exception) {}
-            }.apply { isDaemon = true }.start()
-
-            println("[NguonC] ✓ Streaming proxy at $proxyUrl")
-
-            // Use VIDEO type — ExoPlayer treats it as a regular video file
-            callback(newExtractorLink("NguonC", serverName, proxyUrl, ExtractorLinkType.VIDEO) {
-                this.referer = ""
-                this.quality = Qualities.P1080.value
-                this.headers = mapOf("User-Agent" to UA)
-            })
-            return true
-
         } catch (e: Exception) {
             println("[NguonC] Proxy approach failed: ${e.message}")
         }
 
-        // Fallback: direct segment (plays 8s at least)
+        // Fallback: direct single segment (plays ~10s at least)
         return resolveViaSegment(serverName, embedUrl, callback)
 
         println("[NguonC] ✗ All strategies failed for: $embedUrl")
