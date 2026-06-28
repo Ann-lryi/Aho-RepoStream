@@ -297,7 +297,7 @@ class PhimNguonCProvider : MainAPI() {
                 val tempFile = java.io.File(tempDir, "stream_${System.currentTimeMillis()}.m3u8")
                 tempFile.writeText(m3u8Content)
 
-                val localUrl = tempFile.toURI().toString()
+                val localUrl = "file://" + tempFile.absolutePath
                 println("[NguonC] Saved m3u8: $localUrl (1000 segments)")
 
                 callback(newExtractorLink("NguonC", serverName, localUrl, ExtractorLinkType.M3U8) {
