@@ -952,6 +952,103 @@ class PhimNguonCProvider : MainAPI() {
         return false
     }
 
+    /**
+     * NEW WORKING FLOW (reverse-engineered 2026-06):
+     * The streamc.xyz server now requires a two-step access handshake that the
+     * existing tryFetchWithToken() does not implement, which is why every direct
+     * fetch returns "Unauthorized: Invalid or expired session token.".
+     *
+     *   Step 1 (POST /{token}, Content-Type: application/json)
+     *     -> {"ok":true,"xat":"<64 hex chars>"}
+     *   Step 2 (GET /{token}.m3u9?xat=<xat>)
+     *     -> PLAIN unencrypted M3U8 playlist (segments are .png disguised .ts)
+     *
+     * The .m3u9 mobile endpoint returns an UNENCRYPTED playlist, so none of the
+     * AES-GCM / kX / data-obf decryption logic in the legacy fallbacks is needed.
+     * Segments live on hihihoho*.top / amass*.top and require
+     * Referer: https://embedXX.streamc.xyz/embed.php?hash=<hash> (the embed URL).
+     */
+    private suspend fun tryMobileM3U8Flow(
+        embedUrl: String,
+        embedDomain: String,
+        token: String,
+        serverName: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        // The token from data-obf `sUb` is already URL-safe base64 (no + / =),
+        // but the access endpoint is happy with either form. Use it verbatim.
+        val accessTokenPath = token
+
+        // ── Step 1: POST /{token} to obtain the `xat` access token ──
+        val postUrl = "$embedDomain/$accessTokenPath"
+        val postHeaders = mapOf(
+            "Referer"      to embedUrl,
+            "Origin"       to embedDomain,
+            "Content-Type" to "application/json",
+            "Accept"       to "application/json, text/plain, */*",
+            "User-Agent"   to USER_AGENT
+        )
+        println("[NguonC] [MobileFlow] POST $postUrl")
+        val accessResp = try {
+            app.post(postUrl, headers = postHeaders).parsedSafe<StreamcAccessResponse>()
+        } catch (e: Exception) {
+            println("[NguonC] [MobileFlow] POST failed: ${e.message}")
+            null
+        }
+        val xat = accessResp?.xat
+        if (xat.isNullOrBlank()) {
+            println("[NguonC] [MobileFlow] No xat in response (ok=${accessResp?.ok})")
+            return false
+        }
+        println("[NguonC] [MobileFlow] Got xat: ${xat.take(20)}... (len=${xat.length})")
+
+        // ── Step 2: GET /{token}.m3u9?xat=<xat> to fetch the PLAIN m3u8 ──
+        val m3u8Url = "$embedDomain/$accessTokenPath.m3u9?xat=$xat"
+        val getHeaders = mapOf(
+            "Referer"    to embedUrl,
+            "Origin"     to embedDomain,
+            "Accept"     to "*/*",
+            "User-Agent" to USER_AGENT
+        )
+        println("[NguonC] [MobileFlow] GET $m3u8Url")
+        val m3u8Content = try {
+            app.get(m3u8Url, headers = getHeaders).text
+        } catch (e: Exception) {
+            println("[NguonC] [MobileFlow] GET failed: ${e.message}")
+            null
+        }
+        if (m3u8Content.isNullOrBlank() || !m3u8Content.contains("#EXTM3U")) {
+            println("[NguonC] [MobileFlow] Response is not a valid m3u8 (len=${m3u8Content?.length ?: 0})")
+            // Try .m3u8 extension as a fallback (desktop endpoint, may be encrypted)
+            val altUrl = "$embedDomain/$accessTokenPath.m3u8?xat=$xat"
+            println("[NguonC] [MobileFlow] Trying .m3u8: $altUrl")
+            val altContent = try { app.get(altUrl, headers = getHeaders).text } catch (_: Exception) { null }
+            if (altContent.isNullOrBlank() || !altContent.contains("#EXTM3U")) {
+                println("[NguonC] [MobileFlow] .m3u8 also failed")
+                return false
+            }
+            // If the .m3u8 endpoint returned a PLAIN m3u8, register it.
+            // (If it's encrypted #ENC-AESGCM, we can't decrypt it here — let the
+            // legacy fallbacks try.)
+            if (altContent.contains("#ENC-AESGCM")) {
+                println("[NguonC] [MobileFlow] .m3u8 is encrypted, deferring to legacy fallbacks")
+                return false
+            }
+            return registerM3U8Link(altContent, embedUrl, "", serverName, callback)
+        }
+
+        if (m3u8Content.contains("#ENC-AESGCM")) {
+            println("[NguonC] [MobileFlow] .m3u9 unexpectedly encrypted, deferring to legacy fallbacks")
+            return false
+        }
+
+        println("[NguonC] [MobileFlow] Got plain m3u8 (${m3u8Content.length} chars, ${m3u8Content.split("\n").count { it.startsWith("#EXTINF") }} segments)")
+        // Segments in this playlist are absolute https URLs (e.g. on hihihoho*.top),
+        // so pass empty m3u8BaseUrl. The proxy will rewrite them and fetch with
+        // Referer = embedUrl, which is exactly what the segment CDN requires.
+        return registerM3U8Link(m3u8Content, embedUrl, "", serverName, callback)
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     //  Main link loading logic
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1078,7 +1175,19 @@ class PhimNguonCProvider : MainAPI() {
                                 }
                             }
 
-                            // ── STEP 4: Try fetching with extracted token ──
+                            // ── STEP 3.5 (NEW): Mobile flow — POST /{token} -> xat, then
+                            // GET /{token}.m3u9?xat=<xat>.  This is the current working
+                            // path as of 2026-06 and bypasses all the AES-GCM encryption
+                            // grief because the .m3u9 endpoint returns a PLAIN playlist.
+                            // Try this FIRST so the user actually gets a playable link.
+                            if (token != null) {
+                                println("[NguonC] Step 3.5: Mobile flow (POST + .m3u9?xat=)")
+                                if (tryMobileM3U8Flow(targetUrl, embedDomain, token, serverName, callback)) {
+                                    linkFound = true; return@async
+                                }
+                            }
+
+                            // ── STEP 4: Try fetching with extracted token (legacy, rarely works) ──
                             if (token != null) {
                                 if (tryFetchWithToken(token, embedDomain, targetUrl, kX, serverName, callback)) {
                                     linkFound = true; return@async
@@ -1272,7 +1381,23 @@ class PhimNguonCProvider : MainAPI() {
                         // ══════════════════════════════════════════════════════════════
                         if ((targetUrl.contains(".m3u8") || targetUrl.contains(".m3u9")) && targetUrl.contains("streamc.xyz")) {
                             println("[NguonC] Processing direct m3u8/m3u9 URL: ${targetUrl.take(80)}")
-                            // Try .m3u9 first (plain), then .m3u8
+
+                            // NEW: Extract the token from the URL and try the mobile flow first.
+                            // This handles the case where the API returns a direct /{token}.m3u8
+                            // URL — the same access-confirm handshake is required.
+                            val urlToken = Regex("""/([A-Za-z0-9+/=_-]+)\.(m3u8|m3u9)""").find(targetUrl)?.groupValues?.get(1)
+                            if (urlToken != null) {
+                                // Determine the embed page URL for the Referer header.
+                                // The segment CDN accepts any https://embedXX.streamc.xyz/* referer.
+                                val embedPageUrl = Regex("""(https?://embed\d+\.streamc\.xyz)""").find(targetUrl)?.groupValues?.get(1)?.let { "$it/embed.php" }
+                                    ?: "$embedDomain/embed.php"
+                                println("[NguonC] Trying mobile flow on direct URL with token: ${urlToken.take(20)}...")
+                                if (tryMobileM3U8Flow(embedPageUrl, embedDomain, urlToken, serverName, callback)) {
+                                    linkFound = true; return@async
+                                }
+                            }
+
+                            // Legacy fallback: try .m3u9 first (plain), then .m3u8
                             val urlsToTry = mutableListOf(targetUrl)
                             if (targetUrl.endsWith(".m3u8")) {
                                 urlsToTry.add(targetUrl.replace(".m3u8", ".m3u9"))
@@ -1289,7 +1414,6 @@ class PhimNguonCProvider : MainAPI() {
                                     }
                                     if (content.contains("#ENC-AESGCM")) {
                                         // Need kX - try to get from embed page
-                                        val urlToken = Regex("""/([A-Za-z0-9+/=_-]+)\.(m3u8|m3u9)""").find(targetUrl)?.groupValues?.get(1)
                                         var encKX: String? = null
                                         if (urlToken != null) {
                                             val decoded = decodeStreamcToken(urlToken)
@@ -1453,5 +1577,20 @@ class PhimNguonCProvider : MainAPI() {
         @JsonProperty("name")   val name: String? = null,
         @JsonProperty("embed")  val embed: String? = null,
         @JsonProperty("m3u8")   val m3u8: String? = null
+    )
+
+    /**
+     * Response from `POST https://embedXX.streamc.xyz/{token}` (the access-confirm
+     * endpoint called by player.js `_confirmAccess`).
+     *
+     * Example: `{"ok":true,"xat":"b536dd2e065857326edcb521114e9c46f3f2ad3d1af97f7af50a950c249db8ef"}`
+     *
+     * The `xat` (x-auth-token) is then attached to the m3u8 fetch as either a
+     * `?xat=<xat>` query param (mobile / .m3u9) or a `hash: <xat>` header (desktop
+     * / .m3u8).  We use the mobile path because it returns a plain playlist.
+     */
+    data class StreamcAccessResponse(
+        @JsonProperty("ok")  val ok: Boolean? = null,
+        @JsonProperty("xat") val xat: String? = null
     )
 }
