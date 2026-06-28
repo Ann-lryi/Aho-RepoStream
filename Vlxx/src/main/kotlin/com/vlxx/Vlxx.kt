@@ -173,11 +173,14 @@ class VLXXProvider : MainAPI() {
         val poster = el.selectFirst("img")?.let { img ->
             img.attr("data-original").ifBlank { img.attr("data-src").ifBlank { img.attr("src") } }
         }?.let { if (it.startsWith("http")) it else null }
-        // Ribbon badge (Vietsub / Không che / HD) → quality hint
+        // Ribbon badge (Vietsub / Không che / HD) → quality hint.
+        // SearchQuality enum only has HD / Cam / SD (no P2160 / P1080 etc —
+        // those are on the separate Qualities enum used by ExtractorLink).
         val ribbon = el.selectFirst(".ribbon")?.text()?.trim().orEmpty()
         val quality = when {
             ribbon.contains("HD", ignoreCase = true)          -> SearchQuality.HD
-            ribbon.contains("4K", ignoreCase = true)          -> SearchQuality.P2160
+            ribbon.contains("4K", ignoreCase = true)          -> SearchQuality.HD
+            ribbon.contains("SD", ignoreCase = true)          -> SearchQuality.SD
             else                                              -> null
         }
         return newMovieSearchResponse(title, href, TvType.NSFW) {
