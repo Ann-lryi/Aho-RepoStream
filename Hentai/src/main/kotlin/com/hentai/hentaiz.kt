@@ -551,8 +551,11 @@ class HentaiZProvider : MainAPI() {
                         } catch (_: Exception) { emptyList() }
                     }
                 }.awaitAll()
-                // Pick genre with most results, dedupe by slug, take 30
-                recResults.maxByOrNull { it.size }?.orEmpty()
+                // Pick genre with most results, dedupe by slug, take 30.
+                // NOTE: maxByOrNull returns nullable, so use `?: emptyList()`
+                // (NOT `?.orEmpty()` — that still leaves the chain nullable and
+                // breaks .distinctBy / .take / .mapNotNull below).
+                (recResults.maxByOrNull { it.size } ?: emptyList())
                     .distinctBy { it.slug }
                     .take(30)
                     .mapNotNull { epToSearch(it) }
