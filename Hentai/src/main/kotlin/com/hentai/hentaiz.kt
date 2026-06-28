@@ -440,25 +440,8 @@ class HentaiZProvider : MainAPI() {
     override val mainPage = mainPageOf(
         // ── Sắp xếp theo độ mới / phổ biến ──────────────────
         "sort:publishedAt_desc"   to "Mới Nhất 🔥",
-        "sort:likes_desc"         to "Được Thích Nhất ❤️",
-        "sort:views_desc"         to "Xem Nhiều Nhất 👀",
-        "sort:rating_desc"        to "Đánh Giá Cao ⭐",
-        // ── Lọc theo loại hoạt hình ─────────────────────────
-        "type:TWO_D"              to "Hoạt Hình 2D 🎨",
-        "type:THREE_D"            to "Hoạt Hình 3D 🧊",
-        // ── Lọc theo censor ─────────────────────────────────
-        "rating:UNCENSORED"       to "Không Che 🥵",
-        "rating:CENSORED"         to "Che Censor 🌸",
         // ── Thể loại phổ biến ───────────────────────────────
-        "genre:loan-luan"         to "Loạn Luân 🥵",
-        "genre:harem"             to "Harem 👯",
-        "genre:netorare"          to "Netorare 💔",
-        "genre:romance"           to "Tình Cảm 💕",
-        "genre:action"            to "Hành Động ⚔️",
-        "genre:fantasy"           to "Giả Tưởng 🐉",
-        "genre:comedy"            to "Hài Hước 😂",
-        "genre:milf"              to "MILF 💋",
-        "genre:uncensored"        to "Uncensored 🔥"
+        "genre:loan-luan"         to "Loạn Luân 🥵"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
