@@ -25,8 +25,8 @@ import java.util.EnumSet
 
 @CloudstreamPlugin
 class PhimNguonCPlugin : Plugin() {
-    override fun load() {
-        appContext = activity?.applicationContext
+    override fun load(context: Context) {
+        appContext = context
         registerMainAPI(PhimNguonCProvider())
     }
     companion object {
