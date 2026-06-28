@@ -21,7 +21,7 @@ import javax.crypto.spec.SecretKeySpec
 @CloudstreamPlugin
 class PhimNguonCPlugin : Plugin() {
     override fun load() { registerMainAPI(PhimNguonCProvider()) }
-} 
+}
 
 class PhimNguonCProvider : MainAPI() {
     override var mainUrl = "https://phim.nguonc.com"
@@ -161,24 +161,103 @@ class PhimNguonCProvider : MainAPI() {
         return doc.select("table tbody tr").mapNotNull { parseCard(it) }
     }
 
+    /**
+     * Normalize ugly API server names (which sometimes contain the full URL or
+     * "#PhimNguonC Vietsub" style names) into clean, short labels that look good
+     * in the CloudStream server picker.
+     *
+     * Returns one of: "Vietsub", "Thuyết Minh", "Lồng Tiếng", or a cleaned-up
+     * version of the input.
+     */
+    private fun cleanServerName(raw: String?, fallbackIdx: Int = 0): String {
+        if (raw.isNullOrBlank()) {
+            return when (fallbackIdx) {
+                0    -> "Vietsub"
+                1    -> "Thuyết Minh"
+                else -> "Server ${fallbackIdx + 1}"
+            }
+        }
+        var name = raw.trim()
+        // Strip any URL-like fragment (e.g. "https://phim.nguonc.com/vietsub")
+        name = name.replace(Regex("""https?://\S+""", RegexOption.IGNORE_CASE), "")
+        // Strip file extensions and query strings
+        name = name.replace(Regex("""\.(m3u8|m3u9|php|html?)(\?[^ ]*)?""", RegexOption.IGNORE_CASE), "")
+        // Strip common decorations
+        name = name.trim(' ', '-', '_', '|', '#', ':', '/', '\\', '.', ',')
+        // Collapse repeated whitespace
+        name = name.replace(Regex("\\s+"), " ").trim()
+        if (name.isBlank()) {
+            return when (fallbackIdx) {
+                0    -> "Vietsub"
+                1    -> "Thuyết Minh"
+                else -> "Server ${fallbackIdx + 1}"
+            }
+        }
+        // Normalize by keyword detection — keeps the picker tidy and consistent
+        val lower = name.lowercase()
+        return when {
+            lower.contains("thuyết minh") || lower.contains("thuyet minh") ||
+            (lower.contains("tm") && lower.length <= 4) -> "Thuyết Minh"
+            lower.contains("lồng tiếng") || lower.contains("long tieng") ||
+            lower.contains("lồng tieng") -> "Lồng Tiếng"
+            lower.contains("vietsub") || lower.contains("vsub") ||
+            (lower.contains("vs") && lower.length <= 4) ||
+            lower.contains("sub") && !lower.contains("thuyết") -> "Vietsub"
+            else -> name.split(' ').joinToString(" ") { it.replaceFirstChar { c -> c.uppercaseChar() } }
+        }
+    }
+
+    /**
+     * Normalize episode names so the same episode from different servers gets
+     * merged into a single Episode entry (instead of appearing twice in the
+     * episode list).
+     *
+     *   "Tập 1", "Ep 1", "Episode 1", "1"  →  "1"
+     *   "OVA"                                →  "OVA"
+     */
+    private fun normalizeEpName(raw: String?): String {
+        if (raw.isNullOrBlank()) return "0"
+        val s = raw.trim()
+        // First, look for a number (handles "Tập 1", "Ep 1", "Episode 1", "1", "01")
+        val numMatch = Regex("""(\d+)""").find(s)
+        if (numMatch != null) return numMatch.groupValues[1].trimStart('0').ifBlank { "0" }
+        // No number — return as-is (e.g., "OVA", "Special")
+        return s
+    }
+
     override suspend fun load(url: String): LoadResponse {
         val slug  = url.trim().trimEnd('/').substringAfterLast("/")
         val res   = app.get("$mainUrl/api/film/$slug", headers = commonHeaders).parsedSafe<NguonCDetailResponse>()
         val movie = res?.movie ?: throw ErrorLoadingException("Kh\u00F4ng th\u1EC3 t\u1EA3i d\u1EEF li\u1EC7u phim")
 
-        val epMap = linkedMapOf<String, MutableList<String>>()
+        // ── Build episode map ──
+        // epMap: epName(normalized) -> list of (cleanServerName, url)
+        // Keyed by NORMALIZED episode name so the same episode from different
+        // servers gets merged into one Episode entry (no duplicates).
+        // Deduped by URL so we don't list the same source twice under two names.
+        val epMap = linkedMapOf<String, MutableList<Pair<String, String>>>()
         movie.episodes?.forEachIndexed { idx, server ->
-            val serverName = server.server_name ?: server.name ?: if (idx == 0) "Vietsub" else "Thuy\u1EBFt minh"
+            val serverName = cleanServerName(server.server_name ?: server.name, idx)
             val items = server.items ?: server.list
             items?.forEach { ep ->
-                val embed = ep.embed?.replace("\\/", "/") ?: ""
-                val directM3u8 = ep.m3u8?.replace("\\/", "/") ?: ""
+                val epName = normalizeEpName(ep.name)
+                val embed = ep.embed?.replace("\\/", "/")?.trim() ?: ""
+                val directM3u8 = ep.m3u8?.replace("\\/", "/")?.trim() ?: ""
 
-                if (embed.isNotBlank()) {
-                    epMap.getOrPut(ep.name ?: "0") { mutableListOf() }.add("$serverName::$embed")
+                // Prefer direct m3u8 URL (already contains the token) over the
+                // embed page URL — saves one HTTP round-trip in loadLinks().
+                val url2 = when {
+                    directM3u8.isNotBlank() -> directM3u8
+                    embed.isNotBlank()      -> embed
+                    else                    -> return@forEach
                 }
-                if (directM3u8.isNotBlank() && directM3u8 != embed) {
-                    epMap.getOrPut(ep.name ?: "0") { mutableListOf() }.add("$serverName::$directM3u8")
+
+                val list = epMap.getOrPut(epName) { mutableListOf() }
+                // Dedupe by URL — if this exact URL is already in the list (under
+                // any server name), don't add it again. This is what was producing
+                // "phim....vietsub, phim....thuyet minh" duplicates in the picker.
+                if (list.none { it.second == url2 }) {
+                    list.add(serverName to url2)
                 }
             }
         }
@@ -186,7 +265,8 @@ class PhimNguonCProvider : MainAPI() {
         if (epMap.isEmpty()) throw ErrorLoadingException("Kh\u00F4ng t\u00ECm th\u1EA5y t\u1EADp phim")
 
         val episodes = epMap.map { (epName, embeds) ->
-            newEpisode(embeds.distinct().joinToString("|")) {
+            // Join as "ServerName::url|ServerName::url|..." — loadLinks() will split this
+            newEpisode(embeds.joinToString("|") { (sn, u) -> "$sn::$u" }) {
                 this.name    = "T\u1EADp $epName"
                 this.episode = epName.toIntOrNull()
             }
@@ -229,24 +309,41 @@ class PhimNguonCProvider : MainAPI() {
             }.joinToString("").replace(Regex("-{2,}"), "-").trim('-')
         }
 
+        // ── Recommendations: fetch all candidate genres IN PARALLEL ──
+        // (was sequential — up to 3 round-trips before the first non-empty
+        //  result, which made the detail page feel sluggish.)
         val recommendations: List<SearchResponse> = try {
-            var result: List<SearchResponse> = emptyList()
-            for (genre in theLoaiItems.take(3)) {
-                val genreName = genre.name ?: continue
-                val slug2 = nameToSlug(genreName)
-                if (slug2.isBlank()) continue
-                val items = try {
-                    app.get("$mainUrl/api/films/$slug2?page=1", headers = commonHeaders).parsedSafe<NguonCApiResponse>()?.items
-                } catch (_: Exception) { null }
-                if (!items.isNullOrEmpty()) {
-                    result = items.filter { it.slug != movie.slug }.take(20).mapNotNull { parseApiItem(it) }
-                    break
+            coroutineScope {
+                val genreResults = theLoaiItems.take(3).map { genre ->
+                    async {
+                        val genreName = genre.name ?: return@async null
+                        val slug2 = nameToSlug(genreName)
+                        if (slug2.isBlank()) return@async null
+                        try {
+                            app.get("$mainUrl/api/films/$slug2?page=1", headers = commonHeaders)
+                                .parsedSafe<NguonCApiResponse>()?.items
+                        } catch (_: Exception) { null }
+                    }
+                }.awaitAll()
+
+                val firstNonEmpty = genreResults.firstOrNull { !it.isNullOrEmpty() }
+                if (firstNonEmpty != null) {
+                    firstNonEmpty.filter { it.slug != movie.slug }.take(20).mapNotNull { parseApiItem(it) }
+                } else {
+                    // Fallback — fetch newest films. Run as its own async to keep
+                    // the surrounding coroutineScope happy.
+                    async {
+                        try {
+                            app.get("$mainUrl/api/films/phim-moi-cap-nhat?page=1", headers = commonHeaders)
+                                .parsedSafe<NguonCApiResponse>()?.items
+                                ?.filter { it.slug != movie.slug }
+                                ?.take(20)
+                                ?.mapNotNull { parseApiItem(it) }
+                                ?: emptyList()
+                        } catch (_: Exception) { emptyList() }
+                    }.await()
                 }
             }
-            if (result.isEmpty()) {
-                result = app.get("$mainUrl/api/films/phim-moi-cap-nhat?page=1", headers = commonHeaders).parsedSafe<NguonCApiResponse>()?.items?.filter { it.slug != movie.slug }?.take(20)?.mapNotNull { parseApiItem(it) } ?: emptyList()
-            }
-            result
         } catch (_: Exception) { emptyList() }
 
         return newTvSeriesLoadResponse(movie.name ?: "", url, TvType.TvSeries, episodes) {
@@ -1073,7 +1170,7 @@ class PhimNguonCProvider : MainAPI() {
             if (parts.size == 2) Pair(parts[0], parts[1])
             else if (parts.size == 1 && parts[0].startsWith("http")) Pair("Vietsub", parts[0])
             else null
-        }
+        }.distinctBy { it.second }  // dedupe by URL — same source shouldn't appear twice
         var linkFound = false
 
         coroutineScope {
@@ -1194,8 +1291,26 @@ class PhimNguonCProvider : MainAPI() {
                                 }
                             }
 
+                            // ── FAST BAIL-OUT: if we couldn't even fetch the embed page
+                            // (html == null), have no token, AND no urlHash to try alt
+                            // domains with — the target URL is almost certainly unreachable.
+                            // Skip everything and let the next server (Vietsub/Thuyết Minh)
+                            // try. This prevents the "không tìm thấy trang web" toasts that
+                            // pop up when WebView tries to load a dead URL.
+                            if (html == null && token == null && urlHash == null) {
+                                println("[NguonC] Embed page unreachable + no token + no urlHash — bailing out to avoid 'website not found'")
+                                return@async
+                            }
+                            // If html is null but we DO have urlHash, skip the WebView
+                            // fallbacks that retry the SAME dead URL (Steps 5, 6, 8) and
+                            // go straight to Step 7 (which tries DIFFERENT embed domains).
+                            val skipWebViewFallbacks = (html == null && token == null && urlHash != null)
+                            if (skipWebViewFallbacks) {
+                                println("[NguonC] Embed page unreachable but have urlHash — skipping WebView fallbacks, going to Step 7 (alt domains)")
+                            }
+
                             // ── STEP 5: WebView interception - capture m3u8 directly ──
-                            if (!linkFound) {
+                            if (!linkFound && !skipWebViewFallbacks) {
                                 println("[NguonC] Step 5: WebView interception for m3u8/m3u9")
                                 try {
                                     val resp = app.get(targetUrl, interceptor = m3u8Interceptor, headers = mapOf(
@@ -1252,7 +1367,7 @@ class PhimNguonCProvider : MainAPI() {
                             }
 
                             // ── STEP 6: Broader WebView interception (any domain) ──
-                            if (!linkFound) {
+                            if (!linkFound && !skipWebViewFallbacks) {
                                 println("[NguonC] Step 6: Broad WebView interception")
                                 try {
                                     val resp = app.get(targetUrl, interceptor = broadM3u8Interceptor, headers = mapOf(
@@ -1328,31 +1443,41 @@ class PhimNguonCProvider : MainAPI() {
                                     } catch (_: Exception) {}
                                 }
 
-                                // 7c: Try other embed domain numbers
+                                // 7c: Try other embed domain numbers IN PARALLEL via the
+                                // mobile flow (the working path as of 2026-06). The old
+                                // sequential loop with tryFetchWithToken would hit 401 on
+                                // every domain and take 30+ seconds before giving up.
                                 if (!linkFound) {
-                                    for (embedNum in listOf(11, 12, 13, 14, 15, 16, 17, 18, 19, 20)) {
-                                        val altDomain = "https://embed${embedNum}.streamc.xyz"
-                                        if (altDomain == embedDomain) continue
-                                        val altUrl = "$altDomain/embed.php?hash=$urlHash"
-                                        println("[NguonC] Trying alt domain: $altDomain")
-                                        val altHtml = fetchEmbedHTML(altUrl, altDomain)
-                                        if (altHtml != null) {
-                                            val altObfData = extractObfData(altHtml)
-                                            val altToken = altObfData?.first ?: findTokenInHTML(altHtml)
-                                            val altKX = altObfData?.third ?: findEncryptionKey(altHtml, altDomain, altUrl)
-                                            if (altToken != null) {
-                                                println("[NguonC] Found token on alt domain $altDomain!")
-                                                if (tryFetchWithToken(altToken, altDomain, altUrl, altKX, serverName, callback)) {
-                                                    linkFound = true; return@async
-                                                }
+                                    println("[NguonC] Step 7c: Trying alt domains in parallel via mobile flow")
+                                    val altResults = listOf(11, 12, 13, 14, 15, 16, 17, 18, 19, 20)
+                                        .map { num -> "https://embed${num}.streamc.xyz" }
+                                        .filter { it != embedDomain }
+                                        .map { altDomain ->
+                                            async {
+                                                try {
+                                                    val altUrl = "$altDomain/embed.php?hash=$urlHash"
+                                                    val altHtml = fetchEmbedHTML(altUrl, altDomain)
+                                                    if (altHtml == null) return@async null
+                                                    val altObfData = extractObfData(altHtml)
+                                                    val altToken = altObfData?.first ?: findTokenInHTML(altHtml)
+                                                        ?: return@async null
+                                                    println("[NguonC] [7c] Found token on $altDomain, trying mobile flow")
+                                                    if (tryMobileM3U8Flow(altUrl, altDomain, altToken, serverName, callback)) {
+                                                        return@async altDomain  // success — return domain as a truthy signal
+                                                    }
+                                                    null
+                                                } catch (_: Exception) { null }
                                             }
-                                        }
+                                        }.awaitAll()
+                                    if (altResults.any { it != null }) {
+                                        println("[NguonC] [7c] Alt domain succeeded: $altResults")
+                                        linkFound = true; return@async
                                     }
                                 }
                             }
 
                             // ── STEP 8: Last resort - broader cfInterceptor ──
-                            if (!linkFound) {
+                            if (!linkFound && !skipWebViewFallbacks) {
                                 println("[NguonC] Step 8: Last resort cfInterceptor")
                                 try {
                                     val resp = app.get(targetUrl, interceptor = cfInterceptor, headers = mapOf(
