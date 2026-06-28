@@ -299,9 +299,54 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     /**
-     * Stream all segments concatenated as one continuous MPEG-TS stream.
-     * ExoPlayer sees this as a regular video file (no HLS parsing).
-     * Each .png segment is actually MPEG-TS data despite the extension.
+     * Segment cache — shared across proxy requests for seeking support.
+     * Key: segment index, Value: byte array of that segment's data.
+     * Segments are downloaded on-demand and cached for reuse.
+     */
+    private val segmentCache = java.util.concurrent.ConcurrentHashMap<Int, ByteArray>()
+    private val segmentOffsets = mutableListOf<Long>() // cumulative byte offset per segment
+    @Volatile private var totalVideoSize = -1L
+    @Volatile private var lastSegmentIndex = -1
+
+    private fun fetchSegment(idx: Int, segUrl: String, referer: String): ByteArray? {
+        segmentCache[idx]?.let { return it }
+        try {
+            val conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
+            conn.connectTimeout = 10000
+            conn.readTimeout = 20000
+            conn.setRequestProperty("User-Agent", UA)
+            conn.setRequestProperty("Referer", "$referer/")
+            conn.setRequestProperty("Origin", referer)
+            conn.connect()
+            if (conn.responseCode == 200) {
+                val bytes = conn.inputStream.readBytes()
+                conn.disconnect()
+                segmentCache[idx] = bytes
+                return bytes
+            }
+            conn.disconnect()
+        } catch (_: Exception) {}
+        return null
+    }
+
+    /** Build segment offset table (download segments sequentially until 404) */
+    private fun buildOffsetTable(segments: List<String>, referer: String) {
+        if (segmentOffsets.isNotEmpty()) return // already built
+        var offset = 0L
+        segmentOffsets.clear()
+        for ((i, url) in segments.withIndex()) {
+            segmentOffsets.add(offset)
+            val data = fetchSegment(i, url, referer) ?: break
+            offset += data.size
+            lastSegmentIndex = i
+        }
+        totalVideoSize = offset
+    }
+
+    /**
+     * Handle proxy request with Range support for seeking.
+     * First request: streams sequentially (fast start).
+     * Subsequent requests (seek): uses cached segments + offset table.
      */
     private fun streamSegments(
         client: java.net.Socket,
@@ -311,48 +356,91 @@ class PhimNguonCProvider : MainAPI() {
         try {
             val input = client.getInputStream().bufferedReader()
             val output = client.getOutputStream()
-            // Read HTTP request
             input.readLine() ?: return
-            while (input.readLine()?.isNotBlank() == true) { /* skip headers */ }
 
-            // Send HTTP response header (chunked transfer — unknown total size)
-            val crlf = "\r\n"
-            output.write(("HTTP/1.1 200 OK${crlf}Content-Type: video/mp2t${crlf}Transfer-Encoding: chunked${crlf}Access-Control-Allow-Origin: *${crlf}Connection: close${crlf}${crlf}").toByteArray())
-            output.flush()
-
-            // Stream each segment sequentially
-            for ((idx, segUrl) in segments.withIndex()) {
-                try {
-                    val conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
-                    conn.connectTimeout = 15000
-                    conn.readTimeout = 30000
-                    conn.setRequestProperty("User-Agent", UA)
-                    conn.setRequestProperty("Referer", "$segReferer/")
-                    conn.setRequestProperty("Origin", segReferer)
-                    conn.connect()
-
-                    if (conn.responseCode == 200) {
-                        val bytes = conn.inputStream.readBytes()
-                        conn.disconnect()
-                        // Send chunk: size in hex + CRLF + data + CRLF
-                        output.write("${Integer.toHexString(bytes.size)}${crlf}".toByteArray())
-                        output.write(bytes)
-                        output.write(crlf.toByteArray())
-                        output.flush()
-                    } else {
-                        conn.disconnect()
-                        break // Stop on error (likely end of video)
-                    }
-                } catch (_: Exception) {
-                    break // Connection closed by player or network error
+            // Parse headers
+            var rangeStart = -1L
+            while (true) {
+                val hdr = input.readLine()
+                if (hdr == null || hdr.isBlank()) break
+                if (hdr.startsWith("Range:", true)) {
+                    val r = hdr.substringAfter("bytes=").trim().split("-")
+                    rangeStart = r[0].toLongOrNull() ?: 0L
                 }
             }
 
-            // Send final empty chunk to signal end
-            try {
-                output.write("0${crlf}${crlf}".toByteArray())
+            val crlf = "\r\n"
+
+            if (rangeStart <= 0) {
+                // FIRST REQUEST: stream sequentially (fast start, no waiting)
+                // Send chunked response — video starts immediately
+                // Also build offset table in background for future seeks
+                output.write(("HTTP/1.1 200 OK${crlf}" +
+                    "Content-Type: video/mp2t${crlf}" +
+                    "Transfer-Encoding: chunked${crlf}" +
+                    "Accept-Ranges: bytes${crlf}" +
+                    "Connection: close${crlf}${crlf}").toByteArray())
                 output.flush()
-            } catch (_: Exception) {}
+
+                segmentOffsets.clear()
+                segmentCache.clear()
+                var offset = 0L
+
+                for ((i, segUrl) in segments.withIndex()) {
+                    val data = fetchSegment(i, segUrl, segReferer) ?: break
+                    segmentOffsets.add(offset)
+                    offset += data.size
+                    lastSegmentIndex = i
+                    try {
+                        output.write("${Integer.toHexString(data.size)}${crlf}".toByteArray())
+                        output.write(data)
+                        output.write(crlf.toByteArray())
+                        output.flush()
+                    } catch (_: Exception) { break }
+                }
+                totalVideoSize = offset
+                try { output.write("0${crlf}${crlf}".toByteArray()); output.flush() } catch (_: Exception) {}
+
+            } else {
+                // SEEK REQUEST: use cached segments + offset table
+                if (totalVideoSize <= 0) buildOffsetTable(segments, segReferer)
+                if (totalVideoSize <= 0) {
+                    output.write("HTTP/1.1 500 Error${crlf}${crlf}".toByteArray())
+                    client.close(); return
+                }
+
+                // Find which segment contains rangeStart
+                var segIdx = 0
+                for (i in segmentOffsets.indices) {
+                    if (i + 1 < segmentOffsets.size && segmentOffsets[i + 1] <= rangeStart) {
+                        segIdx = i + 1
+                    } else break
+                }
+
+                // Calculate response range
+                val rangeEnd = totalVideoSize - 1
+                val contentLength = totalVideoSize - rangeStart
+
+                output.write(("HTTP/1.1 206 Partial Content${crlf}" +
+                    "Content-Type: video/mp2t${crlf}" +
+                    "Content-Length: $contentLength${crlf}" +
+                    "Content-Range: bytes $rangeStart-$rangeEnd/$totalVideoSize${crlf}" +
+                    "Accept-Ranges: bytes${crlf}" +
+                    "Connection: close${crlf}${crlf}").toByteArray())
+
+                // Stream from the correct segment offset
+                var bytesSkipped = rangeStart - (if (segIdx < segmentOffsets.size) segmentOffsets[segIdx] else 0L)
+                for (i in segIdx..lastSegmentIndex) {
+                    val data = fetchSegment(i, segments[i], segReferer) ?: break
+                    val start = if (bytesSkipped > 0) bytesSkipped.toInt() else 0
+                    bytesSkipped = 0
+                    try {
+                        output.write(data, start, data.size - start)
+                        output.flush()
+                    } catch (_: Exception) { break }
+                }
+            }
+
             client.close()
         } catch (_: Exception) {
             try { client.close() } catch (_: Exception) {}
