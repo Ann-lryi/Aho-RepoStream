@@ -6,6 +6,7 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
+import android.content.Context
 import java.net.URLEncoder
 import java.util.EnumSet
 
@@ -25,7 +26,11 @@ import java.util.EnumSet
 @CloudstreamPlugin
 class PhimNguonCPlugin : Plugin() {
     override fun load() {
+        appContext = activity?.applicationContext
         registerMainAPI(PhimNguonCProvider())
+    }
+    companion object {
+        var appContext: Context? = null
     }
 }
 
@@ -222,38 +227,20 @@ class PhimNguonCProvider : MainAPI() {
 
         println("[NguonC] === Resolving: $embedUrl ===")
 
-        // ─── WebView Strategy: Intercept m3u8 → rewrite to valid HLS ───
+        // ─── WebView Strategy: Intercept m3u8 content → save local → play ───
         //
-        // Root cause from 3 rounds of real log analysis:
-        //   1. WebView fetches /{token}.m3u8 (needs cookie → OK in WebView)
-        //   2. Content is plaintext HLS but segments use .png extension
-        //   3. ExoPlayer re-fetches same URL WITHOUT cookie → "Unauthorized"
-        //   4. Even if content was OK, .png segments → MANIFEST_MALFORMED
+        // Proven from 4 rounds of real testing:
+        //   ✅ WebView gets plaintext m3u8 with public CDN segment URLs
+        //   ✅ CDN segments work with Referer: https://embedXX.streamc.xyz/
+        //   ❌ ExoPlayer re-fetches m3u8 URL without cookie → "Unauthorized"
+        //   ❌ Passing single segment = only 8 seconds of video
         //
-        // SOLUTION: Intercept m3u8 content → extract public CDN segment URLs
-        //   → rewrite m3u8 with .ts extensions → serve via data URI or temp URL
-        //
-        // Actually, the simplest working approach:
-        //   Intercept m3u8 content → extract segment URLs → pass m3u8 content
-        //   with segments renamed from .png to .ts WON'T work because ExoPlayer
-        //   still needs to re-fetch the manifest URL.
-        //
-        // REAL SOLUTION: Use M3u8Helper.generateM3u8() but pass the CONTENT
-        //   directly... except CS3 API doesn't support that.
-        //
-        // ACTUAL WORKING SOLUTION: 
-        //   Since segments are PUBLIC CDN URLs, just pass the FIRST segment
-        //   as ExtractorLinkType.VIDEO → ExoPlayer plays it as raw video.
-        //   Then use loadExtractor or callback with all segments as playlist.
-        //
-        // SIMPLEST WORKING SOLUTION:
-        //   Intercept segment URLs directly (faster, no m3u8 parsing needed)
-        //   Each .png segment is a complete MPEG-TS chunk despite .png extension
-        //   Pass them as direct VIDEO links → ExoPlayer can play MPEG-TS
+        // SOLUTION: Intercept m3u8 CONTENT from WebView, write to local file,
+        //   pass file:// URI to ExoPlayer → it reads local m3u8 → fetches
+        //   segments directly from CDN (they're absolute URLs, public with Referer)
         try {
             val interceptor = WebViewResolver(
-                // Catch segment URL pattern: streamaaa0000.png from any CDN
-                Regex("""streamaaa\d+\.png""")
+                Regex("""streamc\.xyz/[A-Za-z0-9+/=_-]+\.m3u8""")
             )
             val resp = app.get(
                 embedUrl,
@@ -261,16 +248,25 @@ class PhimNguonCProvider : MainAPI() {
                 headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to UA),
                 timeout = 30
             )
-            val capturedUrl = resp.url ?: ""
+            val content = resp.text
 
-            if (capturedUrl.contains("streamaaa")) {
-                println("[NguonC] ✓ Got segment: ${capturedUrl.take(120)}")
+            if (content.contains("#EXTM3U") && content.contains("streamaaa")) {
+                println("[NguonC] ✓ Got m3u8 with ${content.lines().count { it.contains("streamaaa") }} segments")
 
-                // CDN requires correct Referer = embed page domain (NOT CDN domain)
-                // From DevTools: segments are fetched with Referer: https://embedXX.streamc.xyz/
                 val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
 
-                callback(newExtractorLink("NguonC", serverName, capturedUrl, ExtractorLinkType.VIDEO) {
+                // Write m3u8 to app's internal cache (no permission needed)
+                val ctx = PhimNguonCPlugin.appContext
+                val cacheDir = ctx?.cacheDir ?: java.io.File("/data/data/com.lagradost.cloudstream3.prerelease/cache")
+                val tempDir = java.io.File(cacheDir, "nguonc")
+                if (!tempDir.exists()) tempDir.mkdirs()
+                val tempFile = java.io.File(tempDir, "stream_${System.currentTimeMillis()}.m3u8")
+                tempFile.writeText(content)
+
+                val localUrl = tempFile.toURI().toString()
+                println("[NguonC] Saved m3u8: $localUrl (${content.lines().size} lines)")
+
+                callback(newExtractorLink("NguonC", serverName, localUrl, ExtractorLinkType.M3U8) {
                     this.referer = "$embedDomain/"
                     this.quality = Qualities.P1080.value
                     this.headers = mapOf(
@@ -281,7 +277,7 @@ class PhimNguonCProvider : MainAPI() {
                 return true
             }
         } catch (e: Exception) {
-            println("[NguonC] Segment intercept failed: ${e.message}")
+            println("[NguonC] M3u8 intercept failed: ${e.message}")
         }
 
         println("[NguonC] ✗ All strategies failed for: $embedUrl")
