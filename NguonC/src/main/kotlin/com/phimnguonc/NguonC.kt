@@ -21,7 +21,7 @@ import javax.crypto.spec.SecretKeySpec
 @CloudstreamPlugin
 class PhimNguonCPlugin : Plugin() {
     override fun load() { registerMainAPI(PhimNguonCProvider()) }
-}
+} 
 
 class PhimNguonCProvider : MainAPI() {
     override var mainUrl = "https://phim.nguonc.com"
