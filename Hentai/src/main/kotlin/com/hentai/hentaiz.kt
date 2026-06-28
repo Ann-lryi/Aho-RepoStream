@@ -7,6 +7,9 @@ import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import java.net.URLEncoder
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 
 @CloudstreamPlugin
 class HentaiZPlugin : Plugin() {
@@ -283,6 +286,135 @@ class HentaiZProvider : MainAPI() {
         else "$imgCdn${if (path.startsWith("/")) path else "/$path"}"
     }
 
+    /**
+     * Normalize CDN host name into a clean label for the picker.
+     * Instead of "HentaiZ (c2.animez.top)" → "HentaiZ 1", "HentaiZ 2", etc.
+     * (matches the polish level of NguonC's cleanServerName).
+     */
+    private fun cleanServerName(host: String?, idx: Int = 0): String {
+        if (host.isNullOrBlank()) return "HentaiZ ${idx + 1}"
+        // Extract subdomain number (e.g. "c2.animez.top" → "2")
+        val num = Regex("""[a-z]+(\d+)\.""", RegexOption.IGNORE_CASE).find(host)?.groupValues?.get(1)?.toIntOrNull()
+        return if (num != null) "HentaiZ $num" else "HentaiZ ${idx + 1}"
+    }
+
+    /**
+     * Parse a master m3u8 playlist and return its quality variants.
+     * Each variant is a (label, absolute_url, quality_value) tuple.
+     *
+     * Master playlists look like:
+     *   #EXTM3U
+     *   #EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720
+     *   720p.m3u8
+     *   #EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+     *   1080p.m3u8
+     *
+     * Returns empty list for non-master playlists (single-variant).
+     */
+    private fun parseM3U8Variants(content: String, baseUrl: String): List<Triple<String, String, Int>> {
+        if (!content.contains("#EXT-X-STREAM-INF")) return emptyList()
+        val results = mutableListOf<Triple<String, String, Int>>()
+        val lines = content.lines()
+        var i = 0
+        val baseDir = baseUrl.substringBeforeLast("/", "")
+        while (i < lines.size) {
+            val line = lines[i].trim()
+            if (line.startsWith("#EXT-X-STREAM-INF")) {
+                val nextLine = lines.getOrNull(i + 1)?.trim() ?: ""
+                if (nextLine.isNotEmpty() && !nextLine.startsWith("#")) {
+                    // Extract resolution
+                    val resMatch = Regex("""RESOLUTION=(\d+)x(\d+)""").find(line)
+                    val height = resMatch?.groupValues?.get(2)?.toIntOrNull()
+                    // Extract bandwidth
+                    val bwMatch = Regex("""BANDWIDTH=(\d+)""").find(line)
+                    val bandwidth = bwMatch?.groupValues?.get(1)?.toLongOrNull()
+
+                    // Build label and quality value
+                    val (label, quality) = when {
+                        height != null && height >= 2160 -> "4K" to Qualities.P2160.value
+                        height != null && height >= 1440 -> "2K" to Qualities.P1440.value
+                        height != null && height >= 1080 -> "1080p" to Qualities.P1080.value
+                        height != null && height >= 720  -> "720p" to Qualities.P720.value
+                        height != null && height >= 480  -> "480p" to Qualities.P480.value
+                        bandwidth != null && bandwidth >= 8_000_000 -> "1080p" to Qualities.P1080.value
+                        bandwidth != null && bandwidth >= 4_000_000 -> "720p"  to Qualities.P720.value
+                        bandwidth != null && bandwidth >= 1_500_000 -> "480p"  to Qualities.P480.value
+                        else -> "Auto" to Qualities.Unknown.value
+                    }
+
+                    // Resolve relative URL
+                    val variantUrl = if (nextLine.startsWith("http")) nextLine
+                                     else if (nextLine.startsWith("/")) "https://" + baseUrl.substringAfter("https://").substringBefore("/") + nextLine
+                                     else "$baseDir/$nextLine"
+                    results.add(Triple(label, variantUrl, quality))
+                    i += 2
+                    continue
+                }
+            }
+            i++
+        }
+        return results
+    }
+
+    /**
+     * Build a beautiful HTML-formatted description (matches NguonC's polish).
+     * Uses Vietnamese labels + emoji icons + colored values, so the detail page
+     * looks consistent with the rest of the user's plugin library.
+     */
+    private fun buildBeautifulDescription(ep: EpInfo): String {
+        val description = ep.description?.replace(Regex("<[^>]+>"), "")?.trim() ?: ""
+        return buildString {
+            fun addInfo(icon: String, label: String, value: String?, color: String = "#FFFFFF") {
+                if (!value.isNullOrBlank())
+                    append("$icon <b>$label:</b> <font color='$color'>$value</font><br>")
+            }
+
+            // Censor with color coding
+            val censorColor = when (ep.contentRating?.uppercase()) {
+                "UNCENSORED" -> "#F44336"  // red — spicy
+                "CENSORED"   -> "#9C27B0"  // purple — soft
+                else         -> "#FFEB3B"  // yellow — unknown
+            }
+            val censorLabel = when (ep.contentRating?.uppercase()) {
+                "UNCENSORED" -> "Không Che"
+                "CENSORED"   -> "Che Censor"
+                else         -> ep.contentRating
+            }
+            addInfo("🔞", "Censor", censorLabel, censorColor)
+
+            // Animation type
+            val typeLabel = when (ep.animationType?.uppercase()) {
+                "TWO_D"  -> "2D"
+                "THREE_D"-> "3D"
+                else     -> ep.animationType
+            }
+            addInfo("🎬", "Loại", typeLabel, "#03A9F4")
+
+            addInfo("📅", "Năm", ep.releaseYear?.toString())
+            ep.duration?.takeIf { it > 0 }?.let {
+                val h = it / 60
+                val m = it % 60
+                val durStr = if (h > 0) "${h}h ${m}m" else "${m}m"
+                addInfo("⏱", "Thời lượng", durStr)
+            }
+            if (ep.studios.isNotEmpty()) {
+                addInfo("🎨", "Studio", ep.studios.joinToString(", "), "#E91E63")
+            }
+            if (ep.genres.isNotEmpty()) {
+                addInfo("🎭", "Thể loại", ep.genres.joinToString(", "), "#4CAF50")
+            }
+            if (ep.episodeNumber != null && ep.episodeNumber > 1) {
+                addInfo("📺", "Tập", "Tập ${ep.episodeNumber}", "#FF9800")
+            }
+
+            if (description.isNotBlank()) {
+                append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG</font></b><br>")
+                append("<hr color='#333333' size='1'><br>")
+                append(description)
+            }
+        }
+    }
+
     private fun epToSearch(ep: EpInfo): SearchResponse? {
         val title  = ep.title ?: return null
         val slug   = ep.slug  ?: return null
@@ -306,9 +438,27 @@ class HentaiZProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════
 
     override val mainPage = mainPageOf(
-        // ── Sắp xếp ─────────────────────────────────────────
-        "/browse/2d" to "Mới Nhất🔥",
-        "genre:loan-luan"          to "Loạn luân🥵"
+        // ── Sắp xếp theo độ mới / phổ biến ──────────────────
+        "sort:publishedAt_desc"   to "Mới Nhất 🔥",
+        "sort:likes_desc"         to "Được Thích Nhất ❤️",
+        "sort:views_desc"         to "Xem Nhiều Nhất 👀",
+        "sort:rating_desc"        to "Đánh Giá Cao ⭐",
+        // ── Lọc theo loại hoạt hình ─────────────────────────
+        "type:TWO_D"              to "Hoạt Hình 2D 🎨",
+        "type:THREE_D"            to "Hoạt Hình 3D 🧊",
+        // ── Lọc theo censor ─────────────────────────────────
+        "rating:UNCENSORED"       to "Không Che 🥵",
+        "rating:CENSORED"         to "Che Censor 🌸",
+        // ── Thể loại phổ biến ───────────────────────────────
+        "genre:loan-luan"         to "Loạn Luân 🥵",
+        "genre:harem"             to "Harem 👯",
+        "genre:netorare"          to "Netorare 💔",
+        "genre:romance"           to "Tình Cảm 💕",
+        "genre:action"            to "Hành Động ⚔️",
+        "genre:fantasy"           to "Giả Tưởng 🐉",
+        "genre:comedy"            to "Hài Hước 😂",
+        "genre:milf"              to "MILF 💋",
+        "genre:uncensored"        to "Uncensored 🔥"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -373,37 +523,43 @@ class HentaiZProvider : MainAPI() {
         val poster   = posterUrl(ep.posterPath)
         val backdrop = posterUrl(ep.backdropPath)
 
-        val description = ep.description?.replace(Regex("<[^>]+>"), "")?.trim() ?: ""
-        val plot = buildString {
-            if (description.isNotBlank()) append(description)
-            val meta = listOfNotNull(
-                ep.contentRating?.let { "Censure: $it" },
-                ep.animationType?.let { "Type: $it" },
-                ep.releaseYear?.let   { "Year: $it" },
-                ep.duration?.takeIf { it > 0 }?.let { "Duration: ${it}m" }
-            ).joinToString(" | ")
-            if (meta.isNotBlank()) append("\n\n$meta")
-            if (ep.studios.isNotEmpty()) append("\nStudio: ${ep.studios.joinToString(", ")}")
-        }
+        // Beautiful HTML-formatted plot (matches NguonC polish)
+        val plot = buildBeautifulDescription(ep)
 
         val episodeData = if (ep.embedUrl != null) "$slug::EMBED::${ep.embedUrl}" else slug
         val epNum       = ep.episodeNumber
         val isMovie     = epNum == null || epNum <= 1
 
-        // Gợi ý phim cùng thể loại
-        val recList = mutableListOf<SearchResponse>()
-        if (ep.genreSlugs.isNotEmpty()) {
-            try {
-                val recUrl   = buildBrowseUrl(1, sort = "likes_desc", genre = ep.genreSlugs.first())
-                val recNodes = fetchSvelteData(recUrl)
-                val (recEps, _) = parseBrowse(recNodes?.getOrNull(2) ?: emptyList())
-                recEps.filter { it.slug != slug }
-                    .take(12)
+        // ── Recommendations: try top 3 genres IN PARALLEL, paginate up to 2 pages ──
+        // (was: only the first genre, single page, only 12 items)
+        val recList: List<SearchResponse> = try {
+            if (ep.genreSlugs.isEmpty()) emptyList()
+            else coroutineScope {
+                val recResults = ep.genreSlugs.take(3).map { genreSlug ->
+                    async {
+                        try {
+                            val items = mutableListOf<EpInfo>()
+                            for (p in 1..2) {
+                                val recUrl = buildBrowseUrl(p, sort = "likes_desc", genre = genreSlug)
+                                val recNodes = fetchSvelteData(recUrl) ?: break
+                                val (recEps, totalPages) = parseBrowse(recNodes.getOrNull(2) ?: break)
+                                items += recEps.filter { it.slug != slug }
+                                if (p >= totalPages) break
+                                if (items.size >= 30) break
+                            }
+                            items
+                        } catch (_: Exception) { emptyList() }
+                    }
+                }.awaitAll()
+                // Pick genre with most results, dedupe by slug, take 30
+                recResults.maxByOrNull { it.size }?.orEmpty()
+                    .distinctBy { it.slug }
+                    .take(30)
                     .mapNotNull { epToSearch(it) }
-                    .let { recList.addAll(it) }
-            } catch (e: Exception) {
-                println("[HentaiZ] recommendations error: ${e.message}")
             }
+        } catch (e: Exception) {
+            println("[HentaiZ] recommendations error: ${e.message}")
+            emptyList()
         }
 
         return if (isMovie) {
@@ -465,55 +621,96 @@ class HentaiZProvider : MainAPI() {
 
         val uuid = Regex("""[?&]v=([^&\s]+)""").find(embedUrl)?.groupValues?.get(1)
 
-        // ── Strategy 0: Thử từng CDN host (c1→c5 + variants), 0 WebView ─────
+        // ── Strategy 0: PARALLEL multi-CDN scan (all hosts × master.m3u8 at once) ──
+        // Old code was sequential — could take 8+ seconds if first 7 hosts were
+        // dead. Now we fire all hosts in parallel; first success wins, others
+        // cancel via coroutineScope's structured concurrency.
         if (uuid != null) {
-            println("[HentaiZ] S0: multi-CDN scan, uuid=$uuid")
-            outer@ for (host in CDN_HOSTS) {
-                for (m3u8 in M3U8_NAMES) {
-                    val tryUrl = "https://$host/$uuid/$m3u8"
-                    try {
-                        val resp = app.get(tryUrl, headers = mapOf(
-                            "User-Agent" to USER_AGENT,
-                            "Referer"    to "https://x.haiten.org/"
-                        ))
-                        if (resp.isSuccessful && resp.text.trimStart().startsWith("#EXTM3U")) {
-                            println("[HentaiZ] S0 SUCCESS: $tryUrl")
-                            callback(newExtractorLink("HentaiZ", "HentaiZ ($host)", tryUrl, ExtractorLinkType.M3U8) {
-                                quality = Qualities.P1080.value
-                                headers = mapOf(
-                                    "User-Agent" to USER_AGENT,
-                                    "Referer"    to "https://x.haiten.org/",
-                                    "Origin"     to "https://x.haiten.org"
-                                )
-                            })
-                            return true
-                        } else {
-                            println("[HentaiZ] S0: $tryUrl → ${resp.code}")
+            println("[HentaiZ] S0: parallel multi-CDN scan, uuid=$uuid")
+            val cdnHeaders = mapOf(
+                "User-Agent" to USER_AGENT,
+                "Referer"    to "https://x.haiten.org/",
+                "Origin"     to "https://x.haiten.org"
+            )
+            val cdnHeadersBasic = mapOf(
+                "User-Agent" to USER_AGENT,
+                "Referer"    to "https://x.haiten.org/"
+            )
+
+            try {
+                val found = coroutineScope {
+                    // Try all CDN hosts × master.m3u8 IN PARALLEL
+                    CDN_HOSTS.mapIndexed { idx, host ->
+                        async {
+                            try {
+                                val tryUrl = "https://$host/$uuid/master.m3u8"
+                                val resp = app.get(tryUrl, headers = cdnHeaders)
+                                if (resp.isSuccessful && resp.text.trimStart().startsWith("#EXTM3U")) {
+                                    Pair(host, resp.text)
+                                } else null
+                            } catch (_: Exception) { null }
                         }
-                    } catch (e: Exception) {
-                        println("[HentaiZ] S0 skip $tryUrl: ${e.message}")
+                    }.awaitAll().firstOrNull { it != null }
+                }
+
+                if (found != null) {
+                    val (host, m3u8Content) = found
+                    val m3u8Url = "https://$host/$uuid/master.m3u8"
+                    println("[HentaiZ] S0 SUCCESS: $m3u8Url")
+
+                    // Parse master.m3u8 — if it has multiple quality variants, expose each
+                    // as a separate ExtractorLink with the correct quality value.
+                    // (Matches NguonC's behavior of offering multiple quality options.)
+                    val variants = parseM3U8Variants(m3u8Content, m3u8Url)
+                    if (variants.isNotEmpty()) {
+                        // Multi-variant master playlist
+                        variants.forEach { (name, url, quality) ->
+                            callback(newExtractorLink("HentaiZ", "HentaiZ $name", url, ExtractorLinkType.M3U8) {
+                                this.quality = quality
+                                this.headers = cdnHeadersBasic
+                            })
+                        }
+                        return true
+                    } else {
+                        // Single-variant playlist (no #EXT-X-STREAM-INF)
+                        callback(newExtractorLink("HentaiZ", cleanServerName(host), m3u8Url, ExtractorLinkType.M3U8) {
+                            quality = Qualities.P1080.value
+                            headers = cdnHeaders
+                        })
+                        return true
                     }
-                    // Chỉ thử master.m3u8 trước, nếu 404 thử host tiếp
-                    if (m3u8 == "master.m3u8" && true) break
                 }
-            }
-            // Nếu master.m3u8 fail trên tất cả host → thử hết file names trên c2
-            println("[HentaiZ] S0: master.m3u8 fail all hosts, trying all names on c2...")
-            for (m3u8 in M3U8_NAMES.drop(1)) {
-                for (host in CDN_HOSTS.take(3)) {
-                    val tryUrl = "https://$host/$uuid/$m3u8"
-                    try {
-                        val resp = app.get(tryUrl, headers = mapOf("User-Agent" to USER_AGENT, "Referer" to "https://x.haiten.org/"))
-                        if (resp.isSuccessful && resp.text.trimStart().startsWith("#EXTM3U")) {
-                            println("[HentaiZ] S0b SUCCESS: $tryUrl")
-                            callback(newExtractorLink("HentaiZ", "HentaiZ CDN", tryUrl, ExtractorLinkType.M3U8) {
-                                quality = Qualities.P1080.value
-                                headers = mapOf("User-Agent" to USER_AGENT, "Referer" to "https://x.haiten.org/")
-                            })
-                            return true
+
+                // master.m3u8 failed on all hosts — try other m3u8 file names IN PARALLEL
+                println("[HentaiZ] S0: master.m3u8 fail all hosts, trying other names in parallel...")
+                val fallbackFound = coroutineScope {
+                    M3U8_NAMES.drop(1).flatMap { m3u8Name ->
+                        CDN_HOSTS.take(3).mapIndexed { idx, host ->
+                            async {
+                                try {
+                                    val tryUrl = "https://$host/$uuid/$m3u8Name"
+                                    val resp = app.get(tryUrl, headers = cdnHeadersBasic)
+                                    if (resp.isSuccessful && resp.text.trimStart().startsWith("#EXTM3U")) {
+                                        Triple(host, m3u8Name, resp.text)
+                                    } else null
+                                } catch (_: Exception) { null }
+                            }
                         }
-                    } catch (e: Exception) { /* skip */ }
+                    }.awaitAll().firstOrNull { it != null }
                 }
+
+                if (fallbackFound != null) {
+                    val (host, m3u8Name, _) = fallbackFound
+                    val m3u8Url = "https://$host/$uuid/$m3u8Name"
+                    println("[HentaiZ] S0b SUCCESS: $m3u8Url")
+                    callback(newExtractorLink("HentaiZ", cleanServerName(host), m3u8Url, ExtractorLinkType.M3U8) {
+                        quality = Qualities.P1080.value
+                        headers = cdnHeadersBasic
+                    })
+                    return true
+                }
+            } catch (e: Exception) {
+                println("[HentaiZ] S0 parallel error: ${e.message}")
             }
         }
 
@@ -533,7 +730,7 @@ class HentaiZProvider : MainAPI() {
 
             if (captured.isNotBlank() && !captured.startsWith("blob:") && captured.contains("animez.top")) {
                 val isM3u8 = body.trimStart().startsWith("#EXTM3U") || captured.contains(".m3u")
-                callback(newExtractorLink("HentaiZ", "HentaiZ CDN", captured,
+                callback(newExtractorLink("HentaiZ", "HentaiZ", captured,
                     if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
                     quality = Qualities.P1080.value
                     headers = mapOf("User-Agent" to USER_AGENT, "Referer" to "https://x.haiten.org/")
