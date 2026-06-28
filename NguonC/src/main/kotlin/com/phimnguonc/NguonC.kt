@@ -6,7 +6,6 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
-import android.content.Context
 import java.net.URLEncoder
 import java.util.EnumSet
 
@@ -25,12 +24,8 @@ import java.util.EnumSet
 
 @CloudstreamPlugin
 class PhimNguonCPlugin : Plugin() {
-    override fun load(context: Context) {
-        appContext = context
+    override fun load() {
         registerMainAPI(PhimNguonCProvider())
-    }
-    companion object {
-        var appContext: Context? = null
     }
 }
 
@@ -287,18 +282,38 @@ class PhimNguonCProvider : MainAPI() {
                     appendLine("#EXT-X-ENDLIST")
                 }
 
-                // Write to app cache
-                val ctx = PhimNguonCPlugin.appContext
-                val cacheDir = ctx?.cacheDir ?: java.io.File(
-                    "/data/user/0/com.lagradost.cloudstream3.prerelease/cache"
-                )
-                val tempDir = java.io.File(cacheDir, "nguonc")
-                if (!tempDir.exists()) tempDir.mkdirs()
-                val tempFile = java.io.File(tempDir, "stream_${System.currentTimeMillis()}.m3u8")
-                tempFile.writeText(m3u8Content)
+                // Serve m3u8 via tiny local HTTP server
+                // CronetDataSource only supports http/https, not file://
+                val server = java.net.ServerSocket(0)
+                val port = server.localPort
+                val localUrl = "http://127.0.0.1:$port/stream.m3u8"
 
-                val localUrl = "file://" + tempFile.absolutePath
-                println("[NguonC] Saved m3u8: $localUrl (1000 segments)")
+                // Serve in background thread — single request then close
+                Thread {
+                    try {
+                        server.soTimeout = 30000 // 30s timeout
+                        val client = server.accept()
+                        val output = client.getOutputStream()
+                        val input = client.getInputStream().bufferedReader()
+                        // Read HTTP request line
+                        input.readLine()
+                        while (input.readLine()?.isNotBlank() == true) { /* skip headers */ }
+                        // Send m3u8 response
+                        val body = m3u8Content.toByteArray(Charsets.UTF_8)
+                        val header = "HTTP/1.1 200 OK\r\n" +
+                            "Content-Type: application/vnd.apple.mpegurl\r\n" +
+                            "Content-Length: ${body.size}\r\n" +
+                            "Access-Control-Allow-Origin: *\r\n" +
+                            "\r\n"
+                        output.write(header.toByteArray())
+                        output.write(body)
+                        output.flush()
+                        client.close()
+                    } catch (_: Exception) {}
+                    try { server.close() } catch (_: Exception) {}
+                }.apply { isDaemon = true }.start()
+
+                println("[NguonC] Serving m3u8 at: $localUrl (1000 segments)")
 
                 callback(newExtractorLink("NguonC", serverName, localUrl, ExtractorLinkType.M3U8) {
                     this.referer = "$embedDomain/"
