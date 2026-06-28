@@ -60,8 +60,14 @@ class PhimNguonCProvider : MainAPI() {
         "${API_PREFIX}api/films/phim-moi-cap-nhat"    to "Phim M\u1EDBi C\u1EADp Nh\u1EADt",
         "danh-sach/phim-le"                           to "Phim L\u1EBB",
         "danh-sach/phim-bo"                           to "Phim B\u1ED9",
-        "danh-sach/tv-shows"                          to "Nh\u1EADt B\u1EA3n + Anime",
-        "the-loai/phim-18" to "18+"
+        "the-loai/hoat-hinh"                          to "Ho\u1EA1t H\u00ECnh (Anime)",
+        "the-loai/khoa-hoc-vien-tuong"                to "Khoa H\u1ECDc Vi\u1EC5n T\u01B0\u1EE3ng",
+        "the-loai/gia-tuong"                          to "Gi\u1EA3 T\u01B0\u1EE3ng",
+        "the-loai/hanh-dong"                          to "H\u00E0nh \u0110\u1ED9ng",
+        "the-loai/kinh-di"                            to "Kinh D\u1ECB",
+        "the-loai/co-trang"                           to "C\u1ED5 Trang",
+        "danh-sach/tv-shows"                          to "TV Shows",
+        "the-loai/phim-18"                            to "18+"
     )
 
     private fun parseCard(el: Element): SearchResponse? {
@@ -162,49 +168,62 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     /**
-     * Normalize ugly API server names (which sometimes contain the full URL or
-     * "#PhimNguonC Vietsub" style names) into clean, short labels that look good
-     * in the CloudStream server picker.
+     * Normalize ugly API server names into clean, short labels for the picker.
      *
-     * Returns one of: "Vietsub", "Thuyết Minh", "Lồng Tiếng", or a cleaned-up
-     * version of the input.
+     * Strategy: KEYWORD DETECTION ON RAW INPUT FIRST. This handles ALL ugly
+     * variants the API (or some downstream fork) might throw at us:
+     *
+     *   "Vietsub #1"                              → "Vietsub"
+     *   "Thuyết minh #1"                          → "Thuyết Minh"
+     *   "Lồng Tiếng #1"                           → "Lồng Tiếng"
+     *   "https://phim.nguonc.com/Vietsub 1080p"   → "Vietsub"     (URL-prefixed)
+     *   "Vietsub 1080p"                           → "Vietsub"     (quality suffix)
+     *   "Server 2 (TM)"                           → "Thuyết Minh" (abbreviation)
+     *
+     * Falls back to URL/extension/quality stripping + Title Case if no keyword
+     * matches, and finally to "Vietsub" / "Thuyết Minh" / "Server N" if blank.
      */
     private fun cleanServerName(raw: String?, fallbackIdx: Int = 0): String {
-        if (raw.isNullOrBlank()) {
-            return when (fallbackIdx) {
-                0    -> "Vietsub"
-                1    -> "Thuyết Minh"
-                else -> "Server ${fallbackIdx + 1}"
-            }
+        val fallback = when (fallbackIdx) {
+            0    -> "Vietsub"
+            1    -> "Thuyết Minh"
+            else -> "Server ${fallbackIdx + 1}"
         }
-        var name = raw.trim()
-        // Strip any URL-like fragment (e.g. "https://phim.nguonc.com/vietsub")
-        name = name.replace(Regex("""https?://\S+""", RegexOption.IGNORE_CASE), "")
-        // Strip file extensions and query strings
-        name = name.replace(Regex("""\.(m3u8|m3u9|php|html?)(\?[^ ]*)?""", RegexOption.IGNORE_CASE), "")
-        // Strip common decorations
-        name = name.trim(' ', '-', '_', '|', '#', ':', '/', '\\', '.', ',')
-        // Collapse repeated whitespace
-        name = name.replace(Regex("\\s+"), " ").trim()
-        if (name.isBlank()) {
-            return when (fallbackIdx) {
-                0    -> "Vietsub"
-                1    -> "Thuyết Minh"
-                else -> "Server ${fallbackIdx + 1}"
-            }
-        }
-        // Normalize by keyword detection — keeps the picker tidy and consistent
-        val lower = name.lowercase()
-        return when {
+        if (raw.isNullOrBlank()) return fallback
+
+        // ── Keyword detection on RAW input (before any cleaning) ──
+        // This is the most reliable path — if the API string contains any of
+        // these keywords (anywhere, in any case), we use the canonical label.
+        val lower = raw.lowercase()
+        when {
             lower.contains("thuyết minh") || lower.contains("thuyet minh") ||
-            (lower.contains("tm") && lower.length <= 4) -> "Thuyết Minh"
+            lower.contains("thuyét minh") || (lower.contains("tm") && lower.length <= 6) -> return "Thuyết Minh"
             lower.contains("lồng tiếng") || lower.contains("long tieng") ||
-            lower.contains("lồng tieng") -> "Lồng Tiếng"
-            lower.contains("vietsub") || lower.contains("vsub") ||
-            (lower.contains("vs") && lower.length <= 4) ||
-            lower.contains("sub") && !lower.contains("thuyết") -> "Vietsub"
-            else -> name.split(' ').joinToString(" ") { it.replaceFirstChar { c -> c.uppercaseChar() } }
+            lower.contains("lồng tieng") || lower.contains("long tiếng") -> return "Lồng Tiếng"
+            lower.contains("vietsub")    || lower.contains("vsub") ||
+            lower == "vs" || lower == "sub" ||
+            (lower.contains("sub") && !lower.contains("thuyết") && !lower.contains("thuyet")) -> return "Vietsub"
         }
+
+        // ── No keyword match — strip cruft and Title-Case the rest ──
+        var name = raw.trim()
+        // Strip URL prefix (e.g. "https://phim.nguonc.com/...")
+        name = name.replace(Regex("""https?://\S+""", RegexOption.IGNORE_CASE), "")
+        // Strip bare-domain prefix (e.g. "phim.nguonc.com/...")
+        name = name.replace(Regex("""^[a-z0-9.-]+\.[a-z]{2,}/+""", RegexOption.IGNORE_CASE), "")
+        // Strip file extensions + query strings
+        name = name.replace(Regex("""\.(m3u8|m3u9|php|html?)(\?[^ ]*)?""", RegexOption.IGNORE_CASE), "")
+        // Strip trailing "#N" (e.g. "Vietsub #1" → "Vietsub")
+        name = name.replace(Regex("""\s*#\d+\s*$"""), "")
+        // Strip trailing quality suffixes (e.g. "Vietsub 1080p" → "Vietsub")
+        name = name.replace(Regex("""\s+(1080p|720p|480p|2160p|4k|hd|fhd|uhd|bluray|webrip)\s*$""", RegexOption.IGNORE_CASE), "")
+        // Strip decorations
+        name = name.trim(' ', '-', '_', '|', '#', ':', '/', '\\', '.', ',', '(', ')', '[', ']')
+        // Collapse whitespace
+        name = name.replace(Regex("\\s+"), " ").trim()
+
+        if (name.isBlank()) return fallback
+        return name.split(' ').joinToString(" ") { it.replaceFirstChar { c -> c.uppercaseChar() } }
     }
 
     /**
@@ -309,39 +328,79 @@ class PhimNguonCProvider : MainAPI() {
             }.joinToString("").replace(Regex("-{2,}"), "-").trim('-')
         }
 
-        // ── Recommendations: fetch all candidate genres IN PARALLEL ──
-        // (was sequential — up to 3 round-trips before the first non-empty
-        //  result, which made the detail page feel sluggish.)
+        // ── Recommendations: HTML-scrape the genre listing pages ──
+        //
+        // The old code called `GET /api/films/{genre-slug}` which 404s for genre
+        // slugs (that endpoint only accepts film slugs). As a result the genre
+        // branch always returned empty and the code fell through to
+        // `phim-moi-cap-nhat` (site-wide newest) — which is why an anime like
+        // "Dũng Sĩ Căn Bà" was getting Chinese costume dramas as "similar films".
+        //
+        // The CORRECT endpoint is the HTML genre browse page:
+        //   GET /the-loai/{slug}?page={n}   →  HTML <table><tbody><tr>…</tr></tbody></table>
+        // which `getMainPage` already uses via `parseCard()`. We re-use the same
+        // parser here and paginate up to 3 pages to fill out the grid.
+        //
+        // Genres are sorted by specificity (most specific first) so an anime's
+        // "Hoạt Hình" genre is tried before its "Hành Động" genre — otherwise a
+        // generic action match would drown out the much-more-relevant anime match.
+        val genrePriority = listOf(
+            "hoạt hình", "khoa học viễn tưởng", "giả tưởng", "phiêu lưu",
+            "kinh dị", "bí ẩn", "hình sự", "chính kịch", "lịch sử", "cổ trang",
+            "chiến tranh", "tâm lý", "tình cảm", "lãng mạn", "hài", "gia đình",
+            "hành động", "phim 18", "tài liệu", "nhạc", "miền tây"
+        )
+        val sortedGenres = theLoaiItems.mapNotNull { it.name }.sortedBy { gname ->
+            val lower = gname.lowercase()
+            val idx = genrePriority.indexOfFirst { lower.contains(it) }
+            if (idx == -1) Int.MAX_VALUE else idx
+        }
+
         val recommendations: List<SearchResponse> = try {
             coroutineScope {
-                val genreResults = theLoaiItems.take(3).map { genre ->
+                // Try top 3 genres IN PARALLEL — first non-empty wins.
+                // (If we tried them sequentially, a dead/slow genre would block
+                //  the more relevant one behind it.)
+                val genreResults = sortedGenres.take(3).map { genreName ->
                     async {
-                        val genreName = genre.name ?: return@async null
                         val slug2 = nameToSlug(genreName)
-                        if (slug2.isBlank()) return@async null
-                        try {
-                            app.get("$mainUrl/api/films/$slug2?page=1", headers = commonHeaders)
-                                .parsedSafe<NguonCApiResponse>()?.items
-                        } catch (_: Exception) { null }
+                        if (slug2.isBlank()) return@async emptyList<SearchResponse>()
+
+                        val items = mutableListOf<SearchResponse>()
+                        // Scrape up to 3 pages of this genre (20 films/page → up to 60)
+                        for (p in 1..3) {
+                            try {
+                                val url = if (p == 1) "$mainUrl/the-loai/$slug2"
+                                          else "$mainUrl/the-loai/$slug2?page=$p"
+                                val pageInterceptor = WebViewResolver(Regex(Regex.escape(url)))
+                                val doc = app.get(url, headers = commonHeaders, interceptor = pageInterceptor).document
+                                val rows = doc.select("table tbody tr").mapNotNull { parseCard(it) }
+                                    .filter { (it.url ?: "").trimEnd('/').substringAfterLast("/") != movie.slug }
+                                if (rows.isEmpty()) break  // no more pages
+                                items += rows
+                                if (items.size >= 30) break
+                            } catch (_: Exception) { break }
+                        }
+                        items
                     }
                 }.awaitAll()
 
-                val firstNonEmpty = genreResults.firstOrNull { !it.isNullOrEmpty() }
-                if (firstNonEmpty != null) {
-                    firstNonEmpty.filter { it.slug != movie.slug }.take(20).mapNotNull { parseApiItem(it) }
+                // Pick the genre with the most results — this naturally favors
+                // the most specific genre that has many films (e.g. "Hoạt Hình"
+                // for anime) over a generic one with the same count.
+                val bestResult = genreResults.maxByOrNull { it.size } ?: emptyList()
+                if (bestResult.isNotEmpty()) {
+                    bestResult.distinctBy { it.url }.take(30)
                 } else {
-                    // Fallback — fetch newest films. Run as its own async to keep
-                    // the surrounding coroutineScope happy.
-                    async {
-                        try {
-                            app.get("$mainUrl/api/films/phim-moi-cap-nhat?page=1", headers = commonHeaders)
-                                .parsedSafe<NguonCApiResponse>()?.items
-                                ?.filter { it.slug != movie.slug }
-                                ?.take(20)
-                                ?.mapNotNull { parseApiItem(it) }
-                                ?: emptyList()
-                        } catch (_: Exception) { emptyList() }
-                    }.await()
+                    // Last-resort fallback — site-wide newest films.
+                    try {
+                        app.get("$mainUrl/api/films/phim-moi-cap-nhat?page=1", headers = commonHeaders)
+                            .parsedSafe<NguonCApiResponse>()?.items
+                            ?.filter { it.slug != movie.slug }
+                            ?.take(20)
+                            ?.mapNotNull { parseApiItem(it) }
+                            ?: emptyList()
+                    } catch (_: Exception) { emptyList() }
                 }
             }
         } catch (_: Exception) { emptyList() }
