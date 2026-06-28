@@ -273,30 +273,80 @@ class VLXXProvider : MainAPI() {
         // Extract video ID from URL: /video/xxx/3099/
         val videoId = Regex("""/(\d+)/?$""").find(url)?.groupValues?.get(1)
 
-        // Tags: from breadcrumb or .video-info context (no explicit tags list on page,
-        // but we can derive category from URL or breadcrumb items)
+        // Tags: extract from .category-tag div (genre links like JAV, Vietsub, Vũng Trộm)
         val tagLabels = mutableListOf<String>()
-        // The ribbon badge on the listing usually indicates Vietsub/Không Che
-        // (we don't have it here, so we leave tags empty unless we find genre links)
-        doc.select(".breadcrumb a, .tags a, .tag a, .category a").forEach { a ->
-            val txt = a.text().trim()
-            if (txt.isNotBlank() && txt.length < 30 && !txt.equals("VLXX", ignoreCase = true)) {
-                tagLabels.add(txt)
+        val tagUrls   = mutableListOf<String>()
+        doc.selectFirst(".category-tag")?.let { tagDiv ->
+            tagDiv.select("a[href]").forEach { a ->
+                val txt = a.text().trim()
+                val href = a.attr("href")
+                if (txt.isNotBlank() && txt.length < 30) tagLabels.add(txt)
+                if (href.isNotBlank()) tagUrls.add(fixUrl(href))
             }
         }
+        // Also collect /cast/<slug>/ URLs (actresses) — fetch them too as another
+        // powerful "more like this" signal.
+        val castUrls = doc.select("a[href*='/cast/']").mapNotNull { a ->
+            val href = a.attr("href")
+            if (href.isNotBlank()) fixUrl(href) else null
+        }.distinct()
 
         val plot = buildBeautifulDescription(title, description, videoCode, sourceId, tagLabels)
 
-        // Recommendations: detail page already has 10 related videos in div.video-item.
-        // Filter out the current video to avoid self-reference.
-        // URL pattern is /video/{slug}/{id}/  — extract the trailing numeric id.
-        val recommendations: List<SearchResponse> = doc.select("div.video-item")
-            .mapNotNull { parseVideoItem(it) }
-            .filter { rec ->
-                val recId = (rec.url ?: "").trimEnd('/').substringAfterLast("/")
-                recId != videoId
+        // ── Recommendations ──
+        // Source 1 (free, 0 extra HTTP): the 10 related videos already on the
+        //   detail page in div.video-item blocks.
+        // Source 2 (parallel, N extra HTTPs): each tag page from .category-tag
+        //   (JAV, Vietsub, Vũng Trộm, XNXX, ...) — ~30 items each.
+        // Source 3 (parallel, M extra HTTPs): each /cast/<slug>/ actress page
+        //   — ~12 items each, very strong "more like this" signal.
+        //
+        // All sources are fetched IN PARALLEL via coroutineScope; results are
+        // combined, deduped by videoId (filtering out the current video), and
+        // the first 30 are returned. Target grid size: 30 (was 10).
+        val recommendations: List<SearchResponse> = try {
+            coroutineScope {
+                // Source 1: related videos from detail page (already in `doc`)
+                val fromDetail = doc.select("div.video-item")
+                    .mapNotNull { parseVideoItem(it) }
+
+                // Source 2: each tag page in parallel (up to 4 tags, 1 page each = 30 items/tag)
+                val fromTags = tagUrls.take(4).map { tagUrl ->
+                    async {
+                        try {
+                            val tagDoc = app.get(tagUrl, headers = headers).document
+                            tagDoc.select("div.video-item").mapNotNull { parseVideoItem(it) }
+                        } catch (_: Exception) { emptyList() }
+                    }
+                }
+
+                // Source 3: each /cast/<slug>/ page in parallel (up to 3 actresses, 1 page each)
+                val fromCasts = castUrls.take(3).map { castUrl ->
+                    async {
+                        try {
+                            val castDoc = app.get(castUrl, headers = headers).document
+                            castDoc.select("div.video-item").mapNotNull { parseVideoItem(it) }
+                        } catch (_: Exception) { emptyList() }
+                    }
+                }
+
+                // Wait for all sources, then combine + dedupe + filter + cap
+                val allSources = listOf(fromDetail) + fromTags.awaitAll() + fromCasts.awaitAll()
+                val seen = mutableSetOf<String>()
+                val combined = mutableListOf<SearchResponse>()
+                for (src in allSources) {
+                    for (rec in src) {
+                        val recId = (rec.url ?: "").trimEnd('/').substringAfterLast("/")
+                        // Skip: current video, already-seen, or empty ID
+                        if (recId.isBlank() || recId == videoId || !seen.add(recId)) continue
+                        combined.add(rec)
+                        if (combined.size >= 30) break
+                    }
+                    if (combined.size >= 30) break
+                }
+                combined
             }
-            .take(20)
+        } catch (_: Exception) { emptyList() }
 
         // Data passed to loadLinks: videoId|url (we keep url for fallback re-fetch)
         val episodeData = if (videoId != null) "$videoId|$url" else url
