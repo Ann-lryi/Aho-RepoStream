@@ -268,11 +268,13 @@ class PhimNguonCProvider : MainAPI() {
             val proxyUrl = "http://127.0.0.1:$port/stream.m3u8"
 
             // Rewrite m3u8: replace absolute CDN URLs with proxy URLs
+            // CRITICAL: proxy URLs must end with .ts extension
+            // ExoPlayer HLS parser rejects non-.ts segment extensions (.png → MALFORMED)
             val rewrittenM3u8 = m3u8Content.lines().joinToString("\n") { line ->
                 val trimmed = line.trim()
                 if (trimmed.startsWith("https://")) {
-                    // Rewrite CDN URL to proxy URL
-                    "http://127.0.0.1:$port/seg?url=${URLEncoder.encode(trimmed, "UTF-8")}"
+                    // Rewrite CDN URL to proxy URL with .ts extension
+                    "http://127.0.0.1:$port/seg/${URLEncoder.encode(trimmed, "UTF-8")}/segment.ts"
                 } else {
                     line
                 }
@@ -339,9 +341,9 @@ class PhimNguonCProvider : MainAPI() {
                     output.write(("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${body.size}${crlf}Access-Control-Allow-Origin: *${crlf}Connection: close${crlf}${crlf}").toByteArray())
                     output.write(body)
                 }
-                // Proxy a CDN segment
-                path.contains("/seg") -> {
-                    val encodedUrl = path.substringAfter("url=", "")
+                // Proxy a CDN segment (URL format: /seg/ENCODED_URL/segment.ts)
+                path.contains("/seg/") -> {
+                    val encodedUrl = path.removePrefix("/seg/").removeSuffix("/segment.ts")
                     val segUrl = java.net.URLDecoder.decode(encodedUrl, "UTF-8")
                     if (segUrl.startsWith("https://")) {
                         try {
