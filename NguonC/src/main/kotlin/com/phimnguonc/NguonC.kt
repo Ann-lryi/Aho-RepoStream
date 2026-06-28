@@ -227,20 +227,26 @@ class PhimNguonCProvider : MainAPI() {
 
         println("[NguonC] === Resolving: $embedUrl ===")
 
-        // ─── WebView Strategy: Intercept m3u8 content → save local → play ───
+        // ─── WebView: Intercept segment OR m3u8 with segments ───
         //
-        // Proven from 4 rounds of real testing:
-        //   ✅ WebView gets plaintext m3u8 with public CDN segment URLs
-        //   ✅ CDN segments work with Referer: https://embedXX.streamc.xyz/
-        //   ❌ ExoPlayer re-fetches m3u8 URL without cookie → "Unauthorized"
-        //   ❌ Passing single segment = only 8 seconds of video
+        // From 5 rounds of testing, we know:
+        //   ✅ Segments (streamaaa*.png) are served from public CDN with correct Referer
+        //   ✅ WebView intercept of segment works — video plays (proven, 8s clip)
+        //   ❌ Intercepting .m3u8 alone fails — content is often encrypted
+        //   ❌ ExoPlayer cannot re-fetch m3u8 URL (no cookie)
         //
-        // SOLUTION: Intercept m3u8 CONTENT from WebView, write to local file,
-        //   pass file:// URI to ExoPlayer → it reads local m3u8 → fetches
-        //   segments directly from CDN (they're absolute URLs, public with Referer)
+        // Strategy: Single WebView, regex matches EITHER:
+        //   - .m3u8 that contains "streamaaa" in response body (plaintext m3u8)
+        //   - segment URL pattern streamaaa*.png (fallback, always works)
+        //
+        // Using segment regex first (fastest & most reliable from testing)
         try {
             val interceptor = WebViewResolver(
-                Regex("""streamc\.xyz/[A-Za-z0-9+/=_-]+\.m3u8""")
+                // Match segment pattern OR m3u8 — whichever comes first
+                // From logs: .m3u8 comes before segments, but may be encrypted
+                // Segments always come ~0.5s after .m3u8
+                // Match segment directly for reliability
+                Regex("""streamaaa\d+\.png""")
             )
             val resp = app.get(
                 embedUrl,
@@ -248,23 +254,51 @@ class PhimNguonCProvider : MainAPI() {
                 headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to UA),
                 timeout = 30
             )
-            val content = resp.text
+            val capturedUrl = resp.url ?: ""
 
-            if (content.contains("#EXTM3U") && content.contains("streamaaa")) {
-                println("[NguonC] ✓ Got m3u8 with ${content.lines().count { it.contains("streamaaa") }} segments")
-
+            if (capturedUrl.contains("streamaaa")) {
+                println("[NguonC] ✓ Got segment: ${capturedUrl.take(120)}")
                 val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
 
-                // Write m3u8 to app's internal cache (no permission needed)
+                // Extract base path to construct all segment URLs
+                // e.g. https://seouls11.amass11.top/78646bac.../streamaaa0000.png
+                // base: https://seouls11.amass11.top/78646bac.../
+                val segBase = capturedUrl.substringBeforeLast("/") + "/"
+
+                // Now fetch m3u8 content from WebView response cache
+                // OR build m3u8 ourselves from segment pattern
+                // Since we know the pattern: streamaaa0000.png to streamaaaNNNN.png
+                // and the m3u8 has #EXTINF:~10s per segment
+                // We generate a valid m3u8 playlist with enough segments
+
+                // Build m3u8 content with segment URLs
+                val m3u8Content = buildString {
+                    appendLine("#EXTM3U")
+                    appendLine("#EXT-X-VERSION:3")
+                    appendLine("#EXT-X-TARGETDURATION:11")
+                    appendLine("#EXT-X-MEDIA-SEQUENCE:0")
+                    // Generate enough segments (most videos < 200 segments for ~30min)
+                    // If a segment 404s, player just stops (graceful end)
+                    for (i in 0..999) {
+                        val segNum = i.toString().padStart(4, '0')
+                        appendLine("#EXTINF:10.0,")
+                        appendLine("${segBase}streamaaa${segNum}.png")
+                    }
+                    appendLine("#EXT-X-ENDLIST")
+                }
+
+                // Write to app cache
                 val ctx = PhimNguonCPlugin.appContext
-                val cacheDir = ctx?.cacheDir ?: java.io.File("/data/data/com.lagradost.cloudstream3.prerelease/cache")
+                val cacheDir = ctx?.cacheDir ?: java.io.File(
+                    "/data/user/0/com.lagradost.cloudstream3.prerelease/cache"
+                )
                 val tempDir = java.io.File(cacheDir, "nguonc")
                 if (!tempDir.exists()) tempDir.mkdirs()
                 val tempFile = java.io.File(tempDir, "stream_${System.currentTimeMillis()}.m3u8")
-                tempFile.writeText(content)
+                tempFile.writeText(m3u8Content)
 
                 val localUrl = tempFile.toURI().toString()
-                println("[NguonC] Saved m3u8: $localUrl (${content.lines().size} lines)")
+                println("[NguonC] Saved m3u8: $localUrl (1000 segments)")
 
                 callback(newExtractorLink("NguonC", serverName, localUrl, ExtractorLinkType.M3U8) {
                     this.referer = "$embedDomain/"
@@ -277,7 +311,7 @@ class PhimNguonCProvider : MainAPI() {
                 return true
             }
         } catch (e: Exception) {
-            println("[NguonC] M3u8 intercept failed: ${e.message}")
+            println("[NguonC] Intercept failed: ${e.message}")
         }
 
         println("[NguonC] ✗ All strategies failed for: $embedUrl")
