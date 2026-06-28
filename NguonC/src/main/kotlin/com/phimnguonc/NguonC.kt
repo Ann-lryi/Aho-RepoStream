@@ -60,12 +60,6 @@ class PhimNguonCProvider : MainAPI() {
         "${API_PREFIX}api/films/phim-moi-cap-nhat"    to "Phim M\u1EDBi C\u1EADp Nh\u1EADt",
         "danh-sach/phim-le"                           to "Phim L\u1EBB",
         "danh-sach/phim-bo"                           to "Phim B\u1ED9",
-        "the-loai/hoat-hinh"                          to "Ho\u1EA1t H\u00ECnh (Anime)",
-        "the-loai/khoa-hoc-vien-tuong"                to "Khoa H\u1ECDc Vi\u1EC5n T\u01B0\u1EE3ng",
-        "the-loai/gia-tuong"                          to "Gi\u1EA3 T\u01B0\u1EE3ng",
-        "the-loai/hanh-dong"                          to "H\u00E0nh \u0110\u1ED9ng",
-        "the-loai/kinh-di"                            to "Kinh D\u1ECB",
-        "the-loai/co-trang"                           to "C\u1ED5 Trang",
         "danh-sach/tv-shows"                          to "TV Shows",
         "the-loai/phim-18"                            to "18+"
     )
