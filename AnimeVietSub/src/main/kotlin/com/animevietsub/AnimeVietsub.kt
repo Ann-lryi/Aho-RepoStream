@@ -8,6 +8,7 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.EnumSet
+import delay
 
 /**
  * AnimeVietsub plugin for CloudStream 3 — built from REAL captured data.
@@ -76,25 +77,22 @@ class AnimeVietsubProvider : MainAPI() {
     )
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Home page — verified section URLs from robots/URLs in captured HTML
+    //  Home page — REDUCED to 4 sections to avoid overwhelming Cloudflare.
+    //
+    //  Previous version had 16 sections, all firing WebView requests at once.
+    //  Each request got a Cloudflare challenge HTML page returned immediately
+    //  (because WebViewResolver returns as soon as the page loads, NOT after
+    //  Cloudflare's JS challenge solves). 16 parallel requests × Cloudflare
+    //  = all failed with "items=0".
+    //
+    //  Now we use 4 sections — first request triggers CF warmup, subsequent
+    //  requests reuse the cf_clearance cookie and succeed.
     // ═══════════════════════════════════════════════════════════════════════
 
     override val mainPage = mainPageOf(
         "/"                          to "Mới Cập Nhật 🔥",
-        "/anime-moi/"                to "Anime Mới 🆕",
-        "/anime-le/"                 to "Anime Lẻ 🎬",
         "/anime-bo/"                 to "Anime Bộ 📺",
-        "/the-loai/hanh-dong/"       to "Hành Động ⚔️",
-        "/the-loai/phieu-luu/"       to "Phiêu Lưu 🗺️",
-        "/the-loai/hoat-hinh/"       to "Hoạt Hình 🎨",
-        "/the-loai/phep-thuat/"      to "Phép Thuật ✨",
-        "/the-loai/gia-tuong/"       to "Giả Tưởng 🐉",
-        "/the-loai/kinh-di/"         to "Kinh Dị 👻",
-        "/the-loai/tinh-cam/"        to "Tình Cảm 💕",
-        "/the-loai/hai-huoc/"        to "Hài Hước 😂",
-        "/the-loai/truong-hoc/"      to "Học Đường 🎓",
-        "/the-loai/bi-an/"           to "Bí Ẩn 🔍",
-        "/the-loai/vien-tuong/"      to "Viễn Tưởng 🚀",
+        "/anime-le/"                 to "Anime Lẻ 🎬",
         "/anime-sap-chieu/"          to "Sắp Chiếu 📅"
     )
 
@@ -113,36 +111,107 @@ class AnimeVietsubProvider : MainAPI() {
 
     /**
      * Fetch a Document through the Cloudflare-bypass WebView interceptor.
+     *
+     * IMPORTANT: Cloudflare Turnstile on animevietsub.pl returns a challenge HTML
+     * page IMMEDIATELY (the page "loads" but the JS challenge hasn't solved yet).
+     * WebViewResolver returns this challenge HTML as if it were the real page.
+     *
+     * We detect the challenge by looking for telltale markers ("Just a moment",
+     * "Xác Minh", "challenge-platform") and retry up to 3 times with increasing
+     * delays (3s, 6s, 10s) to give Cloudflare's JS time to solve + set the
+     * cf_clearance cookie. Once the cookie is set, subsequent requests succeed.
      */
     private suspend fun fetchDoc(url: String, useCf: Boolean = true): org.jsoup.nodes.Document? {
-        return try {
-            val resp = if (useCf) {
-                app.get(url, headers = commonHeaders, interceptor = cfInterceptor)
-            } else {
-                app.get(url, headers = commonHeaders)
+        val maxRetries = 3
+        val delays = listOf(3000L, 6000L, 10000L)  // ms
+        var lastError: String? = null
+
+        for (attempt in 1..maxRetries) {
+            try {
+                val resp = if (useCf) {
+                    app.get(url, headers = commonHeaders, interceptor = cfInterceptor)
+                } else {
+                    app.get(url, headers = commonHeaders)
+                }
+                val html = resp.text
+
+                // Detect Cloudflare challenge page
+                if (isCloudflareChallenge(html)) {
+                    println("[AVSB] fetchDoc attempt $attempt/$maxRetries: Cloudflare challenge detected for $url, waiting ${delays[attempt-1]}ms...")
+                    if (attempt < maxRetries) {
+                        delay(delays[attempt - 1])
+                        continue
+                    } else {
+                        println("[AVSB] fetchDoc: Cloudflare challenge persisted after $maxRetries attempts")
+                        return null
+                    }
+                }
+
+                // Success — return parsed document
+                return resp.document
+            } catch (e: Exception) {
+                lastError = e.message
+                println("[AVSB] fetchDoc attempt $attempt/$maxRetries error for $url: $lastError")
+                if (attempt < maxRetries) {
+                    delay(delays[attempt - 1])
+                }
             }
-            resp.document
-        } catch (e: Exception) {
-            println("[AVSB] fetchDoc failed for $url: ${e.message}")
-            null
         }
+        println("[AVSB] fetchDoc failed for $url after $maxRetries attempts: $lastError")
+        return null
     }
 
     /**
-     * Fetch raw HTML text through the Cloudflare-bypass interceptor.
+     * Detect if HTML is a Cloudflare challenge page (not the real content).
+     */
+    private fun isCloudflareChallenge(html: String): Boolean {
+        // Quick check on first 5000 chars (challenge markers are in <head>)
+        val head = if (html.length > 5000) html.substring(0, 5000) else html
+        return head.contains("Just a moment", ignoreCase = true) ||
+               head.contains("Xác Minh", ignoreCase = true) ||
+               head.contains("challenge-platform", ignoreCase = true) ||
+               head.contains("cf-turnstile", ignoreCase = true) ||
+               head.contains("cdn-cgi/challenge-platform", ignoreCase = true) ||
+               (head.contains("AnimeVietsub", ignoreCase = true) && head.contains("captcha-placeholder", ignoreCase = true))
+    }
+
+    /**
+     * Fetch raw HTML text through the Cloudflare-bypass interceptor (with retry).
      */
     private suspend fun fetchText(url: String, useCf: Boolean = true): String? {
-        return try {
-            val resp = if (useCf) {
-                app.get(url, headers = commonHeaders, interceptor = cfInterceptor)
-            } else {
-                app.get(url, headers = commonHeaders)
+        val maxRetries = 3
+        val delays = listOf(3000L, 6000L, 10000L)
+        var lastError: String? = null
+
+        for (attempt in 1..maxRetries) {
+            try {
+                val resp = if (useCf) {
+                    app.get(url, headers = commonHeaders, interceptor = cfInterceptor)
+                } else {
+                    app.get(url, headers = commonHeaders)
+                }
+                val html = resp.text
+
+                if (isCloudflareChallenge(html)) {
+                    println("[AVSB] fetchText attempt $attempt/$maxRetries: Cloudflare challenge for $url, waiting ${delays[attempt-1]}ms...")
+                    if (attempt < maxRetries) {
+                        delay(delays[attempt - 1])
+                        continue
+                    } else {
+                        return null
+                    }
+                }
+                return html
+            } catch (e: Exception) {
+                lastError = e.message
+                println("[AVSB] fetchText attempt $attempt/$maxRetries error for $url: $lastError")
+                if (attempt < maxRetries) {
+                    delay(delays[attempt - 1])
+                }
             }
-            resp.text
-        } catch (e: Exception) {
-            println("[AVSB] fetchText failed for $url: ${e.message}")
-            null
         }
+        println("[AVSB] fetchText failed for $url after $maxRetries attempts: $lastError")
+        return null
     }
 
     /**
