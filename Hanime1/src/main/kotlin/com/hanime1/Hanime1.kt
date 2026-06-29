@@ -274,9 +274,11 @@ class Hanime1Provider : MainAPI() {
             }
         }
 
-        // Build episode data: encode sources as "url1|quality1,url2|quality2,..."
+        // Build episode data: encode sources as "url1|quality1;url2|quality2;..."
+        // IMPORTANT: Use ";" as separator (NOT ",") because MP4 URLs contain
+        // commas in the secure= parameter: secure=hash,expiry
         val episodeData = if (sources.isNotEmpty()) {
-            sources.joinToString(",") { (url, q) -> "$url|$q" }
+            sources.joinToString(";") { (url, q) -> "$url|$q" }
         } else url
 
         // ── Recommendations ──
@@ -307,10 +309,12 @@ class Hanime1Provider : MainAPI() {
     ): Boolean {
         println("[H1] loadLinks: ${data.take(100)}")
 
-        // data format: "url1|quality1,url2|quality2,..." OR just a URL
+        // data format: "url1|quality1;url2|quality2;..." OR just a URL
+        // Use ";" as separator (NOT ",") because MP4 URLs contain commas:
+        //   secure=NtgShAeRSlHUIlnqcbQp8A==,1782777629
         if (data.contains("|")) {
             // Multiple sources encoded in load()
-            val sources = data.split(",").mapNotNull { src ->
+            val sources = data.split(";").mapNotNull { src ->
                 val parts = src.split("|", limit = 2)
                 if (parts.size == 2) Pair(parts[0], parts[1]) else null
             }
