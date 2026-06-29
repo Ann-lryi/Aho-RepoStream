@@ -58,19 +58,8 @@ class Hanime1Provider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════
 
     override val mainPage = mainPageOf(
-        "/"                                                    to "首頁 🏠",
-        "search?sort=最新上傳"                                  to "最新上傳 🆕",
-        "search?sort=最新上市"                                  to "最新上市 🔥",
-        "search?sort=他們在看"                                  to "他們在看 👀",
-        "search?genre=裏番&sort=最新上傳"                       to "裏番 🎬",
-        "search?genre=泡麵番&sort=最新上傳"                     to "泡麵番 🍜",
-        "search?genre=Motion+Anime&sort=最新上傳"               to "Motion Anime 🎞️",
-        "search?genre=3DCG&sort=最新上傳"                       to "3DCG 🧊",
-        "search?genre=2.5D&sort=最新上傳"                       to "2.5D動畫 🎨",
-        "search?genre=2D動畫&sort=最新上傳"                     to "2D動畫 ✏️",
-        "search?genre=AI生成&sort=最新上傳"                     to "AI生成 🤖",
-        "search?genre=MMD&sort=最新上傳"                        to "MMD 🎵",
-        "search?genre=Cosplay&sort=最新上傳"                    to "Cosplay 📸"
+        "search?genre=%E8%A3%8F%E7%95%AA"                                                    to "Home 🏠",
+        "search?query=&type=&genre=%E8%A3%8F%E7%95%AA&sort=%E8%A7%80%E7%9C%8B%E6%AC%A1%E6%95%B8&date=&duration=" to "Lượt xem Cao 🔥"
     )
 
     // ═══════════════════════════════════════════════════════════════════════
