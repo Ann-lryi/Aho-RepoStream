@@ -58,8 +58,9 @@ class Hanime1Provider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════
 
     override val mainPage = mainPageOf(
-        "search?genre=%E8%A3%8F%E7%95%AA"                                                    to "Home 🏠",
-        "search?query=&type=&genre=%E8%A3%8F%E7%95%AA&sort=%E8%A7%80%E7%9C%8B%E6%AC%A1%E6%95%B8&date=&duration=" to "Lượt xem Cao 🔥"
+        "search?genre=裏番" to "Home 🏠",
+        "search?query=&type=&genre=裏番&sort=觀看次數&date=&duration=" to "Lượt xem Cao 🔥",
+        "search?query=&type=&genre=裏番&tags%5B%5D=母&sort=&date=&duration=" to "Loạn Luân 🥵"
     )
 
     // ═══════════════════════════════════════════════════════════════════════
