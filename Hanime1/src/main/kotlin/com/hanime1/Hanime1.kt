@@ -313,7 +313,7 @@ class Hanime1Provider : MainAPI() {
                 if (!href.contains("/watch")) return@mapNotNull null
                 val epTitle = el.selectFirst(".card-mobile-title")?.text()?.trim() ?: return@mapNotNull null
                 val epDuration = el.selectFirst(".card-mobile-duration")?.text()?.trim() ?: ""
-                val isPlaying = el.get_text().contains("現正播放")
+                val isPlaying = el.text().contains("現正播放")
                 Triple(href, epTitle, isPlaying)
             }
             .distinctBy { it.first }
