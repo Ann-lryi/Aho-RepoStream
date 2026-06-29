@@ -1,0 +1,13 @@
+{
+  "name": "Hanime1",
+  "pluginClassName": "com.hanime1.Hanime1",
+  "version": 1,
+  "requiresResources": false,
+  "description": "Vietnamese anime streaming site",
+  "authors": ["Hanime1"],
+  "repositoryUrl": "https://github.com/dah215/Aho-Repo",
+  "status": 1,
+  "tvTypes": ["Movie"],
+  "language": "vi",
+  "iconUrl": "https://hanime1.me/favicon.ico"
+}
