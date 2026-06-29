@@ -57,11 +57,44 @@ class AnimeVietsubProvider : MainAPI() {
         "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
     /**
-     * Cloudflare-bypass interceptor. Matches the main domain + the player
-     * CDN subdomains used by the site.
+     * Cloudflare-bypass interceptor with CUSTOM JS that waits for the real
+     * content to appear (not just the challenge HTML).
+     *
+     * PROBLEM: Default WebViewResolver returns immediately when ANY request
+     * matches the regex. For HTML pages, the initial page-load request matches,
+     * so it returns the Cloudflare challenge HTML before JS has time to solve.
+     *
+     * FIX: Inject custom JavaScript that polls for the real content. The WebView
+     * won't return until either:
+     *   1. The JS detects real content (e.g. .TPostMv or h1.Title exists), OR
+     *   2. The timeout (30s) is reached
+     *
+     * This gives Cloudflare's Turnstile JS up to 30 seconds to solve the
+     * challenge and redirect to the real page.
      */
     private val cfInterceptor = WebViewResolver(
-        Regex(""".*animevietsub\.pl.*|.*animevietsub\..*|.*cdn\.animevietsub\..*|.*player\.animevietsub\..*""")
+        Regex(""".*animevietsub\.pl.*|.*animevietsub\..*|.*cdn\.animevietsub\..*|.*player\.animevietsub\..*"""),
+        js = """
+            (function() {
+                var attempts = 0;
+                var maxAttempts = 60; // 60 x 500ms = 30 seconds max
+                var interval = setInterval(function() {
+                    attempts++;
+                    // Check if real content has loaded (not CF challenge page)
+                    var hasContent = document.querySelector('.TPostMv, h1.Title, .movie-item, .InfoList, .list-episode, .Description');
+                    var noChallenge = !document.title.includes('Just a moment') &&
+                                      !document.title.includes('Xác Minh') &&
+                                      !document.querySelector('.captcha-placeholder');
+                    if (hasContent && noChallenge) {
+                        clearInterval(interval);
+                        console.log('[AVSB-JS] Real content detected after ' + attempts + ' attempts');
+                    } else if (attempts >= maxAttempts) {
+                        clearInterval(interval);
+                        console.log('[AVSB-JS] Timeout after ' + attempts + ' attempts, returning anyway');
+                    }
+                }, 500);
+            })();
+        """.trimIndent()
     )
 
     /** m3u8 capture interceptor — catches any HLS playlist the JWPlayer loads. */
