@@ -288,12 +288,8 @@ class Hanime1Provider : MainAPI() {
 
         val plot = buildBeautifulDescription(title, description, duration, views, rating, tags)
 
-        // ── Video sources ──
-        // Extract directly from <source> tags (verified structure):
-        //   <source size="720" src="https://vdownload.hembed.com/406918-720p.mp4?secure=..." type="video/mp4"/>
-        //   <source size="480" src="..." type="video/mp4"/>
-        //   <source size="1080" src="..." type="video/mp4"/>
-        val sources = mutableListOf<Pair<String, String>>()  // (url, qualityLabel)
+        // ── Video sources (for current episode) ──
+        val sources = mutableListOf<Pair<String, String>>()
         for (source in doc.select("video#player source")) {
             val src = source.attr("src")
             val size = source.attr("size")
@@ -301,27 +297,70 @@ class Hanime1Provider : MainAPI() {
                 sources.add(src to (if (size.isNotBlank()) "${size}p" else "Unknown"))
             }
         }
-
-        // Build episode data: encode sources as "url1|quality1;url2|quality2;..."
-        // IMPORTANT: Use ";" as separator (NOT ",") because MP4 URLs contain
-        // commas in the secure= parameter: secure=hash,expiry
-        val episodeData = if (sources.isNotEmpty()) {
-            sources.joinToString(";") { (url, q) -> "$url|$q" }
+        val currentEpisodeData = if (sources.isNotEmpty()) {
+            sources.joinToString(";") { (u, q) -> "$u|$q" }
         } else url
 
-        // ── Recommendations ──
-        // Watch page has related-watch-wrap sections with video cards
+        // ── Parse playlist (same artist/series videos) ──
+        // Structure (verified from watch page HTML):
+        //   .hover-video-playlist > .related-watch-wrap (×30)
+        //     > a.overlay[href="/watch?v=..."]
+        //     > .card-mobile-panel > .card-mobile-title + .card-mobile-duration
+        val playlistEntries = doc.select(".hover-video-playlist .related-watch-wrap, .related-watch-wrap")
+            .mapNotNull { el ->
+                val linkEl = el.selectFirst("a.overlay") ?: el.selectFirst("a[href*='/watch']") ?: return@mapNotNull null
+                val href = fixUrl(linkEl.attr("href"))
+                if (!href.contains("/watch")) return@mapNotNull null
+                val epTitle = el.selectFirst(".card-mobile-title")?.text()?.trim() ?: return@mapNotNull null
+                val epDuration = el.selectFirst(".card-mobile-duration")?.text()?.trim() ?: ""
+                val isPlaying = el.get_text().contains("現正播放")
+                Triple(href, epTitle, isPlaying)
+            }
+            .distinctBy { it.first }
+
+        // ── Build episodes ──
+        val episodes = if (playlistEntries.size > 1) {
+            // Multiple videos in playlist → return as TV Series
+            playlistEntries.mapIndexed { idx, (epUrl, epTitle, isPlaying) ->
+                // For the currently-playing video, use pre-extracted sources
+                // For others, pass the watch URL (loadLinks will fetch sources)
+                val data = if (isPlaying) currentEpisodeData else epUrl
+                newEpisode(data) {
+                    this.name = epTitle
+                    this.episode = idx + 1
+                }
+            }
+        } else {
+            // Single video → just 1 episode
+            listOf(newEpisode(currentEpisodeData) {
+                this.name = title
+                this.episode = 1
+            })
+        }
+
+        // ── Recommendations (exclude playlist entries) ──
+        val playlistUrls = playlistEntries.map { it.first }.toSet()
         val recommendations = doc.select(".related-watch-wrap .horizontal-card, .related-watch-wrap .video-item-container")
             .mapNotNull { parseVideoCard(it) }
-            .filter { it.url != url }
+            .filter { it.url != url && it.url !in playlistUrls }
             .take(20)
 
-        return newMovieLoadResponse(title, url, TvType.NSFW, episodeData) {
-            this.posterUrl = poster
-            this.backgroundPosterUrl = poster
-            this.plot = plot
-            this.tags = tags.ifEmpty { null }
-            this.recommendations = recommendations.ifEmpty { null }
+        return if (episodes.size > 1) {
+            newTvSeriesLoadResponse(title, url, TvType.NSFW, episodes) {
+                this.posterUrl = poster
+                this.backgroundPosterUrl = poster
+                this.plot = plot
+                this.tags = tags.ifEmpty { null }
+                this.recommendations = recommendations.ifEmpty { null }
+            }
+        } else {
+            newMovieLoadResponse(title, url, TvType.NSFW, currentEpisodeData) {
+                this.posterUrl = poster
+                this.backgroundPosterUrl = poster
+                this.plot = plot
+                this.tags = tags.ifEmpty { null }
+                this.recommendations = recommendations.ifEmpty { null }
+            }
         }
     }
 
