@@ -13,7 +13,6 @@ import android.util.Base64
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import java.util.EnumSet
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -60,7 +59,6 @@ class PhimNguonCProvider : MainAPI() {
         "${API_PREFIX}api/films/phim-moi-cap-nhat"    to "Phim M\u1EDBi C\u1EADp Nh\u1EADt",
         "danh-sach/phim-le"                           to "Phim L\u1EBB",
         "danh-sach/phim-bo"                           to "Phim B\u1ED9",
-        "danh-sach/tv-shows"                          to "TV Shows",
         "the-loai/phim-18"                            to "18+"
     )
 
@@ -82,8 +80,9 @@ class PhimNguonCProvider : MainAPI() {
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
             this.quality   = SearchQuality.HD
-            this.dubStatus = EnumSet.of(DubStatus.Subbed)
-            this.episodes  = mutableMapOf(DubStatus.Subbed to (episodeCount ?: 0))
+            if (episodeCount != null && episodeCount > 0) {
+                addSub(episodeCount)
+            }
         }
     }
 
@@ -105,11 +104,6 @@ class PhimNguonCProvider : MainAPI() {
         val lang      = item.language ?: ""
         val hasSub    = lang.contains("Vietsub",     ignoreCase = true)
         val hasDub    = lang.contains("Thuy\u1EBFt Minh", ignoreCase = true)
-        val dubStatus = when {
-            hasSub && hasDub -> EnumSet.of(DubStatus.Subbed, DubStatus.Dubbed)
-            hasDub           -> EnumSet.of(DubStatus.Dubbed)
-            else             -> EnumSet.of(DubStatus.Subbed)
-        }
 
         val quality = when (item.quality?.uppercase()) {
             "FHD", "HD" -> SearchQuality.HD
@@ -121,11 +115,8 @@ class PhimNguonCProvider : MainAPI() {
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
             this.quality   = quality
-            this.dubStatus = dubStatus
-            if (episodeCount != null) {
-                if (hasSub) addSub(episodeCount)
-                if (hasDub) addDub(episodeCount)
-                if (!hasSub && !hasDub) addSub(episodeCount)
+            if (episodeCount != null && episodeCount > 0) {
+                addSub(episodeCount)
             }
         }
     }
