@@ -169,16 +169,29 @@ class AnimeVietsubProvider : MainAPI() {
 
     /**
      * Detect if HTML is a Cloudflare challenge page (not the real content).
+     *
+     * IMPORTANT: Must search the ENTIRE HTML, not just first 5000 chars.
+     * The challenge page is ~890000 chars — CSS/font data fills the first
+     * 800000+ chars, and challenge markers like "captcha-placeholder" and
+     * "challenge-platform" are at positions 849000+ and 857000+.
+     *
+     * Also check HTML size: challenge pages are ~880000-895000 chars,
+     * real animevietsub.pl pages are ~150000-480000 chars.
      */
     private fun isCloudflareChallenge(html: String): Boolean {
-        // Quick check on first 5000 chars (challenge markers are in <head>)
-        val head = if (html.length > 5000) html.substring(0, 5000) else html
-        return head.contains("Just a moment", ignoreCase = true) ||
-               head.contains("Xác Minh", ignoreCase = true) ||
-               head.contains("challenge-platform", ignoreCase = true) ||
-               head.contains("cf-turnstile", ignoreCase = true) ||
-               head.contains("cdn-cgi/challenge-platform", ignoreCase = true) ||
-               (head.contains("AnimeVietsub", ignoreCase = true) && head.contains("captcha-placeholder", ignoreCase = true))
+        // Size check: challenge pages are consistently ~880K-895K chars
+        if (html.length > 800000) {
+            println("[AVSB] HTML size ${html.length} > 800K — likely CF challenge")
+            return true
+        }
+        // Search ENTIRE HTML for ASCII-only markers (encoding-safe)
+        return html.contains("challenge-platform", ignoreCase = true) ||
+               html.contains("cf-turnstile", ignoreCase = true) ||
+               html.contains("cdn-cgi/challenge-platform", ignoreCase = true) ||
+               html.contains("captcha-placeholder", ignoreCase = true) ||
+               html.contains("Just a moment", ignoreCase = true) ||
+               html.contains("Xác Minh", ignoreCase = true) ||
+               html.contains("Enable JavaScript and cookies", ignoreCase = true)
     }
 
     /**
