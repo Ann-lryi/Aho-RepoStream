@@ -58,7 +58,7 @@ class Hanime1Provider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════
 
     override val mainPage = mainPageOf(
-        "search?genre=裏番" to "Home 🏠",
+        "search?genre=裏番"                                      to "Home 🏠",
         "search?query=&type=&genre=裏番&sort=觀看次數&date=&duration=" to "Lượt xem Cao 🔥",
         "search?query=&type=&genre=裏番&tags%5B%5D=母&sort=&date=&duration=" to "Loạn Luân 🥵"
     )
@@ -109,6 +109,38 @@ class Hanime1Provider : MainAPI() {
     }
 
     /**
+     * Parse a video card from .search-videos structure (verified from search pages):
+     *
+     *   <a href="https://hanime1.me/watch?v=406899">
+     *     <div class="home-rows-videos-div search-videos hover-lighter">
+     *       <div class="video-card-inner">
+     *         <img src="https://vdownload.hembed.com/image/cover/406899.jpg?secure=..." />
+     *         <div class="home-rows-videos-title">不雅之舉 2</div>
+     *       </div>
+     *     </div>
+     *   </a>
+     */
+    private fun parseSearchCard(el: Element): SearchResponse? {
+        // .search-videos is the inner div — the <a> tag is its parent
+        val a = if (el.tagName() == "a") el else el.parent()
+        a ?: return null
+        val href = a.attr("href")
+        if (!href.contains("/watch")) return null
+
+        val title = el.selectFirst(".home-rows-videos-title")?.text()?.trim()
+            ?: a.attr("title").ifBlank { return null }
+
+        val poster = el.selectFirst("img")?.let { img ->
+            img.attr("data-src").ifBlank { img.attr("src") }
+        }?.let { if (it.startsWith("http")) it else fixUrl(it) }
+
+        return newMovieSearchResponse(title, fixUrl(href), TvType.NSFW) {
+            this.posterUrl = poster
+            this.quality = SearchQuality.HD
+        }
+    }
+
+    /**
      * Parse a video card from .horizontal-card structure (verified from home.html):
      *
      *   <div class="horizontal-card">
@@ -150,11 +182,16 @@ class Hanime1Provider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val data = request.data
-        val url = when {
-            data == "/" && page == 1 -> "$mainUrl/"
-            data == "/" -> "$mainUrl/?page=$page"
-            page == 1 -> "$mainUrl/$data"
-            else -> "$mainUrl/$data&page=$page"
+        // URL-encode Chinese characters in the data string
+        // CloudStream passes the raw string to app.get which may not encode properly
+        val encodedData = URLEncoder.encode(data, "UTF-8")
+            .replace("%3F", "?").replace("%3D", "=").replace("%26", "&")
+            .replace("%5B", "%5B").replace("%5D", "%5D")  // keep [ and ] encoded
+
+        val url = if (page == 1) {
+            "$mainUrl/$encodedData"
+        } else {
+            "$mainUrl/$encodedData&page=$page"
         }
 
         println("[H1] getMainPage: $url")
@@ -165,19 +202,18 @@ class Hanime1Provider : MainAPI() {
             return newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
 
-        // Parse .horizontal-card items (verified structure)
-        val items = doc.select(".horizontal-card").mapNotNull { parseVideoCard(it) }
-
-        // Also try .video-item-container (some pages use different layout)
+        // Search pages use .search-videos (verified from live HTML)
+        // Home page uses .horizontal-card
+        // Try both selectors
+        val items = doc.select(".search-videos").mapNotNull { parseSearchCard(it) }
         val items2 = if (items.isEmpty()) {
-            doc.select(".video-item-container, .search-doujin-videos > div").mapNotNull { parseVideoCard(it) }
+            doc.select(".horizontal-card").mapNotNull { parseVideoCard(it) }
         } else items
 
         // hasNext: look for pagination link to next page
         val hasNext = items2.isNotEmpty() && run {
             doc.selectFirst("a.page-link[href*='page=${page + 1}']") != null ||
-            doc.selectFirst("a[rel='next']") != null ||
-            doc.selectFirst("li.page-item:not(.disabled) a[href*='page=${page + 1}']") != null
+            doc.selectFirst("a[rel='next']") != null
         }
 
         println("[H1]   items=${items2.size}, hasNext=$hasNext")
@@ -195,7 +231,9 @@ class Hanime1Provider : MainAPI() {
             app.get(url, headers = commonHeaders).document
         } catch (_: Exception) { return emptyList() }
 
-        return doc.select(".horizontal-card, .search-doujin-videos > div").mapNotNull { parseVideoCard(it) }
+        return doc.select(".search-videos, .horizontal-card").mapNotNull {
+            parseSearchCard(it) ?: parseVideoCard(it)
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
