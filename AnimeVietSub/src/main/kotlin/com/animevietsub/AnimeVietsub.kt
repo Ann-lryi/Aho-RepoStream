@@ -8,7 +8,6 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.EnumSet
-import delay
 
 /**
  * AnimeVietsub plugin for CloudStream 3 — built from REAL captured data.
@@ -139,7 +138,7 @@ class AnimeVietsubProvider : MainAPI() {
                 if (isCloudflareChallenge(html)) {
                     println("[AVSB] fetchDoc attempt $attempt/$maxRetries: Cloudflare challenge detected for $url, waiting ${delays[attempt-1]}ms...")
                     if (attempt < maxRetries) {
-                        delay(delays[attempt - 1])
+                        Thread.sleep(delays[attempt - 1])
                         continue
                     } else {
                         println("[AVSB] fetchDoc: Cloudflare challenge persisted after $maxRetries attempts")
@@ -153,7 +152,7 @@ class AnimeVietsubProvider : MainAPI() {
                 lastError = e.message
                 println("[AVSB] fetchDoc attempt $attempt/$maxRetries error for $url: $lastError")
                 if (attempt < maxRetries) {
-                    delay(delays[attempt - 1])
+                    Thread.sleep(delays[attempt - 1])
                 }
             }
         }
@@ -195,7 +194,7 @@ class AnimeVietsubProvider : MainAPI() {
                 if (isCloudflareChallenge(html)) {
                     println("[AVSB] fetchText attempt $attempt/$maxRetries: Cloudflare challenge for $url, waiting ${delays[attempt-1]}ms...")
                     if (attempt < maxRetries) {
-                        delay(delays[attempt - 1])
+                        Thread.sleep(delays[attempt - 1])
                         continue
                     } else {
                         return null
@@ -206,7 +205,7 @@ class AnimeVietsubProvider : MainAPI() {
                 lastError = e.message
                 println("[AVSB] fetchText attempt $attempt/$maxRetries error for $url: $lastError")
                 if (attempt < maxRetries) {
-                    delay(delays[attempt - 1])
+                    Thread.sleep(delays[attempt - 1])
                 }
             }
         }
