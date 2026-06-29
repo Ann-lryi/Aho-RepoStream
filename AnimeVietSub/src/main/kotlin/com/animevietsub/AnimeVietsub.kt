@@ -73,8 +73,8 @@ class AnimeVietsubProvider : MainAPI() {
      * challenge and redirect to the real page.
      */
     private val cfInterceptor = WebViewResolver(
-        Regex(""".*animevietsub\.pl.*|.*animevietsub\..*|.*cdn\.animevietsub\..*|.*player\.animevietsub\..*"""),
-        js = """
+    Regex(""".*animevietsub\.pl.*|.*animevietsub\..*|.*cdn\.animevietsub\..*|.*player\.animevietsub\..*""")
+)
             (function() {
                 var attempts = 0;
                 var maxAttempts = 60; // 60 x 500ms = 30 seconds max
