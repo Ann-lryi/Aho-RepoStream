@@ -3,6 +3,7 @@ package com.javtiful
 import android.util.Log
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.AppUtils
@@ -79,44 +80,85 @@ class JavtifulProvider : MainAPI() {
     )
 
     // ────────────────────────────────────────────────────────────────────
+    //  Cloudflare bypass
+    //
+    //  javtiful.com sits behind Cloudflare and serves a JS challenge to
+    //  non-browser clients (especially from certain IP ranges — Vietnam
+    //  mobile carriers get challenged aggressively). OkHttp alone cannot
+    //  solve the challenge because it doesn't execute JavaScript.
+    //
+    //  WebViewResolver launches a real Android WebView, loads the URL,
+    //  lets the JS challenge execute, captures the resulting HTML + cookies,
+    //  and returns them. Subsequent requests to the same host reuse the
+    //  cookies via OkHttp's cookie jar — fast.
+    //
+    //  The Regex matches javtiful.com URLs (and only those). We pass this
+    //  interceptor to every app.get() call so the FIRST request to the site
+    //  triggers the WebView, and all later requests are fast OkHttp calls.
+    // ────────────────────────────────────────────────────────────────────
+
+    private val cfInterceptor = WebViewResolver(
+        interceptUrl = Regex("""https?://([a-z0-9-]+\.)*javtiful\.com(/.*)?"""),
+        // useOkhttp = true (default): try OkHttp first, only fall back to WebView
+        // if a Cloudflare challenge is detected. This keeps fast paths fast.
+        // timeout = 30s: the JS challenge usually resolves in 1-3 seconds;
+        // 30s is the safety ceiling for slow mobile networks.
+        timeout = 30_000L
+    )
+
+    // ────────────────────────────────────────────────────────────────────
     //  mainPage
     //
-    //  IMPORTANT: CloudStream fires ONE parallel HTTP request per section
-    //  when the home page loads. Mobile devices cannot sustain 30+ concurrent
-    //  HTTPS connections to the same host — OkHttp's default per-host pool is
-    //  just 5, and CloudStream's home-page coroutine supervisor cancels the
-    //  whole batch after ~3 seconds. Keep this list SHORT (≤10 sections).
-    //  Categories / actresses / channels are still reachable via Search.
+    //  CRITICAL: CloudStream fires ONE parallel HTTP request per section when
+    //  the home page loads, and the home-page coroutine supervisor cancels
+    //  the ENTIRE batch after ~3.5 seconds. On a mobile network:
+    //    - TLS handshake to Cloudflare: 0.5–1.5s
+    //    - Server response: 0.3–0.8s
+    //    - OkHttp per-host connection pool: 5 concurrent
+    //  So with 10 sections, the 6th–10th requests don't even START before
+    //  the 3.5s deadline. With 47 sections (my original code), NOTHING
+    //  completes and the home page stays blank forever.
+    //
+    //  Solution: keep this list to 3 sections (fits within OkHttp's 5-connection
+    //  per-host pool, so all 3 run in parallel and finish within the deadline).
+    //  Everything else is reachable via Search.
+    //
+    //  cacheTime = 300 (5 minutes) means once a page is fetched, subsequent
+    //  navigations back to the home page return instantly from cache.
     // ────────────────────────────────────────────────────────────────────
 
     override val mainPage = mainPageOf(
-        "$mainUrl$VN/videos"                  to "Mới nhất",
-        "$mainUrl$VN/trending"                to "Đang thịnh hành",
-        "$mainUrl$VN/videos?sort=most_viewed" to "Xem nhiều nhất",
-        "$mainUrl$VN/videos?sort=most_liked"  to "Thích nhiều nhất",
-        "$mainUrl$VN/censored"                to "Có che",
-        "$mainUrl$VN/uncensored"              to "Không che",
-        "$mainUrl$VN/reducing-mosaic"         to "Giảm mosaics",
-        "$mainUrl$VN/category/big-tits"       to "Big Tits",
-        "$mainUrl$VN/category/married-woman"  to "Married Woman",
-        "$mainUrl$VN/actress/hatano-yui"      to "Hatano Yui"
+        "$mainUrl$VN/videos"   to "Mới nhất",
+        "$mainUrl$VN/trending" to "Đang thịnh hành",
+        "$mainUrl$VN/censored" to "Có che"
     )
+
+    /** Cache duration for list-page fetches (5 minutes). */
+    private val listCacheTime = 300
 
     // ────────────────────────────────────────────────────────────────────
     //  HTTP helper (suspend — app.get() is suspend)
     //
-    //  CloudStream's home-page UI has a global coroutine supervisor that
-    //  cancels all section requests after ~3 seconds. Each request MUST
-    //  therefore complete quickly. We set an explicit 15s timeout so a
-    //  single slow request can't block the whole batch.
+    //  Every request goes through cfInterceptor (WebViewResolver):
+    //    - First request: WebView loads the page, solves the Cloudflare JS
+    //      challenge, captures cookies. Takes 2-5 seconds but only happens
+    //      ONCE per app session — cookies persist in OkHttp's cookie jar.
+    //    - Subsequent requests: interceptor sees a normal 200 response,
+    //      passes it straight through (no WebView overhead).
+    //
+    //  cacheTime = 300 (5 min) ensures repeat visits to the home page are
+    //  instant even if cookies expired.
     // ────────────────────────────────────────────────────────────────────
 
     private suspend fun httpGet(url: String): String {
         return try {
             app.get(
                 url,
-                headers = commonHeaders,
-                timeout = 15_000L   // 15s — long enough for a slow mobile network
+                headers     = commonHeaders,
+                interceptor = cfInterceptor,
+                timeout     = 30_000L,              // 30s — WebView challenge needs time
+                cacheTime   = listCacheTime,        // cache 5 minutes
+                cacheUnit   = java.util.concurrent.TimeUnit.SECONDS
             ).text
         } catch (t: Throwable) {
             Log.w(TAG, "httpGet failed: $url :: ${t.message}")
