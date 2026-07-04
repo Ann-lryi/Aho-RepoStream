@@ -130,6 +130,33 @@ class JavtifulProvider : MainAPI() {
     }
 
     /**
+     * Convert a javtiful.com image URL (poster, thumbnail) into a proxy.cors.sh URL.
+     *
+     * CloudStream's image loader makes DIRECT OkHttp requests to the image URL.
+     * javtiful.com is behind Cloudflare, which challenges Vietnam mobile IPs —
+     * so a direct request returns a challenge page instead of JPEG bytes, and
+     * the thumbnail renders as a black square.
+     *
+     * Routing through proxy.cors.sh (a Cloudflare Worker) bypasses the challenge
+     * because the request goes Cloudflare-edge → Cloudflare-edge (loopback).
+     *
+     * Only javtiful.com URLs are proxied — R2 video URLs (r2.cloudflarestorage.com)
+     * are NOT behind the CF challenge and work directly.
+     */
+    private fun proxifyImage(url: String?): String? {
+        if (url.isNullOrBlank()) return null
+        // Already absolute and not from javtiful.com → return as-is
+        if (url.startsWith("http") && !url.contains("javtiful.com")) return url
+        // Relative URL → make absolute, then proxy
+        val abs = when {
+            url.startsWith("http") -> url
+            url.startsWith("/")    -> mainUrl + url
+            else                   -> return null
+        }
+        return proxify(abs, corsProxies[0])  // use primary proxy (proxy.cors.sh)
+    }
+
+    /**
      * WebViewResolver used only as a last-resort background cookie solver.
      * `interceptUrl` never matches, so the WebView runs to completion and
      * routes all sub-requests through OkHttp (because useOkhttp=true),
@@ -311,11 +338,9 @@ class JavtifulProvider : MainAPI() {
         }
         if (poster.isNullOrBlank()) poster = img?.attr("src") ?: ""
 
-        val absPoster = when {
-            poster.startsWith("http") -> poster
-            poster.startsWith("/")    -> mainUrl + poster
-            else                      -> ""
-        }
+        // Route through proxy.cors.sh — CloudStream's image loader makes direct
+        // OkHttp requests, which would hit Cloudflare's challenge from Vietnam IPs.
+        val absPoster = proxifyImage(poster)
 
         // Optional quality badge → map to SearchQuality enum
         val qualityTag = selectFirst(".front-quality-tag")?.text()?.trim().orEmpty()
@@ -413,11 +438,10 @@ class JavtifulProvider : MainAPI() {
             ?: doc.selectFirst("title")?.text()?.trim()
             ?: "Untitled"
 
-        val poster = config.videoPoster?.takeIf { it.isNotBlank() }?.let {
-            if (it.startsWith("http")) it else mainUrl + it
-        } ?: doc.selectFirst("video#front-player")?.attr("poster")?.let {
-            if (it.startsWith("http")) it else mainUrl + it
-        }
+        // Poster — route through proxy.cors.sh so CloudStream's image loader
+        // can fetch it from Vietnam IPs without hitting Cloudflare's challenge.
+        val poster = proxifyImage(config.videoPoster?.takeIf { it.isNotBlank() })
+            ?: proxifyImage(doc.selectFirst("video#front-player")?.attr("poster"))
 
         // 3) Metadata rows: actress / tags / categories / channel / date.
         //    Local collectors (NOT class-level) — concurrent load() calls must be isolated.
