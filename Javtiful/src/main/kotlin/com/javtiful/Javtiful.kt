@@ -51,17 +51,14 @@ import java.util.regex.Pattern
 @CloudstreamPlugin
 class JavtifulPlugin : Plugin() {
     override fun load() {
-        val provider = JavtifulProvider()
-        registerMainAPI(provider)
-        // Pre-warm Cloudflare cookies immediately when the plugin loads.
-        // CloudStream loads plugins at app startup — typically 2-3 seconds
-        // BEFORE the user navigates to the home page. By firing the
-        // background WebView NOW, the Cloudflare JS challenge gets solved
-        // during that window, and by the time the user opens the Javtiful
-        // home page, cookies are already cached in OkHttp's jar.
-        // This means the FIRST home page load can succeed instantly,
-        // instead of being empty and requiring a manual refresh.
-        provider.preWarmCloudflareCookies()
+        // KEEP THIS SIMPLE — only register the provider.
+        // Do NOT do any network/WebView work here, because Plugin.load()
+        // runs during app startup when Android Context may not be fully
+        // ready yet. WebViewResolver requires a Context to create a WebView,
+        // and calling it too early crashes the plugin silently.
+        // The CORS proxy (proxy.cors.sh) handles Cloudflare bypass without
+        // needing WebView, so pre-warming is unnecessary.
+        registerMainAPI(JavtifulProvider())
     }
 }
 
@@ -137,17 +134,25 @@ class JavtifulProvider : MainAPI() {
      * `interceptUrl` never matches, so the WebView runs to completion and
      * routes all sub-requests through OkHttp (because useOkhttp=true),
      * which sets cf_clearance cookies in OkHttp's cookie jar.
+     *
+     * Initialized lazily — WebViewResolver doesn't need Context at construction
+     * time, but deferring creation avoids any chance of class-init failures.
      */
-    private val cfWebView = WebViewResolver(
-        interceptUrl = Regex("""__cf_never_match__"""),
-        useOkhttp = true,
-        timeout = 15_000L
-    )
+    private val cfWebView: WebViewResolver by lazy {
+        WebViewResolver(
+            interceptUrl = Regex("""__cf_never_match__"""),
+            useOkhttp = true,
+            timeout = 15_000L
+        )
+    }
 
-    /** Background scope that survives CloudStream's home page cancellation. */
-    private val bgScope = kotlinx.coroutines.CoroutineScope(
-        kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob()
-    )
+    /** Background scope that survives CloudStream's home page cancellation.
+     *  Created lazily so plugin load never touches coroutines. */
+    private val bgScope: kotlinx.coroutines.CoroutineScope by lazy {
+        kotlinx.coroutines.CoroutineScope(
+            kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob()
+        )
+    }
 
     /** Ensures only ONE background WebView runs at a time. */
     private val cfSolving = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -194,35 +199,14 @@ class JavtifulProvider : MainAPI() {
         }
     }
 
-    /**
-     * Public entry point for the Plugin class to pre-warm Cloudflare cookies
-     * at plugin load time. Fires the background WebView 2-3 seconds BEFORE
-     * the user opens the home page, so cookies are ready by the time they do.
-     */
-    fun preWarmCloudflareCookies() {
-        Log.i(TAG, "Pre-warming Cloudflare cookies at plugin load")
-        fireBackgroundChallengeSolver()
-    }
-
     // ────────────────────────────────────────────────────────────────────
     //  mainPage
     //
-    //  CRITICAL: CloudStream fires ONE parallel HTTP request per section when
-    //  the home page loads, and the home-page coroutine supervisor cancels
-    //  the ENTIRE batch after ~3.5 seconds. On a mobile network:
-    //    - TLS handshake to Cloudflare: 0.5–1.5s
-    //    - Server response: 0.3–0.8s
-    //    - OkHttp per-host connection pool: 5 concurrent
-    //  So with 10 sections, the 6th–10th requests don't even START before
-    //  the 3.5s deadline. With 47 sections (my original code), NOTHING
-    //  completes and the home page stays blank forever.
-    //
-    //  Solution: keep this list to 3 sections (fits within OkHttp's 5-connection
-    //  per-host pool, so all 3 run in parallel and finish within the deadline).
-    //  Everything else is reachable via Search.
-    //
-    //  cacheTime = 300 (5 minutes) means once a page is fetched, subsequent
-    //  navigations back to the home page return instantly from cache.
+    //  CloudStream fires ONE parallel HTTP request per section when the home
+    //  page loads. Keep this list SHORT (3 sections) so all requests fit
+    //  within OkHttp's 5-connection-per-host pool and complete before
+    //  CloudStream's ~2s cancellation deadline.
+    //  Categories / actresses / channels are reachable via Search.
     // ────────────────────────────────────────────────────────────────────
 
     override val mainPage = mainPageOf(
