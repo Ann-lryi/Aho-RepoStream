@@ -11,6 +11,7 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
@@ -119,23 +120,68 @@ class JavtifulProvider : MainAPI() {
     private val cfWebView = WebViewResolver(
         interceptUrl = Regex("""__cf_never_match__"""),
         useOkhttp = true,          // route sub-requests through OkHttp → cookies get set
-        timeout = 12_000L          // 12s — challenge usually solves in 1-3s, 12s is safety ceiling
+        timeout = 15_000L          // 15s — challenge usually solves in 1-3s, 15s is safety ceiling
     )
 
-    /** Mutex so only one challenge-solving WebView runs at a time. */
-    private val cfMutex = kotlinx.coroutines.sync.Mutex()
+    /**
+     * Background coroutine scope that is NOT tied to any home page / search /
+     * load coroutine. CloudStream cancels home page coroutines after ~2
+     * seconds — far too short for a WebView to solve Cloudflare's JS
+     * challenge (which takes 3-5 seconds). By running the WebView in this
+     * independent scope, the challenge solver survives the home page
+     * cancellation, sets cookies in OkHttp's jar, and the NEXT home page
+     * load succeeds.
+     */
+    private val bgScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob()
+    )
+
+    /** Atomic flag so only ONE background challenge solver runs at a time. */
+    private val cfSolving = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** Quick check: does this HTML look like a Cloudflare challenge page? */
     private fun looksLikeChallenge(html: String): Boolean {
+        // Empty or very short responses are NOT real content
+        if (html.isBlank() || html.length < 500) return true
         // Cloudflare challenge pages always contain one of these markers
         return html.contains("Just a moment...", ignoreCase = true) ||
                html.contains("cf-challenge", ignoreCase = true) ||
                html.contains("_cf_chl_opt", ignoreCase = true) ||
                html.contains("cf-mitigated", ignoreCase = true) ||
                html.contains("challenge-platform", ignoreCase = true) ||
+               html.contains("cf-browser-verification", ignoreCase = true) ||
+               html.contains("cf_chl_", ignoreCase = true) ||
                // A real javtiful list page always has video cards;
                // a challenge page does not.
-               (html.length < 2000 && !html.contains("front-video-card"))
+               !html.contains("front-video-card")
+    }
+
+    /**
+     * Fire a background WebView to solve the Cloudflare challenge.
+     * This runs in [bgScope] — completely independent of the calling
+     * coroutine, so it survives even if CloudStream cancels the home page.
+     * The WebView loads the URL, Cloudflare's JS challenge executes, and
+     * because `useOkhttp = true`, the challenge-solving POST request goes
+     * through OkHttp → cookies (`cf_clearance`) get set in OkHttp's cookie
+     * jar → all future OkHttp requests to javtiful.com succeed.
+     *
+     * Uses [cfSolving] to ensure only ONE background solver runs at a time.
+     */
+    private fun fireBackgroundChallengeSolver() {
+        if (!cfSolving.compareAndSet(false, true)) return
+        bgScope.launch {
+            try {
+                Log.i(TAG, "Background Cloudflare solver starting")
+                // Use the main page URL — Cloudflare cookies are per-domain,
+                // so solving on any page sets cookies for all pages.
+                cfWebView.resolveUsingWebView(mainUrl + VN + "/videos", referer = mainUrl)
+                Log.i(TAG, "Background Cloudflare solver finished — cookies should now be cached")
+            } catch (t: Throwable) {
+                Log.w(TAG, "Background Cloudflare solver failed: ${t.message}")
+            } finally {
+                cfSolving.set(false)
+            }
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -171,83 +217,63 @@ class JavtifulProvider : MainAPI() {
     // ────────────────────────────────────────────────────────────────────
     //  HTTP helper (suspend — app.get() is suspend)
     //
-    //  Two-phase Cloudflare bypass:
-    //    Phase 1: Normal OkHttp GET (fast — 0.5-1s if cookies cached)
-    //    Phase 2: If Phase 1 returns a challenge page, launch WebView to
-    //             solve challenge (sets cookies in OkHttp jar), then retry.
+    //  CRITICAL ARCHITECTURE: Fire-and-forget Cloudflare bypass
     //
-    //  The `cfMutex` ensures only ONE WebView runs at a time across all
-    //  concurrent section requests. The other sections block on the mutex
-    //  for ~3s, then their Phase-1 retry succeeds with the now-cached
-    //  cookies — so they don't each spawn their own WebView.
+    //  CloudStream cancels home page coroutines after ~2 seconds. Cloudflare's
+    //  JS challenge takes 3-5 seconds to solve. These are INCOMPABLE — no
+    //  approach that blocks the home page coroutine can ever work.
+    //
+    //  Strategy:
+    //    1. Try OkHttp GET with a SHORT 1.5s timeout (must finish before
+    //       CloudStream's 2s cancellation deadline).
+    //    2. If we get real HTML → return it (fast path, cookies cached).
+    //    3. If we get a challenge page or empty → fire a BACKGROUND WebView
+    //       (in bgScope, NOT tied to this coroutine) to solve the challenge
+    //       and set cookies. Return empty string for THIS request.
+    //    4. The user sees an empty home page on first load. 3-5 seconds later,
+    //       the background WebView finishes → cookies cached in OkHttp jar.
+    //    5. The user pulls-to-refresh or reopens the home page → OkHttp now
+    //       has cookies → real HTML → home page renders.
+    //
+    //  This is the ONLY architecture that works when:
+    //    - CloudStream's timeout < Cloudflare challenge solve time
+    //    - The plugin can't control CloudStream's timeout
+    //
+    //  IMPORTANT: Never catch CancellationException — let it propagate so
+    //  the coroutine cancels cleanly. Use `catch (e: Exception)` not
+    //  `catch (t: Throwable)`.
     // ────────────────────────────────────────────────────────────────────
 
     private suspend fun httpGet(url: String): String {
-        // ── Phase 1: try plain OkHttp ──
-        var html = try {
+        // ── Phase 1: Fast OkHttp GET (1.5s timeout — under CloudStream's 2s deadline) ──
+        val html = try {
             app.get(
                 url,
                 headers   = commonHeaders,
-                timeout   = 8_000L,
-                cacheTime = listCacheTime,
+                timeout   = 1_500L,              // 1.5s — MUST finish before CloudStream cancels
+                cacheTime = listCacheTime,        // 5 min cache
                 cacheUnit = java.util.concurrent.TimeUnit.SECONDS
             ).text
-        } catch (t: Throwable) {
-            Log.w(TAG, "httpGet phase 1 failed: $url :: ${t.message}")
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e                              // NEVER catch CancellationException
+        } catch (e: Exception) {
+            Log.w(TAG, "httpGet OkHttp failed: $url :: ${e.message}")
             ""
         }
 
-        // Fast path: got real content, return immediately
+        // Fast path: got real content → return immediately
         if (html.isNotBlank() && !looksLikeChallenge(html)) {
             return html
         }
 
-        // ── Phase 2: Cloudflare challenge detected — solve via WebView ──
-        // Use mutex so only 1 WebView runs at a time. Other concurrent
-        // requests that also hit challenge will wait here, then retry
-        // OkHttp (which by then has cookies from the first WebView).
-        cfMutex.withLock {
-            // After acquiring the lock, retry OkHttp FIRST — another section
-            // may have already solved the challenge while we were waiting.
-            html = try {
-                app.get(
-                    url,
-                    headers   = commonHeaders,
-                    timeout   = 8_000L,
-                    cacheTime = 0   // bypass cache — we want fresh response with new cookies
-                ).text
-            } catch (t: Throwable) {
-                Log.w(TAG, "httpGet phase 2 retry failed: $url :: ${t.message}")
-                ""
-            }
-            if (html.isNotBlank() && !looksLikeChallenge(html)) {
-                return html
-            }
+        // ── Phase 2: Challenge detected → fire background WebView ──
+        // This returns immediately. The WebView runs in bgScope (survives
+        // home page cancellation). Cookies get set in OkHttp's jar.
+        // The CURRENT home page load returns empty, but the NEXT one works.
+        Log.i(TAG, "Cloudflare challenge detected for $url — firing background solver")
+        fireBackgroundChallengeSolver()
 
-            // Still challenged — launch the WebView to solve it.
-            Log.i(TAG, "Solving Cloudflare challenge for $url")
-            try {
-                cfWebView.resolveUsingWebView(url, referer = mainUrl)
-            } catch (t: Throwable) {
-                Log.w(TAG, "WebView challenge solver failed: ${t.message}")
-            }
-
-            // Final retry — cookies should now be set in OkHttp's jar.
-            html = try {
-                app.get(
-                    url,
-                    headers   = commonHeaders,
-                    timeout   = 8_000L,
-                    cacheTime = listCacheTime,
-                    cacheUnit = java.util.concurrent.TimeUnit.SECONDS
-                ).text
-            } catch (t: Throwable) {
-                Log.w(TAG, "httpGet final retry failed: $url :: ${t.message}")
-                ""
-            }
-        }
-
-        return html
+        return ""
     }
 
     private suspend fun httpGetDoc(url: String) =
