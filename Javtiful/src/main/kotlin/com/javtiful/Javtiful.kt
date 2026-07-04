@@ -80,76 +80,44 @@ class JavtifulProvider : MainAPI() {
 
     // ────────────────────────────────────────────────────────────────────
     //  mainPage
+    //
+    //  IMPORTANT: CloudStream fires ONE parallel HTTP request per section
+    //  when the home page loads. Mobile devices cannot sustain 30+ concurrent
+    //  HTTPS connections to the same host — OkHttp's default per-host pool is
+    //  just 5, and CloudStream's home-page coroutine supervisor cancels the
+    //  whole batch after ~3 seconds. Keep this list SHORT (≤10 sections).
+    //  Categories / actresses / channels are still reachable via Search.
     // ────────────────────────────────────────────────────────────────────
 
     override val mainPage = mainPageOf(
-        // Sort-based listings
-        "$mainUrl$VN/videos"                                                    to "Mới nhất",
-        "$mainUrl$VN/videos?sort=added_today"                                   to "Hôm nay",
-        "$mainUrl$VN/videos?sort=added_week"                                    to "Tuần này",
-        "$mainUrl$VN/videos?sort=added_month"                                   to "Tháng này",
-        "$mainUrl$VN/trending"                                                  to "Đang thịnh hành",
-        "$mainUrl$VN/videos?sort=most_viewed"                                   to "Xem nhiều nhất",
-        "$mainUrl$VN/videos?sort=most_liked"                                    to "Thích nhiều nhất",
-        "$mainUrl$VN/videos?sort=popular_today"                                 to "Hot hôm nay",
-        "$mainUrl$VN/videos?sort=popular_month"                                 to "Hot tháng này",
-
-        // Collections
-        "$mainUrl$VN/censored"                                                   to "Có che",
-        "$mainUrl$VN/uncensored"                                                 to "Không che",
-        "$mainUrl$VN/reducing-mosaic"                                            to "Giảm mosaics",
-
-        // Popular categories
-        "$mainUrl$VN/category/beautiful-girl"                                    to "Biệt chủng: Beautiful Girl",
-        "$mainUrl$VN/category/big-tits"                                          to "Biệt chủng: Big Tits",
-        "$mainUrl$VN/category/married-woman"                                     to "Biệt chủng: Married Woman",
-        "$mainUrl$VN/category/milf"                                              to "Biệt chủng: MILF",
-        "$mainUrl$VN/category/mature-woman"                                      to "Biệt chủng: Mature Woman",
-        "$mainUrl$VN/category/female-teacher"                                    to "Biệt chủng: Female Teacher",
-        "$mainUrl$VN/category/female-student"                                    to "Biệt chủng: Female Student",
-        "$mainUrl$VN/category/office-lady"                                       to "Biệt chủng: Office Lady",
-        "$mainUrl$VN/category/nurse"                                             to "Biệt chủng: Nurse",
-        "$mainUrl$VN/category/housekeeper"                                       to "Biệt chủng: Housekeeper",
-        "$mainUrl$VN/category/cosplay"                                           to "Biệt chủng: Cosplay",
-        "$mainUrl$VN/category/drama"                                             to "Biệt chủng: Drama",
-        "$mainUrl$VN/category/amateur"                                           to "Biệt chủng: Amateur",
-
-        // Popular actresses
-        "$mainUrl$VN/actress/hatano-yui"                                         to "Diễn viên: Hatano Yui",
-        "$mainUrl$VN/actress/julia"                                              to "Diễn viên: Julia",
-        "$mainUrl$VN/actress/tachibana-mary"                                     to "Diễn viên: Tachibana Mary",
-        "$mainUrl$VN/actress/shinoda-yuu"                                        to "Diễn viên: Shinoda Yuu",
-        "$mainUrl$VN/actress/iioka-kanako"                                       to "Diễn viên: Iioka Kanako",
-        "$mainUrl$VN/actress/hanasaki-himari"                                    to "Diễn viên: Hanazawa Himari",
-        "$mainUrl$VN/actress/matsumoto-ichika"                                   to "Diễn viên: Matsumoto Ichika",
-        "$mainUrl$VN/actress/tanaka-nene"                                        to "Diễn viên: Tanaka Nene",
-        "$mainUrl$VN/actress/hamasaki-mao"                                       to "Diễn viên: Hamasaki Mao",
-        "$mainUrl$VN/actress/kitano-mina"                                        to "Diễn viên: Kitano Mina",
-        "$mainUrl$VN/actress/misono-waka"                                        to "Diễn viên: Misono Waka",
-        "$mainUrl$VN/actress/suehiro-jun"                                        to "Diễn viên: Suehiro Jun",
-
-        // Popular channels
-        "$mainUrl$VN/channel/s-cute"                                             to "Kênh: S-Cute",
-        "$mainUrl$VN/channel/idea-pocket"                                        to "Kênh: Idea-Pocket",
-        "$mainUrl$VN/channel/faleno"                                             to "Kênh: Faleno",
-        "$mainUrl$VN/channel/kawaii"                                             to "Kênh: Kawaii",
-        "$mainUrl$VN/channel/fitch"                                              to "Kênh: Fitch",
-        "$mainUrl$VN/channel/honnaka"                                            to "Kênh: Honnaka",
-        "$mainUrl$VN/channel/attackers"                                          to "Kênh: Attackers",
-        "$mainUrl$VN/channel/e-body"                                             to "Kênh: E-Body",
-        "$mainUrl$VN/channel/hunter"                                             to "Kênh: Hunter",
-        "$mainUrl$VN/channel/fc2ppv"                                             to "Kênh: FC2PPV",
-        "$mainUrl$VN/channel/1pondo"                                             to "Kênh: 1Pondo",
-        "$mainUrl$VN/channel/caribbean"                                          to "Kênh: Caribbean"
+        "$mainUrl$VN/videos"                  to "Mới nhất",
+        "$mainUrl$VN/trending"                to "Đang thịnh hành",
+        "$mainUrl$VN/videos?sort=most_viewed" to "Xem nhiều nhất",
+        "$mainUrl$VN/videos?sort=most_liked"  to "Thích nhiều nhất",
+        "$mainUrl$VN/censored"                to "Có che",
+        "$mainUrl$VN/uncensored"              to "Không che",
+        "$mainUrl$VN/reducing-mosaic"         to "Giảm mosaics",
+        "$mainUrl$VN/category/big-tits"       to "Big Tits",
+        "$mainUrl$VN/category/married-woman"  to "Married Woman",
+        "$mainUrl$VN/actress/hatano-yui"      to "Hatano Yui"
     )
 
     // ────────────────────────────────────────────────────────────────────
     //  HTTP helper (suspend — app.get() is suspend)
+    //
+    //  CloudStream's home-page UI has a global coroutine supervisor that
+    //  cancels all section requests after ~3 seconds. Each request MUST
+    //  therefore complete quickly. We set an explicit 15s timeout so a
+    //  single slow request can't block the whole batch.
     // ────────────────────────────────────────────────────────────────────
 
     private suspend fun httpGet(url: String): String {
         return try {
-            app.get(url, headers = commonHeaders).text
+            app.get(
+                url,
+                headers = commonHeaders,
+                timeout = 15_000L   // 15s — long enough for a slow mobile network
+            ).text
         } catch (t: Throwable) {
             Log.w(TAG, "httpGet failed: $url :: ${t.message}")
             ""
