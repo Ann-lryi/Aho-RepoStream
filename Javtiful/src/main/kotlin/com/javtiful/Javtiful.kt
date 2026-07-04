@@ -92,125 +92,37 @@ class JavtifulProvider : MainAPI() {
     )
 
     // ────────────────────────────────────────────────────────────────────
-    //  Cloudflare bypass
-    //
-    //  javtiful.com sits behind Cloudflare and serves a JS challenge to
-    //  non-browser clients — especially from Vietnam mobile carriers.
-    //  OkHttp alone cannot solve the challenge because it doesn't execute
-    //  JavaScript.
-    //
-    //  PROBLEM with the naive WebViewResolver interceptor approach:
-    //  WebViewResolver's `shouldInterceptRequest` fires on EVERY request the
-    //  WebView makes, including the FIRST one (before the challenge is solved).
-    //  If `interceptUrl` matches the page URL, it captures the request WITHOUT
-    //  cookies → OkHttp retries without cookies → challenge again → blank page.
-    //
-    //  SOLUTION: Use a two-phase approach.
-    //  Phase 1: Try normal OkHttp GET (fast path — works if cookies already
-    //           cached from a previous session, or if Cloudflare isn't
-    //           challenging this IP right now).
-    //  Phase 2: If the response looks like a Cloudflare challenge page,
-    //           launch WebViewResolver with `interceptUrl = "__never_match__"`
-    //           and `useOkhttp = true`. The WebView loads the URL, Cloudflare's
-    //           JS challenge runs, and because `useOkhttp = true`, all sub-
-    //           requests (including the POST that submits the challenge
-    //           solution) go through OkHttp → cookies get set in OkHttp's
-    //           cookie jar. After 8 seconds (enough for challenge to solve),
-    //           retry the original OkHttp GET → now it has cookies → real HTML.
-    //
-    //  The `cfMutex` ensures only ONE WebView challenge-solving session runs
-    //  at a time, even if 3 home-page sections fire simultaneously. The other
-    //  2 sections wait for the mutex, then retry OkHttp with the now-cached
-    //  cookies — fast.
-    // ────────────────────────────────────────────────────────────────────
-
-    /** WebViewResolver that NEVER matches its interceptUrl — used only to
-     *  drive a WebView long enough for Cloudflare to set cookies via the
-     *  OkHttp sub-request path. */
-    private val cfWebView = WebViewResolver(
-        interceptUrl = Regex("""__cf_never_match__"""),
-        useOkhttp = true,          // route sub-requests through OkHttp → cookies get set
-        timeout = 15_000L          // 15s — challenge usually solves in 1-3s, 15s is safety ceiling
-    )
-
-    /**
-     * Background coroutine scope that is NOT tied to any home page / search /
-     * load coroutine. CloudStream cancels home page coroutines after ~2
-     * seconds — far too short for a WebView to solve Cloudflare's JS
-     * challenge (which takes 3-5 seconds). By running the WebView in this
-     * independent scope, the challenge solver survives the home page
-     * cancellation, sets cookies in OkHttp's jar, and the NEXT home page
-     * load succeeds.
-     */
-    private val bgScope = kotlinx.coroutines.CoroutineScope(
-        kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob()
-    )
-
-    /** Atomic flag so only ONE background challenge solver runs at a time. */
-    private val cfSolving = java.util.concurrent.atomic.AtomicBoolean(false)
-
-    /** Quick check: does this HTML look like a Cloudflare challenge page? */
-    private fun looksLikeChallenge(html: String): Boolean {
-        // Empty or very short responses are NOT real content
-        if (html.isBlank() || html.length < 500) return true
-        // Cloudflare challenge pages always contain one of these markers
-        return html.contains("Just a moment...", ignoreCase = true) ||
-               html.contains("cf-challenge", ignoreCase = true) ||
-               html.contains("_cf_chl_opt", ignoreCase = true) ||
-               html.contains("cf-mitigated", ignoreCase = true) ||
-               html.contains("challenge-platform", ignoreCase = true) ||
-               html.contains("cf-browser-verification", ignoreCase = true) ||
-               html.contains("cf_chl_", ignoreCase = true) ||
-               // A real javtiful list page always has video cards;
-               // a challenge page does not.
-               !html.contains("front-video-card")
-    }
-
-    // ────────────────────────────────────────────────────────────────────
     //  Cloudflare bypass — Multi-proxy strategy
     //
-    //  PROBLEM: javtiful.com sits behind Cloudflare, which serves a JS
-    //  challenge to Vietnam mobile IPs. CloudStream's home page timeout is
-    //  ~2 seconds, but Cloudflare's challenge takes 3-5 seconds to solve.
-    //  No approach that blocks the home page coroutine can work.
+    //  javtiful.com sits behind Cloudflare and serves a JS challenge to
+    //  Vietnam mobile IPs. CloudStream's home page timeout (~2s) is shorter
+    //  than Cloudflare's challenge solve time (3-5s), so WebView-based
+    //  approaches cannot work within the home page coroutine.
     //
-    //  SOLUTION: Route requests through a Cloudflare-hosted CORS proxy.
-    //  proxy.cors.sh is itself a Cloudflare Worker — when it fetches
-    //  javtiful.com, the request goes Cloudflare-edge → Cloudflare-edge
-    //  (loopback), so NO challenge is served. This is essentially using
-    //  Cloudflare to bypass Cloudflare.
+    //  SOLUTION: Route requests through proxy.cors.sh — a Cloudflare Worker.
+    //  When it fetches javtiful.com, the request goes Cloudflare-edge →
+    //  Cloudflare-edge (loopback), so NO challenge is served. This is
+    //  essentially "using Cloudflare to bypass Cloudflare".
     //
-    //  Verified working (2026-07-04):
-    //    proxy.cors.sh/https://javtiful.com/vn/videos → 108KB, 48 video cards
-    //    proxy.cors.sh/https://javtiful.com/vn/video/110518/sqte-699 → MP4 URL
-    //    proxy.cors.sh/https://javtiful.com/vn/search?q=sqte → 48 results
-    //    Response time: 2.3s first, 0.3s cached
-    //
-    //  The plugin tries each proxy in order. The first that returns real
-    //  content (containing "front-video-card") wins. If all fail, fall back
-    //  to direct connection (works with VPN) → then background WebView.
+    //  The plugin tries each proxy in [corsProxies] order. The first that
+    //  returns real content wins. If all fail, fall back to a background
+    //  WebView (fire-and-forget, survives home page cancellation).
     // ────────────────────────────────────────────────────────────────────
 
     /**
-     * List of Cloudflare-hosted CORS proxies to try, in order of preference.
-     * Each proxy URL is prefixed to the target URL.
-     *   - "" = direct connection (works in non-challenged regions / with VPN)
-     *   - proxy.cors.sh = Cloudflare Worker, bypasses CF challenge
-     *
-     * To add more proxies, append "PREFIX" entries here. The plugin will try
-     * each in order until one returns real content.
+     * List of CORS proxies to try, in order of preference.
+     *   - "https://proxy.cors.sh/" = Cloudflare Worker — bypasses CF challenge
+     *   - "" = direct connection (works with VPN or non-challenged IP)
+     *   - allorigins / thingproxy = public backups (sometimes rate-limited)
      */
     private val corsProxies = listOf(
-        "https://proxy.cors.sh/",          // Cloudflare Worker — primary, bypasses CF challenge
-        "",                                 // Direct — works with VPN or in non-challenged regions
-        "https://api.allorigins.win/raw?url=",  // Backup — sometimes works
-        "https://thingproxy.freeboard.io/fetch/"  // Backup — sometimes works
+        "https://proxy.cors.sh/",
+        "",
+        "https://api.allorigins.win/raw?url=",
+        "https://thingproxy.freeboard.io/fetch/"
     )
 
-    /** Convert a direct javtiful.com URL into a proxied URL.
-     *  For proxy.cors.sh: prefix the entire URL.
-     *  For allorigins/thingproxy: URL-encode the target.
-     */
+    /** Convert a direct URL into a proxied URL. */
     private fun proxify(url: String, proxy: String): String {
         if (proxy.isEmpty()) return url
         return if (proxy.endsWith("?url=") || proxy.endsWith("?q=")) {
@@ -221,25 +133,59 @@ class JavtifulProvider : MainAPI() {
     }
 
     /**
+     * WebViewResolver used only as a last-resort background cookie solver.
+     * `interceptUrl` never matches, so the WebView runs to completion and
+     * routes all sub-requests through OkHttp (because useOkhttp=true),
+     * which sets cf_clearance cookies in OkHttp's cookie jar.
+     */
+    private val cfWebView = WebViewResolver(
+        interceptUrl = Regex("""__cf_never_match__"""),
+        useOkhttp = true,
+        timeout = 15_000L
+    )
+
+    /** Background scope that survives CloudStream's home page cancellation. */
+    private val bgScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob()
+    )
+
+    /** Ensures only ONE background WebView runs at a time. */
+    private val cfSolving = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Quick check: does this HTML look like a Cloudflare challenge page?
+     *  IMPORTANT: must NOT match search-result pages with zero results —
+     *  those return valid HTML without front-video-card but with a
+     *  "Không tìm thấy video" message. We detect challenge pages by
+     *  looking for actual Cloudflare markers, not by absence of content. */
+    private fun looksLikeChallenge(html: String): Boolean {
+        if (html.isBlank() || html.length < 500) return true
+        return html.contains("Just a moment...", ignoreCase = true) ||
+               html.contains("cf-challenge", ignoreCase = true) ||
+               html.contains("_cf_chl_opt", ignoreCase = true) ||
+               html.contains("cf-mitigated", ignoreCase = true) ||
+               html.contains("challenge-platform", ignoreCase = true) ||
+               html.contains("cf-browser-verification", ignoreCase = true) ||
+               html.contains("cf_chl_", ignoreCase = true) ||
+               html.contains("/cdn-cgi/challenge-platform/", ignoreCase = true) ||
+               html.contains("cf-spinner-please-wait", ignoreCase = true) ||
+               html.contains("cf-turnstile", ignoreCase = true)
+    }
+
+    /**
      * Fire a background WebView to solve the Cloudflare challenge.
-     * This runs in [bgScope] — completely independent of the calling
-     * coroutine, so it survives even if CloudStream cancels the home page.
-     * The WebView loads the URL, Cloudflare's JS challenge executes, and
-     * because `useOkhttp = true`, the challenge-solving POST request goes
-     * through OkHttp → cookies (`cf_clearance`) get set in OkHttp's cookie
-     * jar → all future OkHttp requests to javtiful.com succeed.
-     *
-     * Uses [cfSolving] to ensure only ONE background solver runs at a time.
+     * Runs in [bgScope] — independent of the calling coroutine, so it
+     * survives CloudStream's home page cancellation. The WebView loads
+     * the URL, the JS challenge executes, and because `useOkhttp = true`,
+     * the challenge-solving POST goes through OkHttp → cf_clearance cookie
+     * gets set in OkHttp's cookie jar → future OkHttp requests succeed.
      */
     private fun fireBackgroundChallengeSolver() {
         if (!cfSolving.compareAndSet(false, true)) return
         bgScope.launch {
             try {
                 Log.i(TAG, "Background Cloudflare solver starting")
-                // Use the main page URL — Cloudflare cookies are per-domain,
-                // so solving on any page sets cookies for all pages.
                 cfWebView.resolveUsingWebView(mainUrl + VN + "/videos", referer = mainUrl)
-                Log.i(TAG, "Background Cloudflare solver finished — cookies should now be cached")
+                Log.i(TAG, "Background Cloudflare solver finished")
             } catch (t: Throwable) {
                 Log.w(TAG, "Background Cloudflare solver failed: ${t.message}")
             } finally {
@@ -250,9 +196,8 @@ class JavtifulProvider : MainAPI() {
 
     /**
      * Public entry point for the Plugin class to pre-warm Cloudflare cookies
-     * at plugin load time. Called from [JavtifulPlugin.load].
-     * This kicks off the background WebView 2-3 seconds BEFORE the user
-     * opens the home page, so cookies are ready by the time they do.
+     * at plugin load time. Fires the background WebView 2-3 seconds BEFORE
+     * the user opens the home page, so cookies are ready by the time they do.
      */
     fun preWarmCloudflareCookies() {
         Log.i(TAG, "Pre-warming Cloudflare cookies at plugin load")
