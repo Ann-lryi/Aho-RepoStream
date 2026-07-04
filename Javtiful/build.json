@@ -1,5 +1,5 @@
 {
-  "name": "Javtiful",
+  "name": "javtiful",
   "pluginClassName": "com.javtiful.Javtiful",
   "version": 1,
   "requiresResources": false,
@@ -9,6 +9,6 @@
   "status": 1,
   "tvTypes": ["NSFW"],
   "language": "vi",
-  "iconUrl": "https://Javtiful.com/favicon.ico"
+  "iconUrl": "https://javtiful.com/favicon.ico"
 }
  
