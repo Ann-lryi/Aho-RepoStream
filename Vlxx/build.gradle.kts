@@ -7,7 +7,7 @@ cloudstream {
 
     description = "Vietnamese anime streaming site"
     language    = "vi"
-    authors = listOf("Vlxx")
+    authors = listOf("Javtiful")
 
     /**
     * Status int as the following:
@@ -22,7 +22,7 @@ cloudstream {
     // You can find a list of available types here:
     // https://recloudstream.github.io/cloudstream/html/app/com.lagradost.cloudstream3/-tv-type/index.html
     tvTypes = listOf("NSFW")
-    iconUrl = "https://vlxx.bz/favicon.ico"
+    iconUrl = "https://Javtiful.com/favicon.ico"
 
     isCrossPlatform = false
 }
