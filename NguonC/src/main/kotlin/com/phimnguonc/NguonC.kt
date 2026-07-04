@@ -6,6 +6,7 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.security.MessageDigest
@@ -13,6 +14,9 @@ import android.util.Base64
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -54,6 +58,113 @@ class PhimNguonCProvider : MainAPI() {
     )
 
     private val API_PREFIX = "API::"
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  PERFORMANCE: Cloudflare-bypass cookie cache + listing-page doc cache
+    // ═══════════════════════════════════════════════════════════════════════════
+    //
+    // The site's HTML listing pages (danh-sach/*, the-loai/*, tim-kiem) sit behind
+    // Cloudflare, so a real WebViewResolver pass is needed to solve the JS
+    // challenge. That's SLOW (multiple seconds to spin up a WebView + wait for the
+    // challenge to resolve). The old code re-ran this WebView dance on literally
+    // EVERY single HTML page request — every homepage tab, every search, and (worst
+    // of all) every genre page used to compute "phim đề xuất" when opening a movie
+    // (up to ~9 separate WebView loads before the movie page could even show).
+    //
+    // Fix: once we solve the Cloudflare challenge via WebView, we capture the
+    // resulting cookies (cf_clearance etc.) and reuse them on subsequent PLAIN
+    // HTTP requests (no WebView needed) for as long as they remain valid. We only
+    // fall back to WebView again if a plain request comes back blocked/empty.
+    // A short-lived per-URL document cache also avoids redundant network calls
+    // entirely when the same listing page is requested again within a few minutes
+    // (e.g. browsing multiple movies of the same genre back-to-back).
+    // A mutex serializes the (rare, expensive) WebView fallback so a cold app
+    // start doesn't spin up several WebViews in parallel for different tabs.
+
+    private data class CachedDoc(val doc: Document, val time: Long)
+
+    private val docCache = ConcurrentHashMap<String, CachedDoc>()
+    private val DOC_CACHE_TTL_MS = 5 * 60 * 1000L // 5 minutes
+
+    private val cfCookieCache = ConcurrentHashMap<String, Map<String, String>>()
+    private val cfMutex = Mutex()
+
+    private fun looksBlocked(html: String): Boolean {
+        if (html.isBlank()) return true
+        val lower = html.lowercase()
+        return lower.contains("just a moment") ||
+               lower.contains("checking your browser") ||
+               lower.contains("cf-browser-verification") ||
+               lower.contains("attention required") ||
+               (lower.contains("cloudflare") && lower.contains("challenge"))
+    }
+
+    /**
+     * Fetch an HTML listing/genre/search page as fast as possible.
+     *
+     * Order of attempts:
+     *  1. Short-lived cache (avoids duplicate fetches for the same URL).
+     *  2. Plain HTTP GET, using any previously-captured Cloudflare cookie. This
+     *     is dramatically faster than WebView and works fine once a valid
+     *     clearance cookie exists.
+     *  3. Plain HTTP GET with no cookie (cheap to try, sometimes works anyway).
+     *  4. WebViewResolver fallback (slow) — serialized via mutex so concurrent
+     *     callers (e.g. parallel genre lookups) don't all spin up a WebView at
+     *     once. The resulting cookies are cached for next time.
+     */
+    private suspend fun fetchListingDoc(url: String): Document {
+        docCache[url]?.let { cached ->
+            if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) return cached.doc
+        }
+
+        suspend fun tryPlain(cookies: Map<String, String>?): Document? {
+            return try {
+                val resp = if (cookies != null) {
+                    app.get(url, headers = commonHeaders, cookies = cookies)
+                } else {
+                    app.get(url, headers = commonHeaders)
+                }
+                val html = resp.text
+                if (!looksBlocked(html)) {
+                    val doc = resp.document
+                    if (doc.select("table tbody tr").isNotEmpty()) {
+                        docCache[url] = CachedDoc(doc, System.currentTimeMillis())
+                        return doc
+                    }
+                }
+                null
+            } catch (_: Exception) { null }
+        }
+
+        // ── Fast path: plain HTTP, reusing cached CF cookie if we have one ──
+        val cachedCookies = cfCookieCache[mainUrl]
+        if (cachedCookies != null) {
+            tryPlain(cachedCookies)?.let { return it }
+        } else {
+            tryPlain(null)?.let { return it }
+        }
+
+        // ── Slow path: WebView bypass, serialized ──
+        return cfMutex.withLock {
+            // Someone else may have solved it while we were waiting for the lock.
+            docCache[url]?.let { cached ->
+                if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) return@withLock cached.doc
+            }
+            val freshCookies = cfCookieCache[mainUrl]
+            if (freshCookies != null && freshCookies != cachedCookies) {
+                tryPlain(freshCookies)?.let { return@withLock it }
+            }
+
+            val interceptor = WebViewResolver(Regex(Regex.escape(url)))
+            val resp = app.get(url, headers = commonHeaders, interceptor = interceptor)
+            try {
+                if (resp.cookies.isNotEmpty()) cfCookieCache[mainUrl] = resp.cookies
+            } catch (_: Exception) {}
+            val doc = resp.document
+            docCache[url] = CachedDoc(doc, System.currentTimeMillis())
+            doc
+        }
+    }
 
     override val mainPage = mainPageOf(
         "${API_PREFIX}api/films/phim-moi-cap-nhat"    to "Phim M\u1EDBi C\u1EADp Nh\u1EADt",
@@ -130,9 +241,9 @@ class PhimNguonCProvider : MainAPI() {
             newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
         } else {
             val url   = if (page == 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
-            val pageInterceptor = WebViewResolver(Regex(Regex.escape(url)))
-            val resp = app.get(url, headers = commonHeaders, interceptor = pageInterceptor)
-            val doc  = resp.document
+            // PERF: fetchListingDoc() reuses cached CF cookies / plain HTTP
+            // whenever possible instead of always spinning up a full WebView.
+            val doc   = fetchListingDoc(url)
             val items = doc.select("table tbody tr").mapNotNull { parseCard(it) }
             newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
         }
@@ -147,8 +258,8 @@ class PhimNguonCProvider : MainAPI() {
             return res!!.items!!.mapNotNull { parseApiItem(it) }
 
         val searchUrl = "$mainUrl/tim-kiem?keyword=${URLEncoder.encode(query, "utf-8")}"
-        val pageInterceptor2 = WebViewResolver(Regex(Regex.escape(searchUrl)))
-        val doc = app.get(searchUrl, headers = commonHeaders, interceptor = pageInterceptor2).document
+        // PERF: same fast-path-first fetch as getMainPage.
+        val doc = fetchListingDoc(searchUrl)
         return doc.select("table tbody tr").mapNotNull { parseCard(it) }
     }
 
@@ -324,7 +435,17 @@ class PhimNguonCProvider : MainAPI() {
         // The CORRECT endpoint is the HTML genre browse page:
         //   GET /the-loai/{slug}?page={n}   →  HTML <table><tbody><tr>…</tr></tbody></table>
         // which `getMainPage` already uses via `parseCard()`. We re-use the same
-        // parser here and paginate up to 3 pages to fill out the grid.
+        // parser here.
+        //
+        // PERF: this used to fetch up to 3 PAGES per genre (up to 9 separate
+        // WebView loads total, since every HTML fetch used a brand-new
+        // WebViewResolver) which is why opening a movie could take 10-30+
+        // seconds. Now:
+        //   - fetchListingDoc() reuses cached CF cookies for a fast plain HTTP
+        //     fetch whenever possible (WebView only runs once per app session,
+        //     in the common case).
+        //   - Capped at 2 pages per genre and stops as soon as we have enough
+        //     items, cutting the number of requests needed.
         //
         // Genres are sorted by specificity (most specific first) so an anime's
         // "Hoạt Hình" genre is tried before its "Hành Động" genre — otherwise a
@@ -345,25 +466,28 @@ class PhimNguonCProvider : MainAPI() {
             coroutineScope {
                 // Try top 3 genres IN PARALLEL — first non-empty wins.
                 // (If we tried them sequentially, a dead/slow genre would block
-                //  the more relevant one behind it.)
+                //  the more relevant one behind it.) The cfMutex inside
+                //  fetchListingDoc() makes sure a cold-start Cloudflare
+                //  challenge is only solved once even though these run in
+                //  parallel — the other calls simply reuse the resulting cookie.
                 val genreResults = sortedGenres.take(3).map { genreName ->
                     async {
                         val slug2 = nameToSlug(genreName)
                         if (slug2.isBlank()) return@async emptyList<SearchResponse>()
 
                         val items = mutableListOf<SearchResponse>()
-                        // Scrape up to 3 pages of this genre (20 films/page → up to 60)
-                        for (p in 1..3) {
+                        // Scrape up to 2 pages of this genre (20 films/page → up to 40),
+                        // stopping early once we have enough for the grid.
+                        for (p in 1..2) {
                             try {
                                 val url = if (p == 1) "$mainUrl/the-loai/$slug2"
                                           else "$mainUrl/the-loai/$slug2?page=$p"
-                                val pageInterceptor = WebViewResolver(Regex(Regex.escape(url)))
-                                val doc = app.get(url, headers = commonHeaders, interceptor = pageInterceptor).document
+                                val doc = fetchListingDoc(url)
                                 val rows = doc.select("table tbody tr").mapNotNull { parseCard(it) }
                                     .filter { (it.url ?: "").trimEnd('/').substringAfterLast("/") != movie.slug }
                                 if (rows.isEmpty()) break  // no more pages
                                 items += rows
-                                if (items.size >= 30) break
+                                if (items.size >= 24) break
                             } catch (_: Exception) { break }
                         }
                         items
@@ -377,7 +501,7 @@ class PhimNguonCProvider : MainAPI() {
                 if (bestResult.isNotEmpty()) {
                     bestResult.distinctBy { it.url }.take(30)
                 } else {
-                    // Last-resort fallback — site-wide newest films.
+                    // Last-resort fallback — site-wide newest films (fast, plain API).
                     try {
                         app.get("$mainUrl/api/films/phim-moi-cap-nhat?page=1", headers = commonHeaders)
                             .parsedSafe<NguonCApiResponse>()?.items
