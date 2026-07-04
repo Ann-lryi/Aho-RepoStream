@@ -198,39 +198,54 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     private fun parseApiItem(item: NguonCApiItem): SearchResponse? {
-        val slug   = item.slug ?: return null
-        val title  = item.name ?: return null
-        val href   = "$mainUrl/phim/$slug"
-        val poster = item.poster_url ?: item.thumb_url
-        val currentEp = item.current_episode ?: ""
+    val slug   = item.slug ?: return null
+    val title  = item.name ?: return null
+    val href   = "$mainUrl/phim/$slug"
+    val poster = item.poster_url ?: item.thumb_url
+    val currentEp = item.current_episode ?: ""
 
-        val episodeCount: Int? = when {
-            currentEp.equals("FULL", ignoreCase = true) -> null
-            currentEp.startsWith("Ho\u00E0n t\u1EA5t", ignoreCase = true) -> null
-            else ->
-                Regex("""[Tt]\u1EADp\s*(\d+)""").find(currentEp)?.groupValues?.get(1)?.toIntOrNull()
-                ?: Regex("""(\d+)\s*/\s*\d+""").find(currentEp)?.groupValues?.get(1)?.toIntOrNull()
-        }
-
-        val lang      = item.language ?: ""
-        val hasSub    = lang.contains("Vietsub",     ignoreCase = true)
-        val hasDub    = lang.contains("Thuy\u1EBFt Minh", ignoreCase = true)
-
-        val quality = when (item.quality?.uppercase()) {
-            "FHD", "HD" -> SearchQuality.HD
-            "CAM"       -> SearchQuality.Cam
-            "SD"        -> SearchQuality.SD
-            else        -> SearchQuality.HD
-        }
-
-        return newAnimeSearchResponse(title, href, TvType.TvSeries) {
-            this.posterUrl = poster
-            this.quality   = quality
-            if (episodeCount != null && episodeCount > 0) {
-                addSub(episodeCount)
-            }
-        }
+    val episodeCount: Int? = when {
+        currentEp.equals("FULL", ignoreCase = true) -> null
+        currentEp.startsWith("Ho\u00E0n t\u1EA5t", ignoreCase = true) -> null
+        else ->
+            Regex("""[Tt]\u1EADp\s*(\d+)""").find(currentEp)?.groupValues?.get(1)?.toIntOrNull()
+            ?: Regex("""(\d+)\s*/\s*\d+""").find(currentEp)?.groupValues?.get(1)?.toIntOrNull()
     }
+
+    val lang      = item.language ?: ""
+    val hasSub    = lang.contains("Vietsub",     ignoreCase = true)
+    val hasDub    = lang.contains("Thuy\u1EBFt Minh", ignoreCase = true) ||
+                     lang.contains("L\u1ED3ng Ti\u1EBFng", ignoreCase = true)
+
+    val quality = when (item.quality?.uppercase()) {
+        "FHD", "HD" -> SearchQuality.HD
+        "CAM"       -> SearchQuality.Cam
+        "SD"        -> SearchQuality.SD
+        else        -> SearchQuality.HD
+    }
+
+    return newAnimeSearchResponse(title, href, TvType.TvSeries) {
+        this.posterUrl = poster
+        this.quality   = quality
+
+        // ── Nhãn Vietsub / Thuyết Minh / Lồng Tiếng ──
+        // Trước đây luôn addSub() bất kể ngôn ngữ thực tế -> mất nhãn.
+        // Giờ đọc đúng "language" trả về từ API để hiển thị:
+        //  - Chỉ có phụ đề           -> "Vietsub"  (Sub)
+        //  - Chỉ có thuyết minh/lồng -> "Thuyết Minh" (Dub)
+        //  - Có cả hai               -> "Vietsub" + "Thuyết Minh" (Sub+Dub)
+        //  - Không xác định được     -> fallback về Vietsub (giữ hành vi cũ)
+        val subExist = hasSub || (!hasSub && !hasDub)
+        val dubExist = hasDub
+
+        addDubStatus(
+            dubExist    = dubExist,
+            subExist    = subExist,
+            dubEpisodes = if (dubExist) episodeCount else null,
+            subEpisodes = if (subExist) episodeCount else null
+        )
+    }
+}
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         return if (request.data.startsWith(API_PREFIX)) {
