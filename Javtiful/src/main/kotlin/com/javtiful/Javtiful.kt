@@ -3,16 +3,15 @@ package com.javtiful
 import android.util.Log
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
-import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.utils.AppUtils
+import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.withContext
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.regex.Pattern
@@ -27,12 +26,12 @@ import java.util.regex.Pattern
  *                   URLs are AWS S3-style signed (X-Amz-Expires=3600), so always fetch fresh.
  *
  * Sections supported:
- *  - mainPage: Latest / Trending / Most Viewed / Most Liked / For You
+ *  - mainPage: Latest / Trending / Most Viewed / Most Liked
  *              + Censored / Uncensored / Reducing-mosaic collections
- *              + 12 popular categories (Beautiful Girl, Big Tits, Married Woman ...)
- *              + 12 popular actresses (Hatano Yui, Julia, Tachibana Mary ...)
- *              + 12 popular channels (S-Cute, Idea-Pocket, Faleno ...)
- *  - search  : /vn/search?q={query}&page={page}
+ *              + 12 popular categories
+ *              + 12 popular actresses
+ *              + 12 popular channels
+ *  - search  : /vn/search?q={query}
  *  - load    : metadata + parallel recommendations from actress + first category page
  *  - loadLinks : direct MP4 from `playerSources` array (refreshed each call)
  *
@@ -57,12 +56,19 @@ class Javtiful : MainAPI() {
     /** Vietnamese-language prefix used on every page we render. */
     private val VN = "/vn"
 
+    private val commonHeaders = mapOf(
+        "User-Agent"      to UA,
+        "Accept"          to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language" to "vi-VN,vi;q=0.9,en;q=0.8",
+        "Referer"         to mainUrl + "/"
+    )
+
     // ────────────────────────────────────────────────────────────────────
     //  mainPage
     // ────────────────────────────────────────────────────────────────────
 
     override val mainPage = mainPageOf(
-        // Sort-based listings (single endpoint, just ?sort=…)
+        // Sort-based listings
         "$mainUrl$VN/videos"                                                    to "Mới nhất",
         "$mainUrl$VN/videos?sort=added_today"                                   to "Hôm nay",
         "$mainUrl$VN/videos?sort=added_week"                                    to "Tuần này",
@@ -123,17 +129,20 @@ class Javtiful : MainAPI() {
     )
 
     // ────────────────────────────────────────────────────────────────────
-    //  HTTP helper
+    //  HTTP helper (suspend — app.get() is suspend)
     // ────────────────────────────────────────────────────────────────────
 
-    private fun httpGet(url: String): String {
+    private suspend fun httpGet(url: String): String {
         return try {
-            app.get(url, headers = mapOf("User-Agent" to UA)).text
+            app.get(url, headers = commonHeaders).text
         } catch (t: Throwable) {
             Log.w(TAG, "httpGet failed: $url :: ${t.message}")
             ""
         }
     }
+
+    private suspend fun httpGetDoc(url: String) =
+        Jsoup.parse(httpGet(url), url)
 
     // ────────────────────────────────────────────────────────────────────
     //  Card parsing — single source of truth for list pages
@@ -167,58 +176,38 @@ class Javtiful : MainAPI() {
         }
         if (poster.isNullOrBlank()) poster = img?.attr("src") ?: ""
 
-        // Optional badges
-        val qualityTag  = selectFirst(".front-quality-tag")?.text()?.trim().orEmpty()
-        val durationTag = selectFirst(".front-duration-tag")?.text()?.trim().orEmpty()
-
-        // Views / time-ago (best-effort — used as a numeric hint)
-        val statText = selectFirst(".front-video-stat")?.text()?.trim().orEmpty()
-
-        return newMovieSearchResponse(
-            title  = title,
-            url    = if (href.startsWith("http")) href else mainUrl + href,
-            type   = TvType.NSFW
-        ) {
-            this.posterUrl = if (poster.startsWith("http")) poster
-                             else if (poster.startsWith("/")) mainUrl + poster
-                             else ""
-            // CloudStream's quality string is free-form; map "FHD"→1080p, "HD"→720p etc.
-            this.quality = when (qualityTag.uppercase()) {
-                "4K", "UHD"   -> getQualityValue("4K")
-                "FHD", "1080" -> getQualityValue("FHD")
-                "HD",  "720"  -> getQualityValue("HD")
-                "SD",  "480"  -> getQualityValue("SD")
-                else          -> null
-            }
-        }.also { sr ->
-            // Stash duration & views inside the SearchResponse's tags so we can show
-            // them without an extra round-trip later.
-            if (durationTag.isNotBlank() || statText.isNotBlank()) {
-                sr.tags = listOfNotNull(
-                    durationTag.takeIf { it.isNotBlank() },
-                    statText.takeIf    { it.isNotBlank() }
-                )
-            }
+        val absPoster = when {
+            poster.startsWith("http") -> poster
+            poster.startsWith("/")    -> mainUrl + poster
+            else                      -> ""
         }
-    }
 
-    /** Map a friendly quality tag to a SearchQualities integer. */
-    private fun getQualityValue(tag: String): Int = when (tag.uppercase()) {
-        "4K", "UHD"   -> SearchQualities.P4K.value
-        "FHD", "1080" -> SearchQualities.P1080.value
-        "HD",  "720"  -> SearchQualities.P720.value
-        "SD",  "480"  -> SearchQualities.P480.value
-        else          -> SearchQualities.Unknown.value
+        // Optional quality badge → map to SearchQuality enum
+        val qualityTag = selectFirst(".front-quality-tag")?.text()?.trim().orEmpty()
+        val quality: SearchQuality? = when (qualityTag.uppercase()) {
+            "4K", "UHD"   -> SearchQuality.FourK
+            "FHD", "1080" -> SearchQuality.HD
+            "HD",  "720"  -> SearchQuality.HD
+            "SD",  "480"  -> SearchQuality.SD
+            else          -> null
+        }
+
+        val absUrl = if (href.startsWith("http")) href else mainUrl + href
+
+        return newMovieSearchResponse(title, absUrl, TvType.NSFW) {
+            this.posterUrl = absPoster
+            this.quality   = quality
+        }
     }
 
     /**
      * Fetch a list page and convert every `<article class="front-video-card">`
      * (excluding partner cards) into a SearchResponse.
      */
-    private fun parseListPage(url: String): List<SearchResponse> {
+    private suspend fun parseListPage(url: String): List<SearchResponse> {
         val html = httpGet(url)
         if (html.isBlank()) return emptyList()
-        val doc = app.newDocument(html)
+        val doc = Jsoup.parse(html, url)
         return doc.select("article.front-video-card")
             .mapNotNull { it.toSearchResponse() }
             .distinctBy { it.url }
@@ -233,9 +222,8 @@ class Javtiful : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse {
         val base = request.data
-        // Trending / collections don't really paginate via ?page — they accept it on the same path.
-        val sep   = if (base.contains("?")) "&" else "?"
-        val url   = if (page <= 1) base else "$base${sep}page=$page"
+        val sep  = if (base.contains("?")) "&" else "?"
+        val url  = if (page <= 1) base else "$base${sep}page=$page"
         val items = parseListPage(url)
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
@@ -245,7 +233,7 @@ class Javtiful : MainAPI() {
     // ────────────────────────────────────────────────────────────────────
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val encoded = java.net.URLEncoder.encode(query, "UTF-8")
+        val encoded = URLEncoder.encode(query, "UTF-8")
         return parseListPage("$mainUrl$VN/search?q=$encoded")
     }
 
@@ -256,25 +244,22 @@ class Javtiful : MainAPI() {
     /** JSON shape inside `#frontWatchConfig` — only the fields we actually use. */
     @com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown = true)
     private data class WatchConfig(
-        @JsonProperty("playerSources") val playerSources: List<PlayerSource>? = null,
-        @JsonProperty("videoTitle")    val videoTitle: String?    = null,
-        @JsonProperty("videoPoster")   val videoPoster: String?   = null,
-        @JsonProperty("defaultQuality") val defaultQuality: Int? = null,
-        @JsonProperty("qualityOptions") val qualityOptions: List<Int>? = null
+        @param:JsonProperty("playerSources")  val playerSources: List<PlayerSource>? = null,
+        @param:JsonProperty("videoTitle")     val videoTitle: String?    = null,
+        @param:JsonProperty("videoPoster")    val videoPoster: String?   = null,
+        @param:JsonProperty("defaultQuality") val defaultQuality: Int?   = null,
+        @param:JsonProperty("qualityOptions") val qualityOptions: List<Int>? = null
     )
 
     @com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown = true)
     private data class PlayerSource(
-        @JsonProperty("src")  val src: String?  = null,
-        @JsonProperty("type") val type: String? = null,
-        @JsonProperty("size") val size: Int?    = null
+        @param:JsonProperty("src")  val src: String?  = null,
+        @param:JsonProperty("type") val type: String? = null,
+        @param:JsonProperty("size") val size: Int?    = null
     )
 
     override suspend fun load(url: String): LoadResponse? {
-        val html = httpGet(url) ?: ""
-        if (html.isBlank()) return null
-        val doc = app.newDocument(html)
-
+        val doc = httpGetDoc(url)
         // 1) Pull the player config JSON out of the page.
         val configJson = doc.selectFirst("script#frontWatchConfig")?.data()
             ?: run {
@@ -282,7 +267,7 @@ class Javtiful : MainAPI() {
                 return null
             }
 
-        val config: WatchConfig = tryParseJson(configJson) ?: run {
+        val config: WatchConfig = AppUtils.tryParseJson<WatchConfig>(configJson) ?: run {
             Log.w(TAG, "load: failed to parse WatchConfig JSON")
             return null
         }
@@ -352,8 +337,8 @@ class Javtiful : MainAPI() {
         val censoredChip = doc.selectFirst(".front-watch-meta .front-chip")?.text()?.trim().orEmpty()
 
         // 5) Views & likes — best-effort, page may not always have them
-        val views  = doc.selectFirst("[data-front-views-count]")?.text()?.trim()
-        val likes  = doc.selectFirst("[data-front-likes-count]")?.text()?.trim()
+        val views = doc.selectFirst("[data-front-views-count]")?.text()?.trim()
+        val likes = doc.selectFirst("[data-front-likes-count]")?.text()?.trim()
 
         // 6) Recommendations — pull the in-page "More like this" grid first,
         //    then enhance with parallel fetches from the actress + first category page.
@@ -364,8 +349,12 @@ class Javtiful : MainAPI() {
         // Parallel enhancement — only fetch if we have somewhere to fetch from.
         val enhancedRecs = withContext(Dispatchers.IO) {
             val endpoints = mutableListOf<String>()
-            actressSlugs.firstOrNull()?.let { endpoints.add(if (it.startsWith("http")) it else mainUrl + it) }
-            categorySlugs.firstOrNull()?.let { endpoints.add(if (it.startsWith("http")) it else mainUrl + it) }
+            actressSlugs.firstOrNull()?.let {
+                endpoints.add(if (it.startsWith("http")) it else mainUrl + it)
+            }
+            categorySlugs.firstOrNull()?.let {
+                endpoints.add(if (it.startsWith("http")) it else mainUrl + it)
+            }
 
             val remote = endpoints.map { ep ->
                 async {
@@ -388,21 +377,21 @@ class Javtiful : MainAPI() {
                 append("<p>").append(metaDesc).append("</p>")
             }
             append("<ul>")
-            actress ?.let { append("<li><b>Diễn viên:</b> ").append(it).append("</li>") }
-            channel ?.let { append("<li><b>Kênh:</b> ").append(it).append("</li>") }
+            actress?.let { append("<li><b>Diễn viên:</b> ").append(it).append("</li>") }
+            channel?.let { append("<li><b>Kênh:</b> ").append(it).append("</li>") }
             if (censoredChip.isNotBlank())
                 append("<li><b>Loại:</b> ").append(censoredChip).append("</li>")
             if (categories.isNotEmpty())
                 append("<li><b>Danh mục:</b> ").append(categories.joinToString(", ")).append("</li>")
             if (tags.isNotEmpty())
                 append("<li><b>Thẻ:</b> ").append(tags.joinToString(", ")).append("</li>")
-            addedDate?.let {
+            addedDate?.let { isoDate ->
                 runCatching {
                     val out = SimpleDateFormat("dd/MM/yyyy", Locale.getDefault())
-                        .format(SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US).parse(it))
+                        .format(SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US).parse(isoDate))
                     append("<li><b>Đăng ngày:</b> ").append(out).append("</li>")
                 }.onFailure {
-                    append("<li><b>Đăng ngày:</b> ").append(it).append("</li>")
+                    append("<li><b>Đăng ngày:</b> ").append(isoDate).append("</li>")
                 }
             }
             views?.let { append("<li><b>Lượt xem:</b> ").append(it).append("</li>") }
@@ -410,19 +399,13 @@ class Javtiful : MainAPI() {
             append("</ul>")
         }
 
-        return newMovieLoadResponse(
-            name       = title,
-            url        = url,
-            type       = TvType.NSFW,
-            dataUrl    = url     // we re-fetch the page in loadLinks to refresh signed MP4 URLs
-        ) {
+        val tagList = (categories + tags).distinct().take(20).ifEmpty { null }
+
+        return newMovieLoadResponse(title, url, TvType.NSFW, url) {
             this.posterUrl      = poster
             this.plot           = description
-            this.tags           = (categories + tags).distinct().ifEmpty { null }
+            this.tags           = tagList
             this.recommendations = enhancedRecs.ifEmpty { null }
-            this.actors         = actress?.split(", ")
-                ?.map { Actor(it.trim(), null) }
-                ?.ifEmpty { null }
         }
     }
 
@@ -433,7 +416,7 @@ class Javtiful : MainAPI() {
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
-        subtitleCallback: (SubtitleData) -> Unit,
+        subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val html = httpGet(data)
@@ -453,7 +436,7 @@ class Javtiful : MainAPI() {
         }
         if (configJson.isBlank()) return false
 
-        val config: WatchConfig = tryParseJson(configJson) ?: run {
+        val config: WatchConfig = AppUtils.tryParseJson<WatchConfig>(configJson) ?: run {
             Log.w(TAG, "loadLinks: WatchConfig parse failed")
             return false
         }
@@ -465,26 +448,25 @@ class Javtiful : MainAPI() {
         }
 
         sources.forEach { s ->
-            val src      = s.src ?: return@forEach
-            val srcAbs   = if (src.startsWith("http")) src else mainUrl + src
-            val height   = s.size ?: 0
-            val quality  = when {
-                height >= 2160 -> Qualities.P4K.value
+            val src     = s.src ?: return@forEach
+            val srcAbs  = if (src.startsWith("http")) src else mainUrl + src
+            val height  = s.size ?: 0
+            val quality = when {
+                height >= 2160 -> Qualities.P2160.value
                 height >= 1080 -> Qualities.P1080.value
                 height >= 720  -> Qualities.P720.value
                 height >= 480  -> Qualities.P480.value
                 height >= 360  -> Qualities.P360.value
                 else           -> Qualities.Unknown.value
             }
-            // Quality label that displays nicely in the CloudStream server picker
             val qLabel = if (height > 0) "${height}p" else "Default"
 
             callback(
                 newExtractorLink(
-                    source  = "Javtiful",
-                    name    = "Javtiful · $qLabel",
-                    url     = srcAbs,
-                    type    = MP4_TYPE
+                    "Javtiful",
+                    "Javtiful · $qLabel",
+                    srcAbs,
+                    ExtractorLinkType.VIDEO
                 ) {
                     this.referer = mainUrl
                     this.quality = quality
@@ -498,14 +480,7 @@ class Javtiful : MainAPI() {
             )
         }
 
-        // The site doesn't ship subtitles — but if a future revision adds them,
-        // we'd extract them here. Returning true means "we found at least one link".
+        // Site doesn't ship subtitles. Returning true means we found at least one link.
         return true
     }
-
-    // ────────────────────────────────────────────────────────────────────
-    //  Link type — CloudStream's VIDEO type is for direct MP4/WebM file URLs.
-    //  (M3U8 / DASH have their own dedicated types; this site only ships MP4.)
-    // ────────────────────────────────────────────────────────────────────
-    private val MP4_TYPE = ExtractorLinkType.VIDEO
 }
