@@ -1,5 +1,26 @@
 [
     {
+        "iconUrl": "https://www.animevietsub.love/favicon.ico",
+        "fileHash": "sha256-9810bc0795dadb6cbe16dad8c44e77bd93e2bc76727181b01eb254cdb1436056",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Ann-lryi/Aho-RepoStream",
+        "fileSize": 45199,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "AnimeVietsub"
+        ],
+        "tvTypes": [
+            "Movie",
+            "AnimeMovie"
+        ],
+        "version": 1,
+        "internalName": "AnimeVietsub",
+        "description": "Vietnamese anime streaming site",
+        "url": "https://raw.githubusercontent.com/Ann-lryi/Aho-RepoStream/builds/AnimeVietsub.cs3",
+        "name": "AnimeVietsub"
+    },
+    {
         "iconUrl": "https://hanime1.me/favicon.ico",
         "fileHash": "sha256-aa2f911cce9e793e1d26453705568a4470871f85fc4e384b0a22611bf7173747",
         "apiVersion": 1,
