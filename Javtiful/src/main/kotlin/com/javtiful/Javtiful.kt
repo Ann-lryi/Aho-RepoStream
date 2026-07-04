@@ -51,7 +51,17 @@ import java.util.regex.Pattern
 @CloudstreamPlugin
 class JavtifulPlugin : Plugin() {
     override fun load() {
-        registerMainAPI(JavtifulProvider())
+        val provider = JavtifulProvider()
+        registerMainAPI(provider)
+        // Pre-warm Cloudflare cookies immediately when the plugin loads.
+        // CloudStream loads plugins at app startup — typically 2-3 seconds
+        // BEFORE the user navigates to the home page. By firing the
+        // background WebView NOW, the Cloudflare JS challenge gets solved
+        // during that window, and by the time the user opens the Javtiful
+        // home page, cookies are already cached in OkHttp's jar.
+        // This means the FIRST home page load can succeed instantly,
+        // instead of being empty and requiring a manual refresh.
+        provider.preWarmCloudflareCookies()
     }
 }
 
@@ -182,6 +192,17 @@ class JavtifulProvider : MainAPI() {
                 cfSolving.set(false)
             }
         }
+    }
+
+    /**
+     * Public entry point for the Plugin class to pre-warm Cloudflare cookies
+     * at plugin load time. Called from [JavtifulPlugin.load].
+     * This kicks off the background WebView 2-3 seconds BEFORE the user
+     * opens the home page, so cookies are ready by the time they do.
+     */
+    fun preWarmCloudflareCookies() {
+        Log.i(TAG, "Pre-warming Cloudflare cookies at plugin load")
+        fireBackgroundChallengeSolver()
     }
 
     // ────────────────────────────────────────────────────────────────────
