@@ -11,6 +11,7 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
@@ -83,28 +84,59 @@ class JavtifulProvider : MainAPI() {
     //  Cloudflare bypass
     //
     //  javtiful.com sits behind Cloudflare and serves a JS challenge to
-    //  non-browser clients (especially from certain IP ranges — Vietnam
-    //  mobile carriers get challenged aggressively). OkHttp alone cannot
-    //  solve the challenge because it doesn't execute JavaScript.
+    //  non-browser clients — especially from Vietnam mobile carriers.
+    //  OkHttp alone cannot solve the challenge because it doesn't execute
+    //  JavaScript.
     //
-    //  WebViewResolver launches a real Android WebView, loads the URL,
-    //  lets the JS challenge execute, captures the resulting HTML + cookies,
-    //  and returns them. Subsequent requests to the same host reuse the
-    //  cookies via OkHttp's cookie jar — fast.
+    //  PROBLEM with the naive WebViewResolver interceptor approach:
+    //  WebViewResolver's `shouldInterceptRequest` fires on EVERY request the
+    //  WebView makes, including the FIRST one (before the challenge is solved).
+    //  If `interceptUrl` matches the page URL, it captures the request WITHOUT
+    //  cookies → OkHttp retries without cookies → challenge again → blank page.
     //
-    //  The Regex matches javtiful.com URLs (and only those). We pass this
-    //  interceptor to every app.get() call so the FIRST request to the site
-    //  triggers the WebView, and all later requests are fast OkHttp calls.
+    //  SOLUTION: Use a two-phase approach.
+    //  Phase 1: Try normal OkHttp GET (fast path — works if cookies already
+    //           cached from a previous session, or if Cloudflare isn't
+    //           challenging this IP right now).
+    //  Phase 2: If the response looks like a Cloudflare challenge page,
+    //           launch WebViewResolver with `interceptUrl = "__never_match__"`
+    //           and `useOkhttp = true`. The WebView loads the URL, Cloudflare's
+    //           JS challenge runs, and because `useOkhttp = true`, all sub-
+    //           requests (including the POST that submits the challenge
+    //           solution) go through OkHttp → cookies get set in OkHttp's
+    //           cookie jar. After 8 seconds (enough for challenge to solve),
+    //           retry the original OkHttp GET → now it has cookies → real HTML.
+    //
+    //  The `cfMutex` ensures only ONE WebView challenge-solving session runs
+    //  at a time, even if 3 home-page sections fire simultaneously. The other
+    //  2 sections wait for the mutex, then retry OkHttp with the now-cached
+    //  cookies — fast.
     // ────────────────────────────────────────────────────────────────────
 
-    private val cfInterceptor = WebViewResolver(
-        interceptUrl = Regex("""https?://([a-z0-9-]+\.)*javtiful\.com(/.*)?"""),
-        // useOkhttp = true (default): try OkHttp first, only fall back to WebView
-        // if a Cloudflare challenge is detected. This keeps fast paths fast.
-        // timeout = 30s: the JS challenge usually resolves in 1-3 seconds;
-        // 30s is the safety ceiling for slow mobile networks.
-        timeout = 30_000L
+    /** WebViewResolver that NEVER matches its interceptUrl — used only to
+     *  drive a WebView long enough for Cloudflare to set cookies via the
+     *  OkHttp sub-request path. */
+    private val cfWebView = WebViewResolver(
+        interceptUrl = Regex("""__cf_never_match__"""),
+        useOkhttp = true,          // route sub-requests through OkHttp → cookies get set
+        timeout = 12_000L          // 12s — challenge usually solves in 1-3s, 12s is safety ceiling
     )
+
+    /** Mutex so only one challenge-solving WebView runs at a time. */
+    private val cfMutex = kotlinx.coroutines.sync.Mutex()
+
+    /** Quick check: does this HTML look like a Cloudflare challenge page? */
+    private fun looksLikeChallenge(html: String): Boolean {
+        // Cloudflare challenge pages always contain one of these markers
+        return html.contains("Just a moment...", ignoreCase = true) ||
+               html.contains("cf-challenge", ignoreCase = true) ||
+               html.contains("_cf_chl_opt", ignoreCase = true) ||
+               html.contains("cf-mitigated", ignoreCase = true) ||
+               html.contains("challenge-platform", ignoreCase = true) ||
+               // A real javtiful list page always has video cards;
+               // a challenge page does not.
+               (html.length < 2000 && !html.contains("front-video-card"))
+    }
 
     // ────────────────────────────────────────────────────────────────────
     //  mainPage
@@ -139,31 +171,83 @@ class JavtifulProvider : MainAPI() {
     // ────────────────────────────────────────────────────────────────────
     //  HTTP helper (suspend — app.get() is suspend)
     //
-    //  Every request goes through cfInterceptor (WebViewResolver):
-    //    - First request: WebView loads the page, solves the Cloudflare JS
-    //      challenge, captures cookies. Takes 2-5 seconds but only happens
-    //      ONCE per app session — cookies persist in OkHttp's cookie jar.
-    //    - Subsequent requests: interceptor sees a normal 200 response,
-    //      passes it straight through (no WebView overhead).
+    //  Two-phase Cloudflare bypass:
+    //    Phase 1: Normal OkHttp GET (fast — 0.5-1s if cookies cached)
+    //    Phase 2: If Phase 1 returns a challenge page, launch WebView to
+    //             solve challenge (sets cookies in OkHttp jar), then retry.
     //
-    //  cacheTime = 300 (5 min) ensures repeat visits to the home page are
-    //  instant even if cookies expired.
+    //  The `cfMutex` ensures only ONE WebView runs at a time across all
+    //  concurrent section requests. The other sections block on the mutex
+    //  for ~3s, then their Phase-1 retry succeeds with the now-cached
+    //  cookies — so they don't each spawn their own WebView.
     // ────────────────────────────────────────────────────────────────────
 
     private suspend fun httpGet(url: String): String {
-        return try {
+        // ── Phase 1: try plain OkHttp ──
+        var html = try {
             app.get(
                 url,
-                headers     = commonHeaders,
-                interceptor = cfInterceptor,
-                timeout     = 30_000L,              // 30s — WebView challenge needs time
-                cacheTime   = listCacheTime,        // cache 5 minutes
-                cacheUnit   = java.util.concurrent.TimeUnit.SECONDS
+                headers   = commonHeaders,
+                timeout   = 8_000L,
+                cacheTime = listCacheTime,
+                cacheUnit = java.util.concurrent.TimeUnit.SECONDS
             ).text
         } catch (t: Throwable) {
-            Log.w(TAG, "httpGet failed: $url :: ${t.message}")
+            Log.w(TAG, "httpGet phase 1 failed: $url :: ${t.message}")
             ""
         }
+
+        // Fast path: got real content, return immediately
+        if (html.isNotBlank() && !looksLikeChallenge(html)) {
+            return html
+        }
+
+        // ── Phase 2: Cloudflare challenge detected — solve via WebView ──
+        // Use mutex so only 1 WebView runs at a time. Other concurrent
+        // requests that also hit challenge will wait here, then retry
+        // OkHttp (which by then has cookies from the first WebView).
+        cfMutex.withLock {
+            // After acquiring the lock, retry OkHttp FIRST — another section
+            // may have already solved the challenge while we were waiting.
+            html = try {
+                app.get(
+                    url,
+                    headers   = commonHeaders,
+                    timeout   = 8_000L,
+                    cacheTime = 0   // bypass cache — we want fresh response with new cookies
+                ).text
+            } catch (t: Throwable) {
+                Log.w(TAG, "httpGet phase 2 retry failed: $url :: ${t.message}")
+                ""
+            }
+            if (html.isNotBlank() && !looksLikeChallenge(html)) {
+                return html
+            }
+
+            // Still challenged — launch the WebView to solve it.
+            Log.i(TAG, "Solving Cloudflare challenge for $url")
+            try {
+                cfWebView.resolveUsingWebView(url, referer = mainUrl)
+            } catch (t: Throwable) {
+                Log.w(TAG, "WebView challenge solver failed: ${t.message}")
+            }
+
+            // Final retry — cookies should now be set in OkHttp's jar.
+            html = try {
+                app.get(
+                    url,
+                    headers   = commonHeaders,
+                    timeout   = 8_000L,
+                    cacheTime = listCacheTime,
+                    cacheUnit = java.util.concurrent.TimeUnit.SECONDS
+                ).text
+            } catch (t: Throwable) {
+                Log.w(TAG, "httpGet final retry failed: $url :: ${t.message}")
+                ""
+            }
+        }
+
+        return html
     }
 
     private suspend fun httpGetDoc(url: String) =
