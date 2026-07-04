@@ -386,13 +386,13 @@ class Javtiful : MainAPI() {
             if (tags.isNotEmpty())
                 append("<li><b>Thẻ:</b> ").append(tags.joinToString(", ")).append("</li>")
             addedDate?.let { isoDate ->
-                runCatching {
-                    val out = SimpleDateFormat("dd/MM/yyyy", Locale.getDefault())
-                        .format(SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US).parse(isoDate))
-                    append("<li><b>Đăng ngày:</b> ").append(out).append("</li>")
-                }.onFailure {
-                    append("<li><b>Đăng ngày:</b> ").append(isoDate).append("</li>")
-                }
+                val formatted = runCatching {
+                    val parsed = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US).parse(isoDate)
+                    if (parsed == null) null
+                    else SimpleDateFormat("dd/MM/yyyy", Locale.getDefault()).format(parsed)
+                }.getOrNull()
+                val display = formatted ?: isoDate
+                append("<li><b>Đăng ngày:</b> ").append(display).append("</li>")
             }
             views?.let { append("<li><b>Lượt xem:</b> ").append(it).append("</li>") }
             likes?.let { append("<li><b>Lượt thích:</b> ").append(it).append("</li>") }
