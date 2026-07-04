@@ -3,6 +3,8 @@ package com.javtiful
 import android.util.Log
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
+import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.AppUtils
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.Dispatchers
@@ -37,7 +39,20 @@ import java.util.regex.Pattern
  *
  * Card filter: skip `<article class="front-video-card front-partner-card">` (ad cards).
  */
-class Javtiful : MainAPI() {
+/**
+ * Plugin entry point — the CloudStream Gradle plugin scans for a class
+ * annotated with `@CloudstreamPlugin` and uses it as the registration hook.
+ * Without this class, the build fails with:
+ *   "No plugin class annotated with @CloudstreamPlugin was found"
+ */
+@CloudstreamPlugin
+class JavtifulPlugin : Plugin() {
+    override fun load() {
+        registerMainAPI(JavtifulProvider())
+    }
+}
+
+class JavtifulProvider : MainAPI() {
     override var mainUrl              = "https://javtiful.com"
     override var name                 = "Javtiful"
     override val supportedTypes       = setOf(TvType.NSFW)
