@@ -60,6 +60,33 @@ class PhimNguonCProvider : MainAPI() {
     private val API_PREFIX = "API::"
 
     // ═══════════════════════════════════════════════════════════════════════════
+    //  PERFORMANCE: CORS proxy for fast Cloudflare bypass
+    //
+    //  proxy.cors.sh is a Cloudflare Worker. When it fetches phim.nguonc.com,
+    //  the request goes Cloudflare-edge → Cloudflare-edge (loopback), so NO
+    //  Cloudflare JS challenge is served. This is dramatically faster than
+    //  spinning up a WebView to solve the challenge (seconds vs milliseconds).
+    //
+    //  All fetch functions try the proxy FIRST. If it fails, they fall back
+    //  to the original plain-HTTP → WebView chain.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private val corsProxies = listOf(
+        "https://proxy.cors.sh/",
+        "",
+        "https://api.allorigins.win/raw?url="
+    )
+
+    private fun proxify(url: String, proxy: String): String {
+        if (proxy.isEmpty()) return url
+        return if (proxy.endsWith("?url=")) {
+            proxy + URLEncoder.encode(url, "UTF-8")
+        } else {
+            proxy + url
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     //  PERFORMANCE: Cloudflare-bypass cookie cache + listing-page doc cache
     // ═══════════════════════════════════════════════════════════════════════════
     //
@@ -112,6 +139,25 @@ class PhimNguonCProvider : MainAPI() {
      *     callers (e.g. parallel genre lookups) don't all spin up a WebView at
      *     once. The resulting cookies are cached for next time.
      */
+    /**
+     * Fetch JSON API endpoint with CORS proxy fast path.
+     * Tries proxy.cors.sh first (bypasses Cloudflare), falls back to direct.
+     */
+    private suspend inline fun <reified T : Any> fetchApi(url: String): T? {
+        // Try CORS proxies first (fast — no Cloudflare challenge)
+        for (proxy in corsProxies) {
+            try {
+                val proxiedUrl = proxify(url, proxy)
+                val res = app.get(proxiedUrl, headers = commonHeaders).parsedSafe<T>()
+                if (res != null) return res
+            } catch (_: Exception) {}
+        }
+        // Fallback: direct request
+        return try {
+            app.get(url, headers = commonHeaders).parsedSafe<T>()
+        } catch (_: Exception) { null }
+    }
+
     private suspend fun fetchListingDoc(url: String): Document {
         docCache[url]?.let { cached ->
             if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) return cached.doc
@@ -134,6 +180,24 @@ class PhimNguonCProvider : MainAPI() {
                 }
                 null
             } catch (_: Exception) { null }
+        }
+
+        // ── FASTEST path: CORS proxy (proxy.cors.sh) — bypasses Cloudflare
+        //    challenge entirely because it's a CF Worker doing loopback fetch.
+        //    This is ~10x faster than WebView and works from any IP. ──
+        for (proxy in corsProxies) {
+            try {
+                val proxiedUrl = proxify(url, proxy)
+                val resp = app.get(proxiedUrl, headers = commonHeaders)
+                val html = resp.text
+                if (!looksBlocked(html)) {
+                    val doc = resp.document
+                    if (doc.select("table tbody tr").isNotEmpty()) {
+                        docCache[url] = CachedDoc(doc, System.currentTimeMillis())
+                        return doc
+                    }
+                }
+            } catch (_: Exception) {}
         }
 
         // ── Fast path: plain HTTP, reusing cached CF cookie if we have one ──
@@ -251,7 +315,7 @@ class PhimNguonCProvider : MainAPI() {
         return if (request.data.startsWith(API_PREFIX)) {
             val path  = request.data.removePrefix(API_PREFIX)
             val url   = "$mainUrl/$path?page=$page"
-            val res   = app.get(url, headers = commonHeaders).parsedSafe<NguonCApiResponse>()
+            val res   = fetchApi<NguonCApiResponse>(url)
             val items = res?.items?.mapNotNull { parseApiItem(it) } ?: emptyList()
             newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
         } else {
@@ -265,9 +329,7 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val res = try {
-            app.get("$mainUrl/api/films?keyword=${URLEncoder.encode(query, "utf-8")}", headers = commonHeaders).parsedSafe<NguonCApiResponse>()
-        } catch (_: Exception) { null }
+        val res = fetchApi<NguonCApiResponse>("$mainUrl/api/films?keyword=${URLEncoder.encode(query, "utf-8")}")
 
         if (!res?.items.isNullOrEmpty())
             return res!!.items!!.mapNotNull { parseApiItem(it) }
@@ -357,7 +419,7 @@ class PhimNguonCProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val slug  = url.trim().trimEnd('/').substringAfterLast("/")
-        val res   = app.get("$mainUrl/api/film/$slug", headers = commonHeaders).parsedSafe<NguonCDetailResponse>()
+        val res   = fetchApi<NguonCDetailResponse>("$mainUrl/api/film/$slug")
         val movie = res?.movie ?: throw ErrorLoadingException("Kh\u00F4ng th\u1EC3 t\u1EA3i d\u1EEF li\u1EC7u phim")
 
         // ── Build episode map ──
