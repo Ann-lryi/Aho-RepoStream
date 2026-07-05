@@ -127,7 +127,9 @@ class AnimeVietsubProvider : MainAPI() {
         "User-Agent"          to USER_AGENT,
         "Accept"              to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Language"     to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding"     to "gzip, deflate, br",
+        // NOTE: Do NOT set Accept-Encoding manually.
+        // OkHttp automatically adds "Accept-Encoding: gzip" AND auto-decompresses.
+        // Setting it manually disables OkHttp's auto-decompression → garbled text.
         "Sec-Ch-Ua"           to "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\"",
         "Sec-Ch-Ua-Mobile"    to "?1",
         "Sec-Ch-Ua-Platform"  to "\"Android\"",
