@@ -1,6 +1,7 @@
 package com.animevietsub
 
 import android.util.Log
+import android.webkit.CookieManager
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
@@ -101,6 +102,27 @@ class AnimeVietsubProvider : MainAPI() {
         "Accept"          to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     )
 
+    /** Cached Cloudflare cookies extracted from WebView CookieManager.
+     *  Updated by [syncCookiesFromWebView] after the background solver runs. */
+    @Volatile private var cachedCfCookies: String? = null
+
+    /** Extract cf_clearance + other cookies from Android WebView's CookieManager
+     *  and cache them for use in OkHttp requests. */
+    private fun syncCookiesFromWebView() {
+        try {
+            val cookieManager = CookieManager.getInstance()
+            val cookies: String? = cookieManager.getCookie(mainUrl)
+            if (!cookies.isNullOrBlank()) {
+                println("[AVSB] Synced cookies from WebView: ${cookies.substring(0, minOf(80, cookies.length))}...")
+                cachedCfCookies = cookies
+            } else {
+                println("[AVSB] No cookies found in WebView CookieManager for $mainUrl")
+            }
+        } catch (e: Exception) {
+            println("[AVSB] Cookie sync failed: ${e.message}")
+        }
+    }
+
     /** Detect Cloudflare challenge page.
      *  IMPORTANT: The CF Turnstile challenge page is ~888K chars (lots of
      *  CSS/font data). Real animevietsub pages are 150K-480K. Size > 700K
@@ -141,7 +163,10 @@ class AnimeVietsubProvider : MainAPI() {
         bgScope.launch {
             try {
                 cfWebView.resolveUsingWebView(mainUrl, referer = mainUrl)
-                println("[AVSB] Background Turnstile solver finished — cookies should be cached")
+                println("[AVSB] Background Turnstile solver finished — syncing cookies")
+                // After WebView finishes, extract cf_clearance from WebView's
+                // CookieManager and cache it for OkHttp requests.
+                syncCookiesFromWebView()
             } catch (t: Throwable) {
                 println("[AVSB] Background Turnstile solver failed: ${t.message}")
             } finally {
@@ -152,16 +177,23 @@ class AnimeVietsubProvider : MainAPI() {
 
     /**
      * HTTP GET with Cloudflare Turnstile bypass.
-     * Phase 1: Fast OkHttp GET (1.5s timeout — under CloudStream's 2s deadline)
+     * Phase 1: OkHttp with cached cf_clearance cookie (fast — works if solver already ran)
      * Phase 2: If challenged, fire background WebView, return empty for this request
      */
     private suspend fun httpGet(url: String): String {
+        // Build headers — add cached CF cookies if available
+        val headers = if (cachedCfCookies != null) {
+            commonHeaders + ("Cookie" to cachedCfCookies!!)
+        } else {
+            commonHeaders
+        }
+
         val html = try {
             app.get(
                 url,
-                headers = commonHeaders,
-                timeout = 1_500L,
-                cacheTime = 300,
+                headers = headers,
+                timeout = 5_000L,
+                cacheTime = 0,  // don't cache — we want fresh response with cookies
                 cacheUnit = java.util.concurrent.TimeUnit.SECONDS
             ).text
         } catch (e: kotlinx.coroutines.CancellationException) {
