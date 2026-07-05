@@ -91,7 +91,7 @@ class AnimeVietsubProvider : MainAPI() {
 
     private val cfWebView: WebViewResolver by lazy {
         WebViewResolver(
-            interceptUrl = Regex("""\.^"""), // Match nothing
+            interceptUrl = Regex("""__cf_never_match__"""), // Match nothing
             additionalUrls = listOf(Regex(""".*""")), // Match everything to test requestCallBack
             useOkhttp = false,           // FALSE: let WebView handle all requests natively
             timeout = 15_000L            // 15s — Turnstile managed challenge needs 5-10s
@@ -197,8 +197,15 @@ class AnimeVietsubProvider : MainAPI() {
             try {
                 println("[AVSB] Blocking Turnstile solver starting")
                 cfWebView.resolveUsingWebView(mainUrl, referer = mainUrl) { req ->
-                    val cookie = android.webkit.CookieManager.getInstance().getCookie(req.url.toString())
-                    cookie?.contains("cf_clearance") == true
+                    val cookieUrl = req.url.toString()
+                    val cookie = android.webkit.CookieManager.getInstance().getCookie(cookieUrl)
+                    val baseCookie = android.webkit.CookieManager.getInstance().getCookie(mainUrl)
+                    if ((cookie != null && cookie.contains("cf_clearance")) || (baseCookie != null && baseCookie.contains("cf_clearance"))) {
+                        println("[AVSB] Found cf_clearance — stopping WebView")
+                        true
+                    } else {
+                        false
+                    }
                 }
                 println("[AVSB] Blocking Turnstile solver finished — syncing cookies")
             } catch (t: Throwable) {
