@@ -82,22 +82,18 @@ class AnimeVietsubProvider : MainAPI() {
 
     private val cfWebView: WebViewResolver by lazy {
         WebViewResolver(
-            // CRITICAL FIX: interceptUrl matches sub-resource URLs (.css, .js, .jpg)
-            // that ONLY load AFTER the Turnstile challenge solves and the real page
-            // renders. The initial challenge page (888K) has all CSS/JS inline —
-            // it does NOT request external .css/.js files from animevietsub.pl.
-            // So this regex will NOT match the initial request (avoiding the 0ms
-            // capture bug). It will ONLY match when the real page loads and
-            // requests external resources — at which point cookies are set.
-            //
-            // The captured Request object has a Cookie header with cf_clearance.
-            // We extract that cookie and use it for OkHttp requests.
+            // interceptUrl matches sub-resource URLs that load AFTER
+            // the challenge solves and the real page renders.
+            // Captured Request has Cookie header with cf_clearance.
             interceptUrl = Regex("""animevietsub\.(pl|love)/.*\.(css|js|jpg|png|woff)"""),
-            // Real Chrome UA — NO "; wv" suffix (Cloudflare blocks WebViews)
-            userAgent = "Mozilla/5.0 (Linux; Android 13; Pixel 7) " +
-                        "AppleWebKit/537.36 (KHTML, like Gecko) " +
-                        "Chrome/138.0.0.0 Mobile Safari/537.36",
-            useOkhttp = false,
+            // DO NOT set userAgent. Cloudflare's challenge JS verifies UA
+            // vs browser capabilities. Setting a fake Chrome UA causes
+            // Cloudflare to detect the mismatch and NOT serve the challenge
+            // script → challenge never solves.
+            userAgent = null,
+            // useOkhttp=true: route sub-resources through OkHttp so the
+            // Cloudflare challenge script loads and executes in WebView.
+            useOkhttp = true,
             script = """
                 (function() {
                     var attempts = 0;
