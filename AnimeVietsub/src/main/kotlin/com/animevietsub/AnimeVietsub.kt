@@ -111,7 +111,7 @@ class AnimeVietsubProvider : MainAPI() {
                     }, 500);
                 })();
             """,
-            timeout = 25_000L
+            timeout = 15_000L
         )
     }
 
@@ -288,6 +288,12 @@ class AnimeVietsubProvider : MainAPI() {
             return html
         }
 
+        // Log the challenge response content for debugging
+        if (html.isNotBlank()) {
+            val preview = html.take(200).replace("\n", " ").replace("\r", "")
+            println("[AVSB] Challenge response preview: $preview")
+        }
+
         // Challenge detected. Fire background solver if not already running.
         if (cfSolving.compareAndSet(false, true)) {
             // We set the flag — start the solver
@@ -304,7 +310,7 @@ class AnimeVietsubProvider : MainAPI() {
         // CloudStream's timeout is 60s — so we CAN wait here.
         println("[AVSB] Waiting for background solver to finish...")
         var waited = 0
-        while (waited < 25_000 && cachedCfCookies == null && cfSolving.get()) {
+        while (waited < 15_000 && cachedCfCookies == null && cfSolving.get()) {
             kotlinx.coroutines.delay(500)
             waited += 500
         }
