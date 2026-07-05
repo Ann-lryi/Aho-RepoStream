@@ -123,15 +123,21 @@ class AnimeVietsubProvider : MainAPI() {
         }
     }
 
-    /** Detect Cloudflare challenge page.
-     *  IMPORTANT: The CF Turnstile challenge page is ~888K chars (lots of
-     *  CSS/font data). Real animevietsub pages are 150K-480K. Size > 700K
-     *  is a reliable challenge indicator even if string matching fails. */
+    /** Detect Cloudflare challenge page, IP block page, or server error page.
+     *  IMPORTANT: animevietsub serves several types of non-content pages:
+     *  - CF Turnstile challenge: ~888K chars (CSS + font data)
+     *  - IP block page: ~798 chars ("IP Bị Chặn")
+     *  - Server error page: ~807 chars ("Lỗi Server 5xx")
+     *  Real animevietsub pages are 150K-480K with .TPostMv cards.
+     *  Any page < 2000 chars is definitely NOT real content. */
     private fun looksLikeChallenge(html: String): Boolean {
         if (html.isBlank() || html.length < 500) return true
-        // Size check: challenge pages are consistently ~880K-895K chars
-        // Real pages are 150K-480K. 700K is a safe threshold.
+        // Size check: challenge pages are ~880K-895K chars
         if (html.length > 700_000) return true
+        // Small pages (< 2000 chars) are never real content — they're
+        // IP block pages, server error pages, or redirect stubs
+        if (html.length < 2000) return true
+        // CF challenge markers
         return html.contains("Just a moment...", ignoreCase = true) ||
                html.contains("cf-challenge", ignoreCase = true) ||
                html.contains("_cf_chl_opt", ignoreCase = true) ||
@@ -145,7 +151,11 @@ class AnimeVietsubProvider : MainAPI() {
                html.contains("IP Bị Chặn", ignoreCase = true) ||
                html.contains("Xác Minh", ignoreCase = true) ||
                html.contains("captcha-placeholder", ignoreCase = true) ||
-               html.contains("Turnstile", ignoreCase = true)
+               html.contains("Turnstile", ignoreCase = true) ||
+               html.contains("Lỗi Server", ignoreCase = true) ||
+               html.contains("5xx", ignoreCase = true) ||
+               html.contains("unknown error", ignoreCase = true) ||
+               html.contains("bị chặn", ignoreCase = true)
     }
 
     /**
