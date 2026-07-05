@@ -60,16 +60,30 @@ class AnimeVietsubProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════
     //  Cloudflare Turnstile bypass — fire-and-forget background WebView
     //
+    //  CRITICAL: useOkhttp = FALSE
+    //  Cloudflare Turnstile's challenge JS makes XHR/fetch requests to
+    //  /cdn-cgi/challenge-platform/ to solve the challenge. With useOkhttp=true,
+    //  these requests route through OkHttp which doesn't have cf_clearance →
+    //  they get challenged again → challenge never solves.
+    //
+    //  With useOkhttp=false, the WebView handles ALL requests natively:
+    //    1. WebView loads animevietsub.pl → gets Turnstile challenge page
+    //    2. Challenge JS runs in WebView's JS engine
+    //    3. JS makes XHR to /cdn-cgi/challenge-platform/ → handled by WebView
+    //    4. Challenge solves → cf_clearance cookie set in WebView CookieManager
+    //    5. WebView redirects to real page
+    //    6. CookieManager syncs to OkHttp's cookie jar (CloudStream does this)
+    //    7. Future OkHttp requests now have cf_clearance → succeed
+    //
     //  interceptUrl = "__never_match__" → WebView runs to completion (15s),
-    //  useOkhttp = true → sub-requests route through OkHttp → cf_clearance
-    //  cookie gets set in OkHttp's cookie jar → future OkHttp requests work.
+    //  giving Turnstile time to auto-solve (usually 5-10s).
     // ═══════════════════════════════════════════════════════════════════════
 
     private val cfWebView: WebViewResolver by lazy {
         WebViewResolver(
             interceptUrl = Regex("""__cf_never_match__"""),
-            useOkhttp = true,
-            timeout = 15_000L
+            useOkhttp = false,           // ← FALSE: let WebView handle all requests natively
+            timeout = 20_000L            // 20s — Turnstile managed challenge needs 5-10s
         )
     }
 
@@ -110,14 +124,17 @@ class AnimeVietsubProvider : MainAPI() {
      * auto-solves (managed challenge), and cf_clearance cookie gets set.
      */
     private fun fireBackgroundChallengeSolver() {
-        if (!cfSolving.compareAndSet(false, true)) return
+        if (!cfSolving.compareAndSet(false, true)) {
+            println("[AVSB] Background solver already running, skipping")
+            return
+        }
+        println("[AVSB] Background Turnstile solver starting")
         bgScope.launch {
             try {
-                Log.i(TAG, "Background Turnstile solver starting")
                 cfWebView.resolveUsingWebView(mainUrl, referer = mainUrl)
-                Log.i(TAG, "Background Turnstile solver finished")
+                println("[AVSB] Background Turnstile solver finished — cookies should be cached")
             } catch (t: Throwable) {
-                Log.w(TAG, "Background Turnstile solver failed: ${t.message}")
+                println("[AVSB] Background Turnstile solver failed: ${t.message}")
             } finally {
                 cfSolving.set(false)
             }
@@ -141,15 +158,16 @@ class AnimeVietsubProvider : MainAPI() {
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
-            Log.w(TAG, "httpGet OkHttp failed: $url :: ${e.message}")
+            println("[AVSB] httpGet OkHttp failed: $url :: ${e.message}")
             ""
         }
 
         if (html.isNotBlank() && !looksLikeChallenge(html)) {
+            println("[AVSB] httpGet SUCCESS: $url (${html.length} chars)")
             return html
         }
 
-        Log.i(TAG, "Turnstile challenge detected for $url — firing background solver")
+        println("[AVSB] Turnstile challenge detected for $url (html=${html.length} chars) — firing background solver")
         fireBackgroundChallengeSolver()
         return ""
     }
