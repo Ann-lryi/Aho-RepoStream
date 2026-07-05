@@ -45,7 +45,7 @@ class AnimeVietsubPlugin : Plugin() {
 }
 
 class AnimeVietsubProvider : MainAPI() {
-    override var mainUrl = "https://animevietsub.love"
+    override var mainUrl = "https://animevietsub.pl"
     override var name = "AnimeVietsub"
     override var lang = "vi"
     override val hasMainPage = true
@@ -101,9 +101,15 @@ class AnimeVietsubProvider : MainAPI() {
         "Accept"          to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     )
 
-    /** Detect Cloudflare challenge page. */
+    /** Detect Cloudflare challenge page.
+     *  IMPORTANT: The CF Turnstile challenge page is ~888K chars (lots of
+     *  CSS/font data). Real animevietsub pages are 150K-480K. Size > 700K
+     *  is a reliable challenge indicator even if string matching fails. */
     private fun looksLikeChallenge(html: String): Boolean {
         if (html.isBlank() || html.length < 500) return true
+        // Size check: challenge pages are consistently ~880K-895K chars
+        // Real pages are 150K-480K. 700K is a safe threshold.
+        if (html.length > 700_000) return true
         return html.contains("Just a moment...", ignoreCase = true) ||
                html.contains("cf-challenge", ignoreCase = true) ||
                html.contains("_cf_chl_opt", ignoreCase = true) ||
@@ -114,7 +120,10 @@ class AnimeVietsubProvider : MainAPI() {
                html.contains("/cdn-cgi/challenge-platform/", ignoreCase = true) ||
                html.contains("cf-spinner-please-wait", ignoreCase = true) ||
                html.contains("cf-turnstile", ignoreCase = true) ||
-               html.contains("IP Bị Chặn", ignoreCase = true)
+               html.contains("IP Bị Chặn", ignoreCase = true) ||
+               html.contains("Xác Minh", ignoreCase = true) ||
+               html.contains("captcha-placeholder", ignoreCase = true) ||
+               html.contains("Turnstile", ignoreCase = true)
     }
 
     /**
