@@ -140,22 +140,25 @@ class PhimNguonCProvider : MainAPI() {
      *     once. The resulting cookies are cached for next time.
      */
     /**
-     * Fetch JSON API endpoint with CORS proxy fast path.
-     * Tries proxy.cors.sh first (bypasses Cloudflare), falls back to direct.
+     * Fetch JSON API endpoint — direct first (fastest), proxy as fallback.
+     * Direct connection to phim.nguonc.com is ~0.1s, proxy is ~2.5s.
      */
     private suspend inline fun <reified T : Any> fetchApi(url: String): T? {
-        // Try CORS proxies first (fast — no Cloudflare challenge)
+        // Try direct first (fastest — phim.nguonc.com usually doesn't block)
+        try {
+            val res = app.get(url, headers = commonHeaders).parsedSafe<T>()
+            if (res != null) return res
+        } catch (_: Exception) {}
+        // Fallback: CORS proxies (slower but bypasses Cloudflare if blocked)
         for (proxy in corsProxies) {
+            if (proxy.isEmpty()) continue  // already tried direct above
             try {
                 val proxiedUrl = proxify(url, proxy)
                 val res = app.get(proxiedUrl, headers = commonHeaders).parsedSafe<T>()
                 if (res != null) return res
             } catch (_: Exception) {}
         }
-        // Fallback: direct request
-        return try {
-            app.get(url, headers = commonHeaders).parsedSafe<T>()
-        } catch (_: Exception) { null }
+        return null
     }
 
     private suspend fun fetchListingDoc(url: String): Document {
@@ -182,10 +185,17 @@ class PhimNguonCProvider : MainAPI() {
             } catch (_: Exception) { null }
         }
 
-        // ── FASTEST path: CORS proxy (proxy.cors.sh) — bypasses Cloudflare
-        //    challenge entirely because it's a CF Worker doing loopback fetch.
-        //    This is ~10x faster than WebView and works from any IP. ──
+        // ── Fastest path: direct plain HTTP (phim.nguonc.com is ~0.1s direct) ──
+        val cachedCookies = cfCookieCache[mainUrl]
+        if (cachedCookies != null) {
+            tryPlain(cachedCookies)?.let { return it }
+        } else {
+            tryPlain(null)?.let { return it }
+        }
+
+        // ── Fallback: CORS proxy (slower ~2.5s but bypasses Cloudflare if blocked) ──
         for (proxy in corsProxies) {
+            if (proxy.isEmpty()) continue  // already tried direct above
             try {
                 val proxiedUrl = proxify(url, proxy)
                 val resp = app.get(proxiedUrl, headers = commonHeaders)
@@ -200,15 +210,7 @@ class PhimNguonCProvider : MainAPI() {
             } catch (_: Exception) {}
         }
 
-        // ── Fast path: plain HTTP, reusing cached CF cookie if we have one ──
-        val cachedCookies = cfCookieCache[mainUrl]
-        if (cachedCookies != null) {
-            tryPlain(cachedCookies)?.let { return it }
-        } else {
-            tryPlain(null)?.let { return it }
-        }
-
-        // ── Slow path: WebView bypass, serialized ──
+        // ── Last resort: WebView bypass, serialized ──
         return cfMutex.withLock {
             // Someone else may have solved it while we were waiting for the lock.
             docCache[url]?.let { cached ->
