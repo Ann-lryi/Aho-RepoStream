@@ -56,7 +56,7 @@ class AnimeVietsubProvider : MainAPI() {
     private val TAG = "AnimeVietsub"
 
     private val USER_AGENT =
-        "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36"
+        "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
     // ═══════════════════════════════════════════════════════════════════════
     //  Cloudflare Turnstile bypass — fire-and-forget background WebView
@@ -82,32 +82,9 @@ class AnimeVietsubProvider : MainAPI() {
 
     private val cfWebView: WebViewResolver by lazy {
         WebViewResolver(
-            // interceptUrl matches sub-resource URLs that load AFTER
-            // the challenge solves and the real page renders.
-            // Captured Request has Cookie header with cf_clearance.
-            interceptUrl = Regex("""animevietsub\.(pl|love)/.*\.(css|js|jpg|png|woff)"""),
-            // DO NOT set userAgent. Cloudflare's challenge JS verifies UA
-            // vs browser capabilities. Setting a fake Chrome UA causes
-            // Cloudflare to detect the mismatch and NOT serve the challenge
-            // script → challenge never solves.
-            userAgent = null,
-            // useOkhttp=true: route sub-resources through OkHttp so the
-            // Cloudflare challenge script loads and executes in WebView.
-            useOkhttp = true,
-            script = """
-                (function() {
-                    var attempts = 0;
-                    var interval = setInterval(function() {
-                        attempts++;
-                        var ts = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-                        if (ts) { try { ts.click(); } catch(e) {} }
-                        var btn = document.querySelector('.cf-turnstile, [role="button"]');
-                        if (btn) btn.click();
-                        if (attempts > 20) clearInterval(interval);
-                    }, 500);
-                })();
-            """,
-            timeout = 15_000L
+            interceptUrl = Regex("""__cf_never_match__"""),
+            useOkhttp = false,           // ← FALSE: let WebView handle all requests natively
+            timeout = 20_000L            // 20s — Turnstile managed challenge needs 5-10s
         )
     }
 
@@ -120,20 +97,9 @@ class AnimeVietsubProvider : MainAPI() {
     private val cfSolving = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private val commonHeaders = mapOf(
-        "User-Agent"          to USER_AGENT,
-        "Accept"              to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "Accept-Language"     to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-        // NOTE: Do NOT set Accept-Encoding manually.
-        // OkHttp automatically adds "Accept-Encoding: gzip" AND auto-decompresses.
-        // Setting it manually disables OkHttp's auto-decompression → garbled text.
-        "Sec-Ch-Ua"           to "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\"",
-        "Sec-Ch-Ua-Mobile"    to "?1",
-        "Sec-Ch-Ua-Platform"  to "\"Android\"",
-        "Sec-Fetch-Dest"      to "document",
-        "Sec-Fetch-Mode"      to "navigate",
-        "Sec-Fetch-Site"      to "none",
-        "Sec-Fetch-User"      to "?1",
-        "Upgrade-Insecure-Requests" to "1"
+        "User-Agent"      to USER_AGENT,
+        "Accept-Language" to "vi-VN,vi;q=0.9,en;q=0.8",
+        "Accept"          to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     )
 
     /** Cached Cloudflare cookies extracted from WebView CookieManager.
@@ -193,6 +159,30 @@ class AnimeVietsubProvider : MainAPI() {
     }
 
     /**
+     * Classify why a page failed the check above — for diagnostic logging only.
+     * Does NOT change looksLikeChallenge's pass/fail decision, just labels it accurately,
+     * using the same size fingerprints documented there:
+     *   IP block ≈ 798 chars | Server error ≈ 807 chars | real Turnstile challenge ≈ 888K chars.
+     */
+    private fun classifyNonContentPage(html: String): String {
+        val len = html.length
+        val preview = html.take(200).replace("\n", " ")
+        return when {
+            html.isBlank() -> "BLANK ($len chars)"
+            len > 700_000 -> "TURNSTILE_CHALLENGE ($len chars, matches ~888K fingerprint)"
+            len < 2000 -> when {
+                html.contains("Bị Chặn", ignoreCase = true) ->
+                    "IP_BLOCKED ($len chars, matches ~798 fingerprint) :: $preview"
+                html.contains("Lỗi Server", ignoreCase = true) || html.contains("5xx") ->
+                    "SERVER_ERROR ($len chars, matches ~807 fingerprint) :: $preview"
+                else ->
+                    "UNKNOWN_SHORT_PAGE ($len chars, no known fingerprint match) :: $preview"
+            }
+            else -> "MARKER_MATCH ($len chars, keyword match in body)"
+        }
+    }
+
+    /**
      * Fire a background WebView to solve Cloudflare Turnstile.
      * Runs in bgScope — independent of home page coroutine, so it survives
      * CloudStream's 2s cancellation. The WebView loads the page, Turnstile
@@ -206,45 +196,11 @@ class AnimeVietsubProvider : MainAPI() {
         println("[AVSB] Background Turnstile solver starting")
         bgScope.launch {
             try {
-                // resolveUsingWebView returns Pair<Request?, List<Request>>
-                // The Request (if captured) has Cookie header set by WebView
-                val (capturedRequest, _) = cfWebView.resolveUsingWebView(mainUrl, referer = mainUrl)
-                println("[AVSB] Background Turnstile solver finished — extracting cookies")
-
-                // Method 1: Extract cookies from the captured Request's headers
-                if (capturedRequest != null) {
-                    val cookieHeader = capturedRequest.header("Cookie")
-                    if (!cookieHeader.isNullOrBlank()) {
-                        println("[AVSB] Extracted cookies from captured Request: ${cookieHeader.substring(0, minOf(80, cookieHeader.length))}...")
-                        cachedCfCookies = cookieHeader
-                    } else {
-                        println("[AVSB] Captured Request has no Cookie header")
-                    }
-                } else {
-                    println("[AVSB] No Request captured (interceptUrl didn't match)")
-                }
-
-                // Method 2: Also try CookieManager as fallback
-                // (check BOTH .pl and .love domains)
-                if (cachedCfCookies == null) {
-                    syncCookiesFromWebView()
-                }
-                if (cachedCfCookies == null) {
-                    // Try .love domain too
-                    try {
-                        val cookies2 = CookieManager.getInstance().getCookie("https://animevietsub.love")
-                        if (!cookies2.isNullOrBlank()) {
-                            println("[AVSB] Found cookies for .love: ${cookies2.substring(0, minOf(80, cookies2.length))}...")
-                            cachedCfCookies = cookies2
-                        }
-                    } catch (_: Exception) {}
-                }
-
-                if (cachedCfCookies != null) {
-                    println("[AVSB] Cookies cached! Next OkHttp request should work.")
-                } else {
-                    println("[AVSB] No cookies found from any source")
-                }
+                cfWebView.resolveUsingWebView(mainUrl, referer = mainUrl)
+                println("[AVSB] Background Turnstile solver finished — syncing cookies")
+                // After WebView finishes, extract cf_clearance from WebView's
+                // CookieManager and cache it for OkHttp requests.
+                syncCookiesFromWebView()
             } catch (t: Throwable) {
                 println("[AVSB] Background Turnstile solver failed: ${t.message}")
             } finally {
@@ -271,7 +227,7 @@ class AnimeVietsubProvider : MainAPI() {
                 url,
                 headers = headers,
                 timeout = 5_000L,
-                cacheTime = 0,
+                cacheTime = 0,  // don't cache — we want fresh response with cookies
                 cacheUnit = java.util.concurrent.TimeUnit.SECONDS
             ).text
         } catch (e: kotlinx.coroutines.CancellationException) {
@@ -286,58 +242,18 @@ class AnimeVietsubProvider : MainAPI() {
             return html
         }
 
-        // Log the challenge response content for debugging
-        if (html.isNotBlank()) {
-            val preview = html.take(200).replace("\n", " ").replace("\r", "")
-            println("[AVSB] Challenge response preview: $preview")
-        }
+        val reason = classifyNonContentPage(html)
+        println("[AVSB] Not real content for $url — $reason")
 
-        // Challenge detected. Fire background solver if not already running.
-        if (cfSolving.compareAndSet(false, true)) {
-            // We set the flag — start the solver
-            cfSolving.set(false) // reset so fireBackgroundChallengeSolver can set it
+        // IP_BLOCKED / SERVER_ERROR are static pages returned over the same network path —
+        // a WebView on this device hits the identical block, so it has nothing to solve.
+        // Only fire the 20s WebView solver when there's an actual Turnstile challenge.
+        if (reason.startsWith("IP_BLOCKED") || reason.startsWith("SERVER_ERROR")) {
+            println("[AVSB]   skipping WebView solver — not a Turnstile challenge")
+        } else {
             println("[AVSB] Turnstile challenge detected for $url (html=${html.length} chars) — firing background solver")
             fireBackgroundChallengeSolver()
         }
-
-        // WAIT for the solver to finish and set cookies.
-        // This blocks for up to 25 seconds. CloudStream will cancel the
-        // home page coroutine at ~2s, but bgScope survives. The NEXT
-        // time the user opens the home page (refresh), cookies will be cached.
-        // However, if we're in a load() or loadLinks() call (not home page),
-        // CloudStream's timeout is 60s — so we CAN wait here.
-        println("[AVSB] Waiting for background solver to finish...")
-        var waited = 0
-        while (waited < 15_000 && cachedCfCookies == null && cfSolving.get()) {
-            kotlinx.coroutines.delay(500)
-            waited += 500
-        }
-
-        // If cookies are now available, retry the request
-        if (cachedCfCookies != null) {
-            println("[AVSB] Cookies available after waiting ${waited}ms — retrying request")
-            val retryHeaders = commonHeaders + ("Cookie" to cachedCfCookies!!)
-            val retryHtml = try {
-                app.get(
-                    url,
-                    headers = retryHeaders,
-                    timeout = 5_000L,
-                    cacheTime = 0,
-                    cacheUnit = java.util.concurrent.TimeUnit.SECONDS
-                ).text
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                println("[AVSB] httpGet retry failed: $url :: ${e.message}")
-                ""
-            }
-            if (retryHtml.isNotBlank() && !looksLikeChallenge(retryHtml)) {
-                println("[AVSB] httpGet retry SUCCESS: $url (${retryHtml.length} chars)")
-                return retryHtml
-            }
-        }
-
-        println("[AVSB] httpGet giving up after waiting ${waited}ms")
         return ""
     }
 
