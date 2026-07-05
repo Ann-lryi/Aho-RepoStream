@@ -122,18 +122,7 @@ class AnimeVietsubProvider : MainAPI() {
         }
     }
 
-    /**
-     * HTTP GET with Cloudflare Turnstile bypass.
-     * Phase 1: OkHttp with cached cf_clearance cookie (fast)
-     * Phase 2: If challenged, fire blocking WebView, then retry
-     */
-    private suspend fun httpGet(url: String): String {
-        val currentCookies = getCookiesFromWebView()
-        val headers = if (currentCookies != null) {
-            commonHeaders + ("Cookie" to currentCookies)
-        } else {
-            commonHeaders
-        }
+    /** Detect Cloudflare challenge page, IP block page, or server error page.
      *  IMPORTANT: animevietsub serves several types of non-content pages:
      *  - CF Turnstile challenge: ~888K chars (CSS + font data)
      *  - IP block page: ~798 chars ("IP Bị Chặn")
@@ -168,17 +157,15 @@ class AnimeVietsubProvider : MainAPI() {
                html.contains("bị chặn", ignoreCase = true)
     }
 
-
-
     /**
      * HTTP GET with Cloudflare Turnstile bypass.
      * Phase 1: OkHttp with cached cf_clearance cookie (fast)
      * Phase 2: If challenged, fire blocking WebView, then retry
      */
     private suspend fun httpGet(url: String): String {
-        // Build headers — add cached CF cookies if available
-        val headers = if (cachedCfCookies != null) {
-            commonHeaders + ("Cookie" to cachedCfCookies!!)
+        val currentCookies = getCookiesFromWebView()
+        val headers = if (currentCookies != null) {
+            commonHeaders + ("Cookie" to currentCookies)
         } else {
             commonHeaders
         }
@@ -205,7 +192,7 @@ class AnimeVietsubProvider : MainAPI() {
 
         println("[AVSB] Turnstile challenge detected for $url (html=${html.length} chars) — firing blocking solver")
         
-        // Block and solve (up to 20 seconds)
+        // Block and solve (up to 15 seconds)
         if (cfSolving.compareAndSet(false, true)) {
             try {
                 println("[AVSB] Blocking Turnstile solver starting")
