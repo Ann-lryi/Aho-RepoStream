@@ -292,7 +292,7 @@ window.adsbygoogle.push=function(){};
         return withContext(Dispatchers.Main) {
             withTimeoutOrNull(30_000L) {
                 suspendCancellableCoroutine { cont ->
-                    val ctx = try { AcraApplication.context }
+                    val ctx = try { CloudStreamApp.context }
                     catch (_: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
 
@@ -552,7 +552,7 @@ if (origFetch) {
         return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
             kotlinx.coroutines.withTimeoutOrNull(30_000L) {
                 kotlinx.coroutines.suspendCancellableCoroutine { cont ->
-                    val ctx = try { AcraApplication.context } catch (_: Exception) { null }
+                    val ctx = try { CloudStreamApp.context } catch (_: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
 
                     android.webkit.CookieManager.getInstance().setAcceptCookie(true)
@@ -689,7 +689,7 @@ if (origFetch) {
         return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
             kotlinx.coroutines.withTimeoutOrNull(30_000L) {
                 kotlinx.coroutines.suspendCancellableCoroutine { cont ->
-                    val ctx = try { AcraApplication.context } catch (_: Exception) { null }
+                    val ctx = try { CloudStreamApp.context } catch (_: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
 
                     // Sync cookie
