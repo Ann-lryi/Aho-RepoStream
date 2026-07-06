@@ -18,13 +18,20 @@ import java.util.EnumSet
  * AnimeVietsub plugin for CloudStream 3 — rebuilt with fire-and-forget WebView pattern.
  *
  * CLOUDFLARE TURNSTILE BYPASS:
- *   animevietsub.pl is behind Cloudflare Turnstile (managed challenge).
- *   CloudStream's home page timeout (~2s) is shorter than Turnstile solve time (5-10s),
+ *   animevietsub.pl is behind Cloudflare Turnstile.
+ *   CloudStream's home page timeout (~2s) is shorter than any realistic Turnstile solve time,
  *   so we use a fire-and-forget background WebView:
  *     1. Try OkHttp first (fast — works if cf_clearance cookie already cached)
  *     2. If challenged, fire background WebView in bgScope (survives home page cancellation)
- *     3. WebView runs 15s, Turnstile auto-solves, cf_clearance cookie set in OkHttp jar
+ *     3. WebView runs to timeout; if Turnstile is non-interactive it auto-solves and sets
+ *        cf_clearance in WebView's own CookieManager (NOT OkHttp's jar — synced manually,
+ *        see syncCookiesFromWebView())
  *     4. Return empty for current request — next request succeeds with cached cookies
+ *
+ *   2026-07-06: confirmed a genuine Turnstile page loads (888783 chars) but no cookie
+ *   appears even after 40s. Suspected cause: Cloudflare's "Managed" mode shows an
+ *   interactive checkbox when it detects automated traffic, and this headless WebView
+ *   has no real touch/scroll signals to avoid that. Unconfirmed — needs visual check.
  *
  *   The old plugin used WebViewResolver with interceptUrl matching the page URL,
  *   which captured the request IMMEDIATELY (0ms) before Turnstile could solve.
@@ -73,18 +80,34 @@ class AnimeVietsubProvider : MainAPI() {
     //    3. JS makes XHR to /cdn-cgi/challenge-platform/ → handled by WebView
     //    4. Challenge solves → cf_clearance cookie set in WebView CookieManager
     //    5. WebView redirects to real page
-    //    6. CookieManager syncs to OkHttp's cookie jar (CloudStream does this)
+    //    6. syncCookiesFromWebView() reads WebView's CookieManager manually and
+    //       caches cf_clearance — verified against real WebViewResolver.android.kt
+    //       source (recloudstream/cloudstream, master): resolveUsingWebView() does
+    //       NOT bridge cookies into OkHttp itself. httpGet() attaches the cached
+    //       cookie as a header on subsequent requests.
     //    7. Future OkHttp requests now have cf_clearance → succeed
     //
-    //  interceptUrl = "__never_match__" → WebView runs to completion (15s),
-    //  giving Turnstile time to auto-solve (usually 5-10s).
+    //  interceptUrl = "__cf_never_match__" → WebView runs to full timeout,
+    //  giving Turnstile time to auto-solve (managed, non-interactive challenge).
+    //
+    //  2026-07-06 finding: confirmed real Turnstile page served (888783 chars,
+    //  matches fingerprint) — not an IP block. Full 20s elapses every time,
+    //  WebView CookieManager still empty after. Per Cloudflare's own Turnstile
+    //  docs, "Managed" mode presents an interactive checkbox specifically when
+    //  it detects automated traffic; a headless background WebView with no real
+    //  touch/scroll signals is a plausible trigger for that escalation. If so,
+    //  timeout length does not fix this — needs an actual tap, which this
+    //  fire-and-forget invisible WebView cannot provide. Unconfirmed without
+    //  visually watching the challenge render (see chat for what to check).
     // ═══════════════════════════════════════════════════════════════════════
 
     private val cfWebView: WebViewResolver by lazy {
         WebViewResolver(
             interceptUrl = Regex("""__cf_never_match__"""),
             useOkhttp = false,           // ← FALSE: let WebView handle all requests natively
-            timeout = 20_000L            // 20s — Turnstile managed challenge needs 5-10s
+            timeout = 40_000L            // raised from 20s to rule out "just needs more time"
+                                          // — see 2026-07-06 finding above; likely insufficient
+                                          // alone if the escalation hypothesis is correct
         )
     }
 
@@ -169,7 +192,22 @@ class AnimeVietsubProvider : MainAPI() {
         val preview = html.take(200).replace("\n", " ")
         return when {
             html.isBlank() -> "BLANK ($len chars)"
-            len > 700_000 -> "TURNSTILE_CHALLENGE ($len chars, matches ~888K fingerprint)"
+            len > 700_000 -> {
+                // Surface real evidence instead of guessing managed vs interactive —
+                // "challenges.cloudflare.com" is Cloudflare's documented Turnstile
+                // iframe host (developers.cloudflare.com/turnstile). If present,
+                // print the surrounding markup so the next log capture shows the
+                // actual widget config instead of us inferring from byte count alone.
+                val idx = html.indexOf("challenges.cloudflare.com", ignoreCase = true)
+                val evidence = if (idx >= 0) {
+                    val start = maxOf(0, idx - 60)
+                    val end = minOf(html.length, idx + 90)
+                    "around challenges.cloudflare.com: " + html.substring(start, end).replace("\n", " ")
+                } else {
+                    "no 'challenges.cloudflare.com' string found in body"
+                }
+                "TURNSTILE_CHALLENGE ($len chars, matches ~888K fingerprint) :: $evidence"
+            }
             len < 2000 -> when {
                 html.contains("Bị Chặn", ignoreCase = true) ->
                     "IP_BLOCKED ($len chars, matches ~798 fingerprint) :: $preview"
@@ -247,7 +285,7 @@ class AnimeVietsubProvider : MainAPI() {
 
         // IP_BLOCKED / SERVER_ERROR are static pages returned over the same network path —
         // a WebView on this device hits the identical block, so it has nothing to solve.
-        // Only fire the 20s WebView solver when there's an actual Turnstile challenge.
+        // Only fire the WebView solver (see cfWebView.timeout) when there's an actual Turnstile challenge.
         if (reason.startsWith("IP_BLOCKED") || reason.startsWith("SERVER_ERROR")) {
             println("[AVSB]   skipping WebView solver — not a Turnstile challenge")
         } else {
