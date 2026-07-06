@@ -130,8 +130,11 @@ class AnimeVietsubProvider : MainAPI() {
     private fun looksLikeChallenge(html: String): Boolean {
         if (html.isBlank() || html.length < 500) return true
         // Size check: challenge pages are consistently ~880K-895K chars
-        // Real pages are 150K-480K. 700K is a safe threshold.
         if (html.length > 700_000) return true
+        // Small pages (< 2000 chars) are never real content — they're
+        // Cloudflare JS challenge interstitials, IP block pages, or error pages.
+        // Real animevietsub pages are 150K-480K with .TPostMv cards.
+        if (html.length < 2000) return true
         return html.contains("Just a moment...", ignoreCase = true) ||
                html.contains("cf-challenge", ignoreCase = true) ||
                html.contains("_cf_chl_opt", ignoreCase = true) ||
@@ -145,7 +148,13 @@ class AnimeVietsubProvider : MainAPI() {
                html.contains("IP Bị Chặn", ignoreCase = true) ||
                html.contains("Xác Minh", ignoreCase = true) ||
                html.contains("captcha-placeholder", ignoreCase = true) ||
-               html.contains("Turnstile", ignoreCase = true)
+               html.contains("Turnstile", ignoreCase = true) ||
+               html.contains("Lỗi Server", ignoreCase = true) ||
+               html.contains("5xx", ignoreCase = true) ||
+               html.contains("unknown error", ignoreCase = true) ||
+               html.contains("bị chặn", ignoreCase = true) ||
+               html.contains("static.cloudflare", ignoreCase = true) ||
+               html.contains("window.location.href", ignoreCase = true)
     }
 
     /**
