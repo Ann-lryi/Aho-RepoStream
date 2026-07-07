@@ -236,6 +236,7 @@ class PhimNguonCProvider : MainAPI() {
         "${API_PREFIX}api/films/phim-moi-cap-nhat"    to "Phim M\u1EDBi C\u1EADp Nh\u1EADt",
         "danh-sach/phim-le"                           to "Phim L\u1EBB",
         "danh-sach/phim-bo"                           to "Phim B\u1ED9",
+        "the-loai/hoat-hinh"                           to "Anime~H.hình",
         "the-loai/phim-18"                            to "18+"
     )
 
