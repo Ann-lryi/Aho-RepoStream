@@ -6,6 +6,12 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
@@ -78,8 +84,10 @@ class AnimeVietsubProvider : MainAPI() {
         "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Cloudflare Turnstile bypass — synchronous WebViewResolver interceptor
-    //  (matches the confirmed-working reference version — see class doc above)
+    //  Cloudflare Turnstile bypass — shared background WebView solve, awaited
+    //  with a short bounded timeout so it can never trip CloudStream's own
+    //  outer framework timeout (confirmed on-device: fully synchronous
+    //  resolveUsingWebView() here caused "Timed out waiting for 120000 ms").
     // ═══════════════════════════════════════════════════════════════════════
 
     private val cfWebView: WebViewResolver by lazy {
@@ -108,13 +116,36 @@ class AnimeVietsubProvider : MainAPI() {
         "Accept"          to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     )
 
-    /**
-     * HTTP GET with Cloudflare Turnstile bypass. cfWebView is passed as an OkHttp
-     * Interceptor — WebViewResolver implements Interceptor (verified from real
-     * recloudstream/cloudstream source), so app.get() only returns once the
-     * whole WebView-solve-then-fetch exchange finishes, no manual retry needed.
-     */
+    private val bgScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var solveJob: Deferred<Unit>? = null
+
+    /** Ensure exactly one WebView solve is running, shared by any concurrent
+     *  caller. Runs in bgScope so it survives this specific call being
+     *  cancelled/timed out — the job itself is NOT awaited unboundedly by
+     *  httpGet (see waitMs below), so it can never cause the "Timed out
+     *  waiting for 120000 ms" CloudStream framework error seen on-device
+     *  when a previous version awaited resolveUsingWebView() directly here. */
+    private fun ensureSolving(): Deferred<Unit> {
+        solveJob?.let { if (it.isActive) return it }
+        val job = bgScope.async {
+            try {
+                cfWebView.resolveUsingWebView(mainUrl, referer = mainUrl)
+            } catch (e: Exception) {
+                println("[AVSB] WebView solve failed: ${e.message}")
+            }
+            syncCookiesFromWebView()
+        }
+        solveJob = job
+        return job
+    }
+
+    /** HTTP GET with Cloudflare bypass. Tries a plain request first (fast path
+     *  once a cookie is cached). On a short/non-content response, waits up to
+     *  waitMs for a shared background WebView solve, then retries once —
+     *  win either way: fast if the solve finishes quickly, and never blocks
+     *  longer than waitMs regardless of how long the solve itself takes. */
     private suspend fun httpGet(url: String): String {
+        val waitMs = 8_000L
         val headers1 = cachedCfCookies?.let { commonHeaders + ("Cookie" to it) } ?: commonHeaders
         val html1 = try {
             app.get(url, headers = headers1).text
@@ -128,15 +159,8 @@ class AnimeVietsubProvider : MainAPI() {
             println("[AVSB] httpGet: $url (${html1.length} chars)")
             return html1
         }
-        println("[AVSB] httpGet short response for $url (${html1.length} chars) — running WebView solve")
-        try {
-            cfWebView.resolveUsingWebView(mainUrl, referer = mainUrl)
-        } catch (e: kotlinx.coroutines.CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            println("[AVSB] WebView solve failed: ${e.message}")
-        }
-        syncCookiesFromWebView()
+        println("[AVSB] httpGet short response for $url (${html1.length} chars) — waiting up to ${waitMs}ms for shared solve")
+        withTimeoutOrNull(waitMs) { ensureSolving().await() }
         val headers2 = cachedCfCookies?.let { commonHeaders + ("Cookie" to it) } ?: commonHeaders
         val html2 = try {
             app.get(url, headers = headers2).text
@@ -146,7 +170,7 @@ class AnimeVietsubProvider : MainAPI() {
             println("[AVSB] httpGet retry failed: $url :: ${e.message}")
             ""
         }
-        println("[AVSB] httpGet after solve: $url (${html2.length} chars)")
+        println("[AVSB] httpGet after wait: $url (${html2.length} chars)")
         return html2
     }
 
