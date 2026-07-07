@@ -90,15 +90,33 @@ class AnimeVietsubProvider : MainAPI() {
     //  resolveUsingWebView() here caused "Timed out waiting for 120000 ms").
     // ═══════════════════════════════════════════════════════════════════════
 
+    /**
+     * Config matches CloudStream's own official CloudflareKiller class
+     * (app/.../network/CloudflareKiller.kt — not accessible from a plugin
+     * directly since it lives in the app module, not library, so replicated
+     * here) rather than values I picked myself:
+     *   - userAgent = null: CloudflareKiller's own comment says "Cloudflare
+     *     needs default user agent" — i.e. the WebView's real one, not a
+     *     custom string. Contradicts an explicit UA I set in an earlier fix;
+     *     deferring to the framework author's tested value.
+     *   - additionalUrls matching everything + requestCallBack checking for
+     *     cf_clearance in resolveUsingWebView() below: exits AS SOON AS the
+     *     cookie appears on ANY request (checked continuously), instead of
+     *     blindly waiting a fixed duration and only checking at the end.
+     */
     private val cfWebView: WebViewResolver by lazy {
         WebViewResolver(
-            interceptUrl = Regex("""__cf_never_match__"""),
+            interceptUrl = Regex(""".^"""),   // never matches (CloudflareKiller's own trick)
+            additionalUrls = listOf(Regex(".")),  // matches every request
             useOkhttp = false,
-            userAgent = USER_AGENT
+            userAgent = null
         )
     }
 
     private var cachedCfCookies: String? = null
+
+    private fun hasCfClearance(url: String): Boolean =
+        android.webkit.CookieManager.getInstance().getCookie(url)?.contains("cf_clearance") == true
 
     private fun syncCookiesFromWebView() {
         val cookies = android.webkit.CookieManager.getInstance().getCookie(mainUrl)
@@ -129,7 +147,9 @@ class AnimeVietsubProvider : MainAPI() {
         solveJob?.let { if (it.isActive) return it }
         val job = bgScope.async {
             try {
-                cfWebView.resolveUsingWebView(mainUrl, referer = mainUrl)
+                cfWebView.resolveUsingWebView(mainUrl, referer = mainUrl) { req ->
+                    hasCfClearance(req.url.toString())
+                }
             } catch (e: Exception) {
                 println("[AVSB] WebView solve failed: ${e.message}")
             }
