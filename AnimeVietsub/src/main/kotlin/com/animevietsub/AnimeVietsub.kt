@@ -84,11 +84,22 @@ class AnimeVietsubProvider : MainAPI() {
 
     private val cfWebView: WebViewResolver by lazy {
         WebViewResolver(
-            interceptUrl = Regex(Regex.escape(mainUrl) + """.*"""),
-            useOkhttp = false,   // WebView handles all requests natively —
-                                 // library's own doc comment: "Disable for cloudflare"
-            userAgent = USER_AGENT  // explicit — see class doc bug #1
+            interceptUrl = Regex("""__cf_never_match__"""),
+            useOkhttp = false,
+            userAgent = USER_AGENT
         )
+    }
+
+    private var cachedCfCookies: String? = null
+
+    private fun syncCookiesFromWebView() {
+        val cookies = android.webkit.CookieManager.getInstance().getCookie(mainUrl)
+        if (!cookies.isNullOrBlank()) {
+            cachedCfCookies = cookies
+            println("[AVSB] synced cookies: $cookies")
+        } else {
+            println("[AVSB] no cookies found in WebView CookieManager for $mainUrl")
+        }
     }
 
     private val commonHeaders = mapOf(
@@ -104,16 +115,39 @@ class AnimeVietsubProvider : MainAPI() {
      * whole WebView-solve-then-fetch exchange finishes, no manual retry needed.
      */
     private suspend fun httpGet(url: String): String {
-        val html = try {
-            app.get(url, headers = commonHeaders, interceptor = cfWebView).text
+        val headers1 = cachedCfCookies?.let { commonHeaders + ("Cookie" to it) } ?: commonHeaders
+        val html1 = try {
+            app.get(url, headers = headers1).text
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
             println("[AVSB] httpGet failed: $url :: ${e.message}")
-            return ""
+            ""
         }
-        println("[AVSB] httpGet: $url (${html.length} chars)")
-        return html
+        if (html1.length > 2000) {
+            println("[AVSB] httpGet: $url (${html1.length} chars)")
+            return html1
+        }
+        println("[AVSB] httpGet short response for $url (${html1.length} chars) — running WebView solve")
+        try {
+            cfWebView.resolveUsingWebView(mainUrl, referer = mainUrl)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            println("[AVSB] WebView solve failed: ${e.message}")
+        }
+        syncCookiesFromWebView()
+        val headers2 = cachedCfCookies?.let { commonHeaders + ("Cookie" to it) } ?: commonHeaders
+        val html2 = try {
+            app.get(url, headers = headers2).text
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            println("[AVSB] httpGet retry failed: $url :: ${e.message}")
+            ""
+        }
+        println("[AVSB] httpGet after solve: $url (${html2.length} chars)")
+        return html2
     }
 
     private suspend fun httpGetDoc(url: String) =
