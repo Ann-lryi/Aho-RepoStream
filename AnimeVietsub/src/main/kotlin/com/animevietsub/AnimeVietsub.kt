@@ -1269,6 +1269,75 @@ class AnimeVietsubProvider : MainAPI() {
             return out
         }
 
+        suspend fun tryStatusEndpoint(): Boolean {
+            val origin = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: return false
+            val playerId = embedUrl.substringAfterLast("/").substringBefore("?")
+            if (playerId.isBlank()) return false
+            val statusUrl = "$origin/status/$playerId"
+            val statusHeaders = withCookies(mapOf(
+                "User-Agent" to USER_AGENT,
+                "Referer" to embedUrl,
+                "Origin" to origin,
+                "Accept" to "application/json, text/plain, */*",
+                "X-Requested-With" to "XMLHttpRequest",
+                "Sec-Fetch-Site" to "same-origin",
+                "Sec-Fetch-Mode" to "cors",
+                "Sec-Fetch-Dest" to "empty"
+            ))
+
+            // The iframe JS calls /status/{playerId}; log and parse it directly.
+            // If the endpoint is cookie/fingerprint-protected, fall back to a
+            // WebView capture of that exact XHR response.
+            val statusBodies = mutableListOf<String>()
+            try {
+                val body = app.get(statusUrl, headers = statusHeaders).text
+                println("[AVSB]   status direct $statusUrl len=${body.length} preview=${body.take(220).replace("\n", " ")}")
+                statusBodies += body
+            } catch (e: Exception) {
+                println("[AVSB]   status direct failed: ${e.message}")
+            }
+            try {
+                val statusResolver = WebViewResolver(
+                    interceptUrl = Regex(Regex.escape(statusUrl)),
+                    additionalUrls = emptyList(),
+                    useOkhttp = false,
+                    userAgent = null
+                )
+                val resp = app.get(embedUrl, headers = statusHeaders, interceptor = statusResolver)
+                val body = resp.text
+                println("[AVSB]   status WebView ${resp.url?.take(120)} len=${body.length} preview=${body.take(220).replace("\n", " ")}")
+                statusBodies += body
+            } catch (e: Exception) {
+                println("[AVSB]   status WebView capture failed: ${e.message}")
+            }
+
+            for (body in statusBodies) {
+                val found = scanMediaUrls(body)
+                println("[AVSB]   status scan → ${found.size} media URLs")
+                for (mediaUrl in found) {
+                    if (tryM3U8Link(mediaUrl, embedUrl, callback)) return true
+                }
+
+                // Some player APIs return JSON-escaped strings or base64-ish blobs
+                // outside atob(). Decode all long base64 candidates as a last static pass.
+                Regex("""["']([A-Za-z0-9+/=_-]{60,})["']""").findAll(body).forEach { m ->
+                    val raw = m.groupValues[1]
+                    val variants = listOf(raw, raw.replace('-', '+').replace('_', '/'))
+                    for (v in variants) {
+                        try {
+                            val decoded = String(Base64.decode(v, Base64.DEFAULT), Charsets.UTF_8)
+                            val nested = scanMediaUrls(decoded)
+                            if (nested.isNotEmpty()) println("[AVSB]   status base64 nested scan → ${nested.size} media URLs")
+                            for (mediaUrl in nested) {
+                                if (tryM3U8Link(mediaUrl, embedUrl, callback)) return true
+                            }
+                        } catch (_: Exception) {}
+                    }
+                }
+            }
+            return false
+        }
+
         var mediaUrls = scanMediaUrls(embedHtml)
         println("[AVSB]   embed static scan → ${mediaUrls.size} media URLs")
 
@@ -1277,6 +1346,8 @@ class AnimeVietsubProvider : MainAPI() {
             if (tryM3U8Link(mediaUrl, embedUrl, callback)) anyFound = true
         }
         if (anyFound) return true
+
+        if (tryStatusEndpoint()) return true
 
         // Static HTML had no direct URL. Execute the iframe in a real WebView and
         // capture the first requested m3u8/mp4. This is the correct fallback for
