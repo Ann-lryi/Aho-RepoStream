@@ -14,7 +14,6 @@ import android.util.Base64
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
@@ -425,31 +424,6 @@ class PhimNguonCProvider : MainAPI() {
         return s
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  PERFORMANCE: non-blocking recommendations for load() page
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Opening a movie page must not wait for slow HTML genre pages / WebView.
-    // Keep the recommendations component, but cap it to a very small time budget;
-    // if the relevant genre scrape is slow, fall back to the fast JSON API.
-    private val RECOMMENDATIONS_TIMEOUT_MS = 1500L
-    private val RECOMMENDATIONS_FALLBACK_TIMEOUT_MS = 1200L
-
-    private suspend fun fastFallbackRecommendations(currentSlug: String?): List<SearchResponse> {
-        return withTimeoutOrNull(RECOMMENDATIONS_FALLBACK_TIMEOUT_MS) {
-            try {
-                fetchApi<NguonCApiResponse>("$mainUrl/api/films/phim-moi-cap-nhat?page=1")
-                    ?.items
-                    ?.asSequence()
-                    ?.filter { it.slug != currentSlug }
-                    ?.take(20)
-                    ?.mapNotNull { parseApiItem(it) }
-                    ?.toList()
-                    ?: emptyList()
-            } catch (_: Exception) { emptyList() }
-        } ?: emptyList()
-    }
-
-
     override suspend fun load(url: String): LoadResponse {
         val slug  = url.trim().trimEnd('/').substringAfterLast("/")
         val res   = fetchApi<NguonCDetailResponse>("$mainUrl/api/film/$slug")
@@ -505,112 +479,14 @@ class PhimNguonCProvider : MainAPI() {
 
         val beautifulPlot = buildBeautifulDescription(movie, dinhDang, theLoai, namPhatHanh, quocGia)
 
-        val genreItems = categories.values.flatMap { it.list ?: emptyList() }.filter { !it.id.isNullOrBlank() }
-        val theLoaiItems = categories.values
-            .filter { cat ->
-                val gname = cat.group?.name ?: ""
-                !gname.contains("\u0103m") && !gname.contains("gia") && !gname.contains("nh d") && (cat.list?.size ?: 0) >= 2
-            }
-            .maxByOrNull { it.list?.size ?: 0 }?.list ?: genreItems.take(5)
-
-        fun nameToSlug(name: String): String {
-            val map = mapOf(
-                '\u00E0' to "a", '\u00E1' to "a", '\u00E2' to "a", '\u00E3' to "a", '\u00E4' to "a", '\u00E5' to "a",
-                '\u0103' to "a", '\u1EAF' to "a", '\u1EB7' to "a", '\u1EB1' to "a", '\u1EB3' to "a", '\u1EB5' to "a",
-                '\u1EA5' to "a", '\u1EA7' to "a", '\u1EA9' to "a", '\u1EAB' to "a", '\u1EAD' to "a", '\u1EA3' to "a", '\u1EA1' to "a",
-                '\u00E8' to "e", '\u00E9' to "e", '\u00EA' to "e", '\u00EB' to "e",
-                '\u1EC1' to "e", '\u1EBF' to "e", '\u1EC7' to "e", '\u1EC3' to "e", '\u1EC5' to "e", '\u1EB9' to "e", '\u1EBB' to "e", '\u1EBD' to "e",
-                '\u00EC' to "i", '\u00ED' to "i", '\u00EE' to "i", '\u00EF' to "i", '\u1ECB' to "i", '\u1EC9' to "i", '\u0129' to "i",
-                '\u00F2' to "o", '\u00F3' to "o", '\u00F4' to "o", '\u00F5' to "o", '\u00F6' to "o",
-                '\u1ED3' to "o", '\u1ED1' to "o", '\u1ED9' to "o", '\u1ED5' to "o", '\u1ED7' to "o",
-                '\u1EDD' to "o", '\u1EDB' to "o", '\u1EE3' to "o", '\u1EDF' to "o", '\u1EE1' to "o", '\u1ECD' to "o", '\u1ECF' to "o",
-                '\u00F9' to "u", '\u00FA' to "u", '\u00FB' to "u", '\u00FC' to "u",
-                '\u1EEB' to "u", '\u1EE9' to "u", '\u1EF1' to "u", '\u1EED' to "u", '\u1EEF' to "u", '\u1EE5' to "u", '\u1EE7' to "u", '\u0169' to "u",
-                '\u1EF3' to "y", '\u00FD' to "y", '\u1EF5' to "y", '\u1EF7' to "y", '\u1EF9' to "y",
-                '\u0111' to "d", '\u0110' to "d", '\u01B0' to "u", '\u01A1' to "o"
-            )
-            return name.lowercase().trim().map { c ->
-                map[c] ?: if (c in 'a'..'z' || c in '0'..'9') c.toString() else if (c == ' ') "-" else ""
-            }.joinToString("").replace(Regex("-{2,}"), "-").trim('-')
-        }
-
-        // ── Recommendations: use JSON API for genre listing pages ──
-        //
-        // The old code called `GET /api/films/{genre-slug}` which 404s for genre
-        // slugs (that endpoint only accepts film slugs). As a result the genre
-        // branch always returned empty and the code fell through to
-        // `phim-moi-cap-nhat` (site-wide newest) — which is why an anime like
-        // "Dũng Sĩ Căn Bà" was getting Chinese costume dramas as "similar films".
-        //
-        // The site also exposes JSON endpoints for genre/listing pages:
-        //   GET /api/films/the-loai/{slug}?page={n}
-        //   GET /api/films/danh-sach/{slug}?page={n}
-        // so we use JSON + parseApiItem() here instead of HTML + parseCard().
-        //
-        // PERF: this used to fetch HTML genre pages and could fall back to
-        // WebViewResolver, which is exactly what the supplied log shows. Now it
-        // uses the JSON API and remains time-boxed, so recommendations cannot
-        // block the movie detail page.
-        //
-        // Genres are sorted by specificity (most specific first) so an anime's
-        // "Hoạt Hình" genre is tried before its "Hành Động" genre — otherwise a
-        // generic action match would drown out the much-more-relevant anime match.
-        val genrePriority = listOf(
-            "hoạt hình", "khoa học viễn tưởng", "giả tưởng", "phiêu lưu",
-            "kinh dị", "bí ẩn", "hình sự", "chính kịch", "lịch sử", "cổ trang",
-            "chiến tranh", "tâm lý", "tình cảm", "lãng mạn", "hài", "gia đình",
-            "hành động", "phim 18", "tài liệu", "nhạc", "miền tây"
-        )
-        val sortedGenres = theLoaiItems.mapNotNull { it.name }.sortedBy { gname ->
-            val lower = gname.lowercase()
-            val idx = genrePriority.indexOfFirst { lower.contains(it) }
-            if (idx == -1) Int.MAX_VALUE else idx
-        }
-
-        val recommendations: List<SearchResponse> = withTimeoutOrNull(RECOMMENDATIONS_TIMEOUT_MS) {
-            try {
-                coroutineScope {
-                    // Try top 3 genres IN PARALLEL — first non-empty wins.
-                    // IMPORTANT PERF FIX: this whole block is now time-boxed.
-                    // On the supplied log, the genre HTML requests hit multiple
-                    // NiceHttp SocketTimeoutException events and then a WebViewResolver
-                    // fallback for /the-loai/phim-bo, which makes opening a movie page
-                    // feel very slow. Recommendations are useful, but they must not
-                    // block the core movie details + episode list.
-                    val genreResults = sortedGenres.take(3).map { genreName ->
-                        async {
-                            val slug2 = nameToSlug(genreName)
-                            if (slug2.isBlank()) return@async emptyList<SearchResponse>()
-
-                            val items = mutableListOf<SearchResponse>()
-                            // Scrape up to 2 pages of this genre (20 films/page → up to 40),
-                            // stopping early once we have enough for the grid.
-                            for (p in 1..2) {
-                                try {
-                                    val genreUrl = "$mainUrl/api/films/the-loai/$slug2?page=$p"
-                                    val rows = fetchApi<NguonCApiResponse>(genreUrl)
-                                        ?.items
-                                        ?.mapNotNull { parseApiItem(it) }
-                                        ?.filter { (it.url ?: "").trimEnd('/').substringAfterLast("/") != movie.slug }
-                                        ?: emptyList()
-                                    if (rows.isEmpty()) break  // no more pages
-                                    items += rows
-                                    if (items.size >= 24) break
-                                } catch (_: Exception) { break }
-                            }
-                            items
-                        }
-                    }.awaitAll()
-
-                    // Pick the genre with the most results — this naturally favors
-                    // the most specific genre that has many films (e.g. "Hoạt Hình"
-                    // for anime) over a generic one with the same count.
-                    val bestResult = genreResults.maxByOrNull { it.size } ?: emptyList()
-                    bestResult.distinctBy { it.url }.take(30)
-                }
-            } catch (_: Exception) { emptyList() }
-        }?.takeIf { it.isNotEmpty() }
-            ?: fastFallbackRecommendations(movie.slug)
+        // IMPORTANT PERF FIX: only wait for the film detail API (`/api/film/{slug}`)
+        // when opening a movie. The supplied log shows the delay comes from extra
+        // listing/recommendation requests after the film data is already available
+        // (SocketTimeoutException + WebViewResolver on /the-loai/...).
+        // Cloudstream cannot update recommendations lazily after returning
+        // LoadResponse, so we avoid all extra network work here to keep the movie
+        // page instant. Main page/search still use the JSON listing APIs.
+        val recommendations: List<SearchResponse> = emptyList()
 
         return newTvSeriesLoadResponse(movie.name ?: "", url, TvType.TvSeries, episodes) {
             this.posterUrl       = movie.poster_url ?: movie.thumb_url
