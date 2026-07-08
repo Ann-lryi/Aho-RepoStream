@@ -14,6 +14,7 @@ import android.util.Base64
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
@@ -233,11 +234,11 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     override val mainPage = mainPageOf(
-        "${API_PREFIX}api/films/phim-moi-cap-nhat"    to "Phim M\u1EDBi C\u1EADp Nh\u1EADt",
-        "danh-sach/phim-le"                           to "Phim L\u1EBB",
-        "danh-sach/phim-bo"                           to "Phim B\u1ED9",
-        "the-loai/hoat-hinh"                           to "Anime~H.hình",
-        "the-loai/phim-18"                            to "18+"
+        "${API_PREFIX}api/films/phim-moi-cap-nhat"        to "Phim M\u1EDBi C\u1EADp Nh\u1EADt",
+        "${API_PREFIX}api/films/danh-sach/phim-le"        to "Phim L\u1EBB",
+        "${API_PREFIX}api/films/danh-sach/phim-bo"        to "Phim B\u1ED9",
+        "${API_PREFIX}api/films/the-loai/hoat-hinh"       to "Anime~H.hình",
+        "${API_PREFIX}api/films/the-loai/phim-18"         to "18+"
     )
 
     private fun parseCard(el: Element): SearchResponse? {
@@ -332,15 +333,19 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val res = fetchApi<NguonCApiResponse>("$mainUrl/api/films?keyword=${URLEncoder.encode(query, "utf-8")}")
+        val keyword = URLEncoder.encode(query, "utf-8")
+
+        // PERF: use the site's JSON search API instead of the HTML /tim-kiem page.
+        // This avoids the same slow listing-page WebView/Cloudflare path seen in the log.
+        val res = fetchApi<NguonCApiResponse>("$mainUrl/api/films/search?keyword=$keyword")
 
         if (!res?.items.isNullOrEmpty())
             return res!!.items!!.mapNotNull { parseApiItem(it) }
 
-        val searchUrl = "$mainUrl/tim-kiem?keyword=${URLEncoder.encode(query, "utf-8")}"
-        // PERF: same fast-path-first fetch as getMainPage.
-        val doc = fetchListingDoc(searchUrl)
-        return doc.select("table tbody tr").mapNotNull { parseCard(it) }
+        // Backward-compatible API fallback only; do not fall back to HTML here,
+        // because HTML listing fetches are exactly the source of the slow load.
+        val legacyRes = fetchApi<NguonCApiResponse>("$mainUrl/api/films?keyword=$keyword")
+        return legacyRes?.items?.mapNotNull { parseApiItem(it) } ?: emptyList()
     }
 
     /**
@@ -419,6 +424,31 @@ class PhimNguonCProvider : MainAPI() {
         // No number — return as-is (e.g., "OVA", "Special")
         return s
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  PERFORMANCE: non-blocking recommendations for load() page
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Opening a movie page must not wait for slow HTML genre pages / WebView.
+    // Keep the recommendations component, but cap it to a very small time budget;
+    // if the relevant genre scrape is slow, fall back to the fast JSON API.
+    private val RECOMMENDATIONS_TIMEOUT_MS = 1500L
+    private val RECOMMENDATIONS_FALLBACK_TIMEOUT_MS = 1200L
+
+    private suspend fun fastFallbackRecommendations(currentSlug: String?): List<SearchResponse> {
+        return withTimeoutOrNull(RECOMMENDATIONS_FALLBACK_TIMEOUT_MS) {
+            try {
+                fetchApi<NguonCApiResponse>("$mainUrl/api/films/phim-moi-cap-nhat?page=1")
+                    ?.items
+                    ?.asSequence()
+                    ?.filter { it.slug != currentSlug }
+                    ?.take(20)
+                    ?.mapNotNull { parseApiItem(it) }
+                    ?.toList()
+                    ?: emptyList()
+            } catch (_: Exception) { emptyList() }
+        } ?: emptyList()
+    }
+
 
     override suspend fun load(url: String): LoadResponse {
         val slug  = url.trim().trimEnd('/').substringAfterLast("/")
@@ -504,7 +534,7 @@ class PhimNguonCProvider : MainAPI() {
             }.joinToString("").replace(Regex("-{2,}"), "-").trim('-')
         }
 
-        // ── Recommendations: HTML-scrape the genre listing pages ──
+        // ── Recommendations: use JSON API for genre listing pages ──
         //
         // The old code called `GET /api/films/{genre-slug}` which 404s for genre
         // slugs (that endpoint only accepts film slugs). As a result the genre
@@ -512,20 +542,15 @@ class PhimNguonCProvider : MainAPI() {
         // `phim-moi-cap-nhat` (site-wide newest) — which is why an anime like
         // "Dũng Sĩ Căn Bà" was getting Chinese costume dramas as "similar films".
         //
-        // The CORRECT endpoint is the HTML genre browse page:
-        //   GET /the-loai/{slug}?page={n}   →  HTML <table><tbody><tr>…</tr></tbody></table>
-        // which `getMainPage` already uses via `parseCard()`. We re-use the same
-        // parser here.
+        // The site also exposes JSON endpoints for genre/listing pages:
+        //   GET /api/films/the-loai/{slug}?page={n}
+        //   GET /api/films/danh-sach/{slug}?page={n}
+        // so we use JSON + parseApiItem() here instead of HTML + parseCard().
         //
-        // PERF: this used to fetch up to 3 PAGES per genre (up to 9 separate
-        // WebView loads total, since every HTML fetch used a brand-new
-        // WebViewResolver) which is why opening a movie could take 10-30+
-        // seconds. Now:
-        //   - fetchListingDoc() reuses cached CF cookies for a fast plain HTTP
-        //     fetch whenever possible (WebView only runs once per app session,
-        //     in the common case).
-        //   - Capped at 2 pages per genre and stops as soon as we have enough
-        //     items, cutting the number of requests needed.
+        // PERF: this used to fetch HTML genre pages and could fall back to
+        // WebViewResolver, which is exactly what the supplied log shows. Now it
+        // uses the JSON API and remains time-boxed, so recommendations cannot
+        // block the movie detail page.
         //
         // Genres are sorted by specificity (most specific first) so an anime's
         // "Hoạt Hình" genre is tried before its "Hành Động" genre — otherwise a
@@ -542,57 +567,50 @@ class PhimNguonCProvider : MainAPI() {
             if (idx == -1) Int.MAX_VALUE else idx
         }
 
-        val recommendations: List<SearchResponse> = try {
-            coroutineScope {
-                // Try top 3 genres IN PARALLEL — first non-empty wins.
-                // (If we tried them sequentially, a dead/slow genre would block
-                //  the more relevant one behind it.) The cfMutex inside
-                //  fetchListingDoc() makes sure a cold-start Cloudflare
-                //  challenge is only solved once even though these run in
-                //  parallel — the other calls simply reuse the resulting cookie.
-                val genreResults = sortedGenres.take(3).map { genreName ->
-                    async {
-                        val slug2 = nameToSlug(genreName)
-                        if (slug2.isBlank()) return@async emptyList<SearchResponse>()
+        val recommendations: List<SearchResponse> = withTimeoutOrNull(RECOMMENDATIONS_TIMEOUT_MS) {
+            try {
+                coroutineScope {
+                    // Try top 3 genres IN PARALLEL — first non-empty wins.
+                    // IMPORTANT PERF FIX: this whole block is now time-boxed.
+                    // On the supplied log, the genre HTML requests hit multiple
+                    // NiceHttp SocketTimeoutException events and then a WebViewResolver
+                    // fallback for /the-loai/phim-bo, which makes opening a movie page
+                    // feel very slow. Recommendations are useful, but they must not
+                    // block the core movie details + episode list.
+                    val genreResults = sortedGenres.take(3).map { genreName ->
+                        async {
+                            val slug2 = nameToSlug(genreName)
+                            if (slug2.isBlank()) return@async emptyList<SearchResponse>()
 
-                        val items = mutableListOf<SearchResponse>()
-                        // Scrape up to 2 pages of this genre (20 films/page → up to 40),
-                        // stopping early once we have enough for the grid.
-                        for (p in 1..2) {
-                            try {
-                                val url = if (p == 1) "$mainUrl/the-loai/$slug2"
-                                          else "$mainUrl/the-loai/$slug2?page=$p"
-                                val doc = fetchListingDoc(url)
-                                val rows = doc.select("table tbody tr").mapNotNull { parseCard(it) }
-                                    .filter { (it.url ?: "").trimEnd('/').substringAfterLast("/") != movie.slug }
-                                if (rows.isEmpty()) break  // no more pages
-                                items += rows
-                                if (items.size >= 24) break
-                            } catch (_: Exception) { break }
+                            val items = mutableListOf<SearchResponse>()
+                            // Scrape up to 2 pages of this genre (20 films/page → up to 40),
+                            // stopping early once we have enough for the grid.
+                            for (p in 1..2) {
+                                try {
+                                    val genreUrl = "$mainUrl/api/films/the-loai/$slug2?page=$p"
+                                    val rows = fetchApi<NguonCApiResponse>(genreUrl)
+                                        ?.items
+                                        ?.mapNotNull { parseApiItem(it) }
+                                        ?.filter { (it.url ?: "").trimEnd('/').substringAfterLast("/") != movie.slug }
+                                        ?: emptyList()
+                                    if (rows.isEmpty()) break  // no more pages
+                                    items += rows
+                                    if (items.size >= 24) break
+                                } catch (_: Exception) { break }
+                            }
+                            items
                         }
-                        items
-                    }
-                }.awaitAll()
+                    }.awaitAll()
 
-                // Pick the genre with the most results — this naturally favors
-                // the most specific genre that has many films (e.g. "Hoạt Hình"
-                // for anime) over a generic one with the same count.
-                val bestResult = genreResults.maxByOrNull { it.size } ?: emptyList()
-                if (bestResult.isNotEmpty()) {
+                    // Pick the genre with the most results — this naturally favors
+                    // the most specific genre that has many films (e.g. "Hoạt Hình"
+                    // for anime) over a generic one with the same count.
+                    val bestResult = genreResults.maxByOrNull { it.size } ?: emptyList()
                     bestResult.distinctBy { it.url }.take(30)
-                } else {
-                    // Last-resort fallback — site-wide newest films (fast, plain API).
-                    try {
-                        app.get("$mainUrl/api/films/phim-moi-cap-nhat?page=1", headers = commonHeaders)
-                            .parsedSafe<NguonCApiResponse>()?.items
-                            ?.filter { it.slug != movie.slug }
-                            ?.take(20)
-                            ?.mapNotNull { parseApiItem(it) }
-                            ?: emptyList()
-                    } catch (_: Exception) { emptyList() }
                 }
-            }
-        } catch (_: Exception) { emptyList() }
+            } catch (_: Exception) { emptyList() }
+        }?.takeIf { it.isNotEmpty() }
+            ?: fastFallbackRecommendations(movie.slug)
 
         return newTvSeriesLoadResponse(movie.name ?: "", url, TvType.TvSeries, episodes) {
             this.posterUrl       = movie.poster_url ?: movie.thumb_url
