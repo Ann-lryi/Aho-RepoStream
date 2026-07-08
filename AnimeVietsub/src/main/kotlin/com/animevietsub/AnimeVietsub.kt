@@ -89,7 +89,11 @@ class AnimeVietsubProvider : MainAPI() {
     private val TAG = "AnimeVietsub"
 
     private val USER_AGENT =
-        "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+        // Match Android System WebView shown in the user's log. The site appears
+        // to bind its JS anti-bot cookies to the browser fingerprint/UA; using a
+        // desktop/Chrome UA after solving in WebView causes the 798-byte JS stub
+        // to be returned again.
+        "Mozilla/5.0 (Linux; Android 16; PPG-AN00 Build/HONORPPG-AN00; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/138.0.7204.179 Mobile Safari/537.36"
 
     // ═══════════════════════════════════════════════════════════════════════
     //  Cloudflare Turnstile bypass — shared background WebView solve, awaited
@@ -132,8 +136,12 @@ class AnimeVietsubProvider : MainAPI() {
 
     private var cachedCfCookies: String? = null
 
-    private fun hasCfClearance(url: String): Boolean =
-        android.webkit.CookieManager.getInstance().getCookie(url)?.contains("cf_clearance") == true
+    private fun hasSolvedCookies(url: String): Boolean {
+        val cookies = android.webkit.CookieManager.getInstance().getCookie(url) ?: return false
+        // animevietsub.love sets a JS anti-bot token cookie + PHP/session cookies
+        // after the page runs in a real WebView. There is no cf_clearance cookie.
+        return cookies.contains("PHPSESSID") || cookies.contains("token")
+    }
 
     private fun syncCookiesFromWebView() {
         val cookies = android.webkit.CookieManager.getInstance().getCookie(mainUrl)
@@ -156,7 +164,7 @@ class AnimeVietsubProvider : MainAPI() {
         "Sec-Fetch-Site"       to "none",
         "Sec-Fetch-Mode"       to "navigate",
         "Sec-Fetch-Dest"       to "document",
-        "sec-ch-ua"            to "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"",
+        "sec-ch-ua"            to "\"Chromium\";v=\"138\", \"Android WebView\";v=\"138\", \"Not.A/Brand\";v=\"99\"",
         "sec-ch-ua-mobile"     to "?1",
         "sec-ch-ua-platform"   to "\"Android\""
     )
@@ -175,7 +183,7 @@ class AnimeVietsubProvider : MainAPI() {
         val job = bgScope.async {
             try {
                 cfWebView.resolveUsingWebView(mainUrl, referer = mainUrl) { req ->
-                    hasCfClearance(req.url.toString())
+                    hasSolvedCookies(mainUrl) || hasSolvedCookies(req.url.toString())
                 }
             } catch (e: Exception) {
                 println("[AVSB] WebView solve failed: ${e.message}")
@@ -337,15 +345,12 @@ class AnimeVietsubProvider : MainAPI() {
             return html1
         }
 
-        // If direct OkHttp is blocked, let a real WebView load the page once.
-        // The screenshot shows the site works in a browser and loads /ajax/player;
-        // this path mirrors that browser session and then reuses the resulting cookies.
-        println("[AVSB] httpGet short/blocked response for $url (${html1.length} chars) preview=${html1.take(120).replace("\n", " ")} — trying WebView/browser session")
-        webViewFetch(url)?.let { html ->
-            if (html.length > html1.length && !looksBlocked(html)) return html
-        }
+        // Direct OkHttp got the small JS anti-bot stub. Start exactly ONE shared
+        // WebView browser session to execute the JS/cookie challenge, then retry
+        // this same URL with the WebView-matching UA + synced cookies.
+        println("[AVSB] httpGet short/blocked response for $url (${html1.length} chars) preview=${html1.take(120).replace("\n", " ")} — waiting for shared WebView cookie solve")
 
-        println("[AVSB] waiting up to ${waitMs}ms for shared Cloudflare solve")
+        println("[AVSB] waiting up to ${waitMs}ms for shared browser solve")
         withTimeoutOrNull(waitMs) { ensureSolving().await() }
         val html2 = try {
             rawGet(url, withCookies(commonHeaders))
@@ -976,7 +981,7 @@ class AnimeVietsubProvider : MainAPI() {
             "Sec-Fetch-Site"   to "same-origin",
             "Sec-Fetch-Mode"   to "cors",
             "Sec-Fetch-Dest"   to "empty",
-            "sec-ch-ua"        to "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"",
+            "sec-ch-ua"        to "\"Chromium\";v=\"138\", \"Android WebView\";v=\"138\", \"Not.A/Brand\";v=\"99\"",
             "sec-ch-ua-mobile" to "?1",
             "sec-ch-ua-platform" to "\"Android\""
         ))
