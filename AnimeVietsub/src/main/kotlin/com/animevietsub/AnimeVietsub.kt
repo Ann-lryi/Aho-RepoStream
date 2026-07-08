@@ -14,11 +14,14 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Dns
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.dnsoverhttps.DnsOverHttps
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.URLEncoder
 import java.util.EnumSet
 
@@ -165,19 +168,45 @@ class AnimeVietsubProvider : MainAPI() {
     }
 
     /**
-     * 3 lần test riêng (cùng WiFi, cách nhau ~1-1.5 phút) đều thất bại ở tầng
-     * kết nối TCP, không phải nội dung: "Failed to connect to /[2606:4700:...]:443"
-     * tới ít nhất 4 địa chỉ IPv6 khác nhau của Cloudflare. Đây là loại lỗi từng
-     * được ghi nhận công khai độc lập với site cụ thể nào (OkHttp + IPv6 +
-     * Cloudflare, github.com/square/okhttp/issues/5186) — không chắc chắn đây
-     * là nguyên nhân duy nhất ở đây, nhưng là điều duy nhất tôi có bằng chứng
-     * cụ thể để thử sửa. app.get() dùng chung 1 OkHttpClient toàn app (kiểm tra
-     * từ source thật NiceHttp — Requests.baseClient), plugin không sửa được nó,
-     * nên dùng 1 client riêng chỉ cho httpGet, ép DNS trả về IPv4 khi có.
+     * 2026-07-08: 3 lần test WiFi trước → "Failed to connect" tới các IP IPv6
+     * Cloudflare (nghĩ là vấn đề IPv4/IPv6, đã thêm ipv4Dns bên dưới).
+     * 2026-07-08 (log mới nhất): DNS thất bại HOÀN TOÀN — "No address
+     * associated with hostname" — khác hẳn, không phải chuyện chọn IPv4/IPv6
+     * nữa. Đối chiếu cùng log: InAppUpdater gọi GitHub cách đó <1s, kết nối
+     * thành công (lỗi của nó là parse JSON, không phải mạng) — nên DNS/mạng
+     * nói chung vẫn ổn, chỉ riêng domain này bị chặn ở DNS. Nghi ngờ có căn cứ:
+     * mạng WiFi đang test chặn DNS theo domain (phổ biến với site vi phạm bản
+     * quyền tại VN) — chưa xác nhận 100% (chưa test được trên mạng khác).
+     * Thêm DoH (Cloudflare 1.1.1.1) làm phương án dự phòng khi DNS hệ thống
+     * thất bại — né được việc DNS nội bộ mạng chặn theo domain, vì hỏi thẳng
+     * resolver công khai qua HTTPS. Dùng đúng tiện ích DnsOverHttps đã có sẵn
+     * trong nicehttp (xác nhận từ source thật, không phải dependency mới).
      */
+    private val dohDns: Dns by lazy {
+        DnsOverHttps.Builder()
+            .client(OkHttpClient.Builder().build())
+            .url("https://cloudflare-dns.com/dns-query".toHttpUrl())
+            .bootstrapDnsHosts(
+                listOf(InetAddress.getByName("1.1.1.1"), InetAddress.getByName("1.0.0.1"))
+            )
+            .build()
+    }
+
     private val ipv4Dns = object : Dns {
         override fun lookup(hostname: String): List<java.net.InetAddress> {
-            val all = Dns.SYSTEM.lookup(hostname)
+            val all = try {
+                Dns.SYSTEM.lookup(hostname)
+            } catch (e: Exception) {
+                println("[AVSB] system DNS failed for $hostname :: ${e.message} — trying DoH (1.1.1.1)")
+                val dohResult = try {
+                    dohDns.lookup(hostname)
+                } catch (e2: Exception) {
+                    println("[AVSB] DoH also failed for $hostname :: ${e2.message}")
+                    throw e2
+                }
+                println("[AVSB] DoH resolved $hostname -> $dohResult")
+                dohResult
+            }
             val v4 = all.filterIsInstance<Inet4Address>()
             return v4.ifEmpty { all }
         }
