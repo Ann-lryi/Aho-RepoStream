@@ -14,6 +14,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Dns
+import okhttp3.FormBody
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -79,7 +80,7 @@ class AnimeVietsubPlugin : Plugin() {
 }
 
 class AnimeVietsubProvider : MainAPI() {
-    override var mainUrl = "https://animevietsub.pl"
+    override var mainUrl = "https://animevietsub.love"
     override var name = "AnimeVietsub"
     override var lang = "vi"
     override val hasMainPage = true
@@ -121,6 +122,15 @@ class AnimeVietsubProvider : MainAPI() {
         )
     }
 
+    private val mediaWebView: WebViewResolver by lazy {
+        WebViewResolver(
+            interceptUrl = Regex(""".*\.(m3u8|m3u|mp4)(\?|$).*"""),
+            additionalUrls = listOf(Regex(""".*ajax/player.*|.*\.(m3u8|m3u|mp4)(\?|$).*""")),
+            useOkhttp = false,
+            userAgent = null
+        )
+    }
+
     private var cachedCfCookies: String? = null
 
     private fun hasCfClearance(url: String): Boolean =
@@ -137,9 +147,19 @@ class AnimeVietsubProvider : MainAPI() {
     }
 
     private val commonHeaders = mapOf(
-        "User-Agent"      to USER_AGENT,
-        "Accept-Language" to "vi-VN,vi;q=0.9,en;q=0.8",
-        "Accept"          to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        // Match the real mobile browser seen in DevTools as closely as possible.
+        // Some animevietsub.love endpoints return short/block pages for plain
+        // OkHttp-looking requests, especially /ajax/player.
+        "User-Agent"           to USER_AGENT,
+        "Accept-Language"      to "vi-VN,vi;q=0.9,en;q=0.8",
+        "Accept"               to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Upgrade-Insecure-Requests" to "1",
+        "Sec-Fetch-Site"       to "none",
+        "Sec-Fetch-Mode"       to "navigate",
+        "Sec-Fetch-Dest"       to "document",
+        "sec-ch-ua"            to "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"",
+        "sec-ch-ua-mobile"     to "?1",
+        "sec-ch-ua-platform"   to "\"Android\""
     )
 
     private val bgScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -213,13 +233,85 @@ class AnimeVietsubProvider : MainAPI() {
     }
     private val ipv4Client = OkHttpClient.Builder().dns(ipv4Dns).build()
 
+    private fun mergeSetCookies(setCookies: List<String>) {
+        if (setCookies.isEmpty()) return
+        val jar = linkedMapOf<String, String>()
+        cachedCfCookies?.split(";")
+            ?.map { it.trim() }
+            ?.filter { it.contains("=") }
+            ?.forEach { c ->
+                val k = c.substringBefore("=").trim()
+                if (k.isNotBlank()) jar[k] = c
+            }
+        setCookies.forEach { raw ->
+            val pair = raw.substringBefore(";").trim()
+            val k = pair.substringBefore("=").trim()
+            if (k.isNotBlank() && pair.contains("=")) jar[k] = pair
+        }
+        cachedCfCookies = jar.values.joinToString("; ")
+        println("[AVSB] merged cookies: $cachedCfCookies")
+    }
+
+    private fun withCookies(headers: Map<String, String>): Map<String, String> =
+        cachedCfCookies?.let { headers + ("Cookie" to it) } ?: headers
+
     private suspend fun rawGet(url: String, headers: Map<String, String>): String =
         withContext(Dispatchers.IO) {
             val request = Request.Builder().url(url).apply {
                 headers.forEach { (k, v) -> addHeader(k, v) }
             }.build()
-            ipv4Client.newCall(request).execute().use { it.body?.string() ?: "" }
+            ipv4Client.newCall(request).execute().use { resp ->
+                mergeSetCookies(resp.headers("Set-Cookie"))
+                resp.body?.string() ?: ""
+            }
         }
+
+    private suspend fun rawPostForm(
+        url: String,
+        headers: Map<String, String>,
+        data: Map<String, String>
+    ): String = withContext(Dispatchers.IO) {
+        val form = FormBody.Builder().apply {
+            data.forEach { (k, v) -> add(k, v) }
+        }.build()
+        val request = Request.Builder().url(url).post(form).apply {
+            headers.forEach { (k, v) -> addHeader(k, v) }
+        }.build()
+        ipv4Client.newCall(request).execute().use { resp ->
+            mergeSetCookies(resp.headers("Set-Cookie"))
+            resp.body?.string() ?: ""
+        }
+    }
+
+    private suspend fun webViewFetch(url: String): String? {
+        return try {
+            val resolver = WebViewResolver(
+                interceptUrl = Regex(Regex.escape(url)),
+                additionalUrls = listOf(Regex(".")),
+                useOkhttp = false,
+                userAgent = null
+            )
+            val resp = app.get(url, headers = withCookies(commonHeaders), interceptor = resolver)
+            syncCookiesFromWebView()
+            val html = resp.text
+            println("[AVSB] WebView fetch: $url (${html.length} chars)")
+            html.ifBlank { null }
+        } catch (e: Exception) {
+            println("[AVSB] WebView fetch failed: $url :: ${e.message}")
+            null
+        }
+    }
+
+    private fun looksBlocked(html: String): Boolean {
+        val lower = html.lowercase()
+        return html.isBlank() ||
+            lower.contains("just a moment") ||
+            lower.contains("checking your browser") ||
+            lower.contains("cf-browser-verification") ||
+            lower.contains("attention required") ||
+            lower.contains("enable javascript") ||
+            (lower.contains("cloudflare") && lower.contains("challenge"))
+    }
 
     /** HTTP GET with Cloudflare bypass. Tries a plain request first (fast path
      *  once a cookie is cached). On a short/non-content response, waits up to
@@ -228,24 +320,31 @@ class AnimeVietsubProvider : MainAPI() {
      *  longer than waitMs regardless of how long the solve itself takes. */
     private suspend fun httpGet(url: String): String {
         val waitMs = 8_000L
-        val headers1 = cachedCfCookies?.let { commonHeaders + ("Cookie" to it) } ?: commonHeaders
         val html1 = try {
-            rawGet(url, headers1)
+            rawGet(url, withCookies(commonHeaders))
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
             println("[AVSB] httpGet failed: $url :: ${e.message}")
             ""
         }
-        if (html1.length > 2000) {
+        if (html1.length > 2000 && !looksBlocked(html1)) {
             println("[AVSB] httpGet: $url (${html1.length} chars)")
             return html1
         }
-        println("[AVSB] httpGet short response for $url (${html1.length} chars) — waiting up to ${waitMs}ms for shared solve")
+
+        // If direct OkHttp is blocked, let a real WebView load the page once.
+        // The screenshot shows the site works in a browser and loads /ajax/player;
+        // this path mirrors that browser session and then reuses the resulting cookies.
+        println("[AVSB] httpGet short/blocked response for $url (${html1.length} chars) — trying WebView/browser session")
+        webViewFetch(url)?.let { html ->
+            if (html.length > html1.length && !looksBlocked(html)) return html
+        }
+
+        println("[AVSB] waiting up to ${waitMs}ms for shared Cloudflare solve")
         withTimeoutOrNull(waitMs) { ensureSolving().await() }
-        val headers2 = cachedCfCookies?.let { commonHeaders + ("Cookie" to it) } ?: commonHeaders
         val html2 = try {
-            rawGet(url, headers2)
+            rawGet(url, withCookies(commonHeaders))
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -253,7 +352,7 @@ class AnimeVietsubProvider : MainAPI() {
             ""
         }
         println("[AVSB] httpGet after wait: $url (${html2.length} chars)")
-        return html2
+        return if (html2.length >= html1.length) html2 else html1
     }
 
     private suspend fun httpGetDoc(url: String) =
@@ -731,7 +830,7 @@ class AnimeVietsubProvider : MainAPI() {
         if (!linkFound) {
             println("[AVSB] S3: WebView m3u8 capture...")
             try {
-                val resp = app.get(watchUrl, headers = commonHeaders)
+                val resp = app.get(watchUrl, headers = withCookies(commonHeaders), interceptor = mediaWebView)
                 val capturedUrl = resp.url ?: ""
                 val content = resp.text
                 println("[AVSB]   S3 captured URL: ${capturedUrl.take(120)}")
@@ -768,7 +867,7 @@ class AnimeVietsubProvider : MainAPI() {
         if (!linkFound) {
             println("[AVSB] S4: CF interceptor broad capture...")
             try {
-                val resp = app.get(watchUrl, headers = commonHeaders)
+                val resp = app.get(watchUrl, headers = withCookies(commonHeaders), interceptor = mediaWebView)
                 val capturedUrl = resp.url ?: ""
                 val content = resp.text
                 println("[AVSB]   S4 captured URL: ${capturedUrl.take(120)}")
@@ -861,14 +960,20 @@ class AnimeVietsubProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val ajaxUrl = "$mainUrl/ajax/player"
-        val ajaxHeaders = mapOf(
+        val ajaxHeaders = withCookies(mapOf(
             "User-Agent"       to USER_AGENT,
             "Referer"          to referer,
             "Origin"           to mainUrl,
             "X-Requested-With" to "XMLHttpRequest",
             "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
-            "Accept"           to "application/json, text/javascript, */*; q=0.01"
-        )
+            "Accept"           to "application/json, text/javascript, */*; q=0.01",
+            "Sec-Fetch-Site"   to "same-origin",
+            "Sec-Fetch-Mode"   to "cors",
+            "Sec-Fetch-Dest"   to "empty",
+            "sec-ch-ua"        to "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"",
+            "sec-ch-ua-mobile" to "?1",
+            "sec-ch-ua-platform" to "\"Android\""
+        ))
 
         // EXACT POST body from pl.watchbk2.js AnimeVsub() function:
         //   data: { "link": level, "id": deepDataAndEvents }
@@ -879,8 +984,7 @@ class AnimeVietsubProvider : MainAPI() {
 
         return try {
             println("[AVSB]   POST /ajax/player with EXACT params: link=${epHash.take(40)}... id=$filmID")
-            val resp = app.post(ajaxUrl, headers = ajaxHeaders, data = params)
-            val body = resp.text
+            val body = rawPostForm(ajaxUrl, ajaxHeaders, params)
             println("[AVSB]   response (${body.length} chars): ${body.take(300)}")
 
             if (body.isBlank()) {
@@ -1011,11 +1115,15 @@ class AnimeVietsubProvider : MainAPI() {
         label: String? = null
     ): Boolean {
         return try {
-            val headers = mapOf(
+            val headers = withCookies(mapOf(
                 "User-Agent" to USER_AGENT,
                 "Referer"    to referer,
-                "Origin"     to mainUrl
-            )
+                "Origin"     to mainUrl,
+                "Accept"     to "*/*",
+                "Sec-Fetch-Site" to "cross-site",
+                "Sec-Fetch-Mode" to "cors",
+                "Sec-Fetch-Dest" to "empty"
+            ))
             val resp = app.get(m3u8Url, headers = headers)
             if (resp.code != 200 || !resp.text.contains("#EXTM3U")) {
                 // Not m3u8 — try as mp4
@@ -1083,11 +1191,15 @@ class AnimeVietsubProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val embedHtml = try {
-            app.get(embedUrl, headers = mapOf(
-                "User-Agent" to USER_AGENT,
-                "Referer"    to referer,
-                "Accept"     to "text/html,application/xhtml+xml,*/*;q=0.8"
-            )).text
+            if (embedUrl.startsWith(mainUrl)) {
+                httpGet(embedUrl)
+            } else {
+                app.get(embedUrl, headers = withCookies(mapOf(
+                    "User-Agent" to USER_AGENT,
+                    "Referer"    to referer,
+                    "Accept"     to "text/html,application/xhtml+xml,*/*;q=0.8"
+                ))).text
+            }
         } catch (e: Exception) {
             println("[AVSB]   embed fetch failed: ${e.message}")
             return false
