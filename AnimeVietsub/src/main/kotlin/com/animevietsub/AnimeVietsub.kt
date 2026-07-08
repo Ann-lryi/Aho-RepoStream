@@ -1,6 +1,7 @@
 package com.animevietsub
 
 import android.util.Log
+import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
@@ -126,9 +127,13 @@ class AnimeVietsubProvider : MainAPI() {
     }
 
     private val mediaWebView: WebViewResolver by lazy {
+        val mediaRegex = Regex(""".*\.(m3u8|m3u|mp4)(\?.*)?$""", RegexOption.IGNORE_CASE)
         WebViewResolver(
-            interceptUrl = Regex(""".*\.(m3u8|m3u|mp4)(\?|$).*"""),
-            additionalUrls = listOf(Regex(""".*ajax/player.*|.*\.(m3u8|m3u|mp4)(\?|$).*""")),
+            interceptUrl = mediaRegex,
+            // Do NOT include ajax/player here. In practice additionalUrls can
+            // cause WebViewResolver to return non-media side requests, which is
+            // how we previously captured /cdn-cgi/speculation instead of HTML.
+            additionalUrls = emptyList(),
             useOkhttp = false,
             userAgent = null
         )
@@ -828,11 +833,21 @@ class AnimeVietsubProvider : MainAPI() {
 
         // ── Strategy 2: POST /ajax/player with extracted hash + IDs ──
         // (endpoint confirmed from screenshot DevTools panel)
-        if (epHash != null && filmID != null && epID != null) {
+        val ajaxAttempted = epHash != null && filmID != null && epID != null
+        if (ajaxAttempted) {
             println("[AVSB] S2: POST /ajax/player with hash + filmId + epId...")
-            if (postAjaxPlayer(epHash, filmID, epID, playTech, watchUrl, callback)) {
+            if (postAjaxPlayer(epHash!!, filmID!!, epID!!, playTech, watchUrl, callback)) {
                 linkFound = true
             }
+        }
+
+        // If AJAX succeeded as a request but no playable link was extracted,
+        // avoid burning 60s on the watch page WebView. The actionable player is
+        // the iframe returned by /ajax/player, and processEmbedUrl() already tries
+        // both static extraction and WebView media capture on that iframe.
+        if (ajaxAttempted && !linkFound) {
+            println("[AVSB] AJAX player path produced no playable media; skipping slow watch-page WebView fallbacks")
+            return false
         }
 
         // ── Strategy 3: WebView m3u8 capture ──
@@ -1216,32 +1231,75 @@ class AnimeVietsubProvider : MainAPI() {
             return false
         }
 
-        // Look for m3u8 / mp4 URLs in the embed page
-        val urlPatterns = listOf(
-            Regex("""file\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE),
-            Regex("""source\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE),
-            Regex("""["']([^"']+\.m3u8[^"']*)["']"""),
-            Regex("""file\s*[:=]\s*["']([^"']+\.mp4[^"']*)["']""", RegexOption.IGNORE_CASE),
-            Regex("""source\s*[:=]\s*["']([^"']+\.mp4[^"']*)["']""", RegexOption.IGNORE_CASE),
-            Regex("""["']([^"']+\.mp4[^"']*)["']""")
-        )
+        println("[AVSB]   embed fetch ${embedUrl.take(70)} len=${embedHtml.length} preview=${embedHtml.take(180).replace("\n", " ")}")
 
-        val mediaUrls = mutableSetOf<String>()
-        for (pattern in urlPatterns) {
-            pattern.findAll(embedHtml).forEach { m ->
-                val u = m.groupValues[1].replace("\\/", "/")
-                if (u.isNotBlank() && !u.contains("blob:") && (u.startsWith("http") || u.startsWith("//"))) {
-                    mediaUrls.add(if (u.startsWith("//")) "https:$u" else u)
-                }
-            }
-            if (mediaUrls.isNotEmpty()) break
+        fun cleanMediaUrl(raw: String): String {
+            return raw
+                .replace("\\/", "/")
+                .replace("\\u0026", "&")
+                .replace("&amp;", "&")
+                .let { if (it.startsWith("//")) "https:$it" else it }
         }
 
-        println("[AVSB]   embed ${embedUrl.take(50)} → ${mediaUrls.size} media URLs")
+        fun scanMediaUrls(text: String): Set<String> {
+            val out = linkedSetOf<String>()
+            // 1) Any full URL that already contains a known media extension.
+            Regex("""https?:\\?/\\?/[^\s"'<>\\]+""", RegexOption.IGNORE_CASE)
+                .findAll(text)
+                .map { cleanMediaUrl(it.value) }
+                .filter { !it.contains("blob:") && (it.contains(".m3u8", true) || it.contains(".m3u", true) || it.contains(".mp4", true)) }
+                .forEach { out.add(it) }
+
+            // 2) Common JS player fields: file/src/source/url.
+            Regex("""(?i)(?:file|src|source|url)\s*[:=]\s*["']([^"']+)["']""")
+                .findAll(text)
+                .map { cleanMediaUrl(it.groupValues[1]) }
+                .filter { !it.contains("blob:") && (it.startsWith("http") || it.startsWith("//")) && (it.contains(".m3u8", true) || it.contains(".m3u", true) || it.contains(".mp4", true)) }
+                .forEach { out.add(it) }
+
+            // 3) Base64 wrappers such as atob('...') sometimes hold the source.
+            Regex("""atob\s*\(\s*["']([^"']{20,})["']\s*\)""", RegexOption.IGNORE_CASE)
+                .findAll(text)
+                .forEach { m ->
+                    try {
+                        val decoded = String(Base64.decode(m.groupValues[1], Base64.DEFAULT), Charsets.UTF_8)
+                        out.addAll(scanMediaUrls(decoded))
+                    } catch (_: Exception) {}
+                }
+            return out
+        }
+
+        var mediaUrls = scanMediaUrls(embedHtml)
+        println("[AVSB]   embed static scan → ${mediaUrls.size} media URLs")
 
         var anyFound = false
         for (mediaUrl in mediaUrls) {
             if (tryM3U8Link(mediaUrl, embedUrl, callback)) anyFound = true
+        }
+        if (anyFound) return true
+
+        // Static HTML had no direct URL. Execute the iframe in a real WebView and
+        // capture the first requested m3u8/mp4. This is the correct fallback for
+        // /ajax/player responses with playTech='iframe'.
+        println("[AVSB]   embed WebView media capture: ${embedUrl.take(80)}")
+        try {
+            val resp = app.get(embedUrl, headers = withCookies(mapOf(
+                "User-Agent" to USER_AGENT,
+                "Referer"    to referer,
+                "Accept"     to "text/html,application/xhtml+xml,*/*;q=0.8"
+            )), interceptor = mediaWebView)
+            val capturedUrl = resp.url ?: ""
+            val content = resp.text
+            println("[AVSB]   embed WebView captured URL: ${capturedUrl.take(160)} len=${content.length} preview=${content.take(120).replace("\n", " ")}")
+            if (capturedUrl.contains(".m3u", true) || capturedUrl.contains(".mp4", true)) {
+                if (tryM3U8Link(capturedUrl, embedUrl, callback)) return true
+            }
+            mediaUrls = scanMediaUrls(content)
+            for (mediaUrl in mediaUrls) {
+                if (tryM3U8Link(mediaUrl, embedUrl, callback)) anyFound = true
+            }
+        } catch (e: Exception) {
+            println("[AVSB]   embed WebView capture failed: ${e.message}")
         }
         return anyFound
     }
