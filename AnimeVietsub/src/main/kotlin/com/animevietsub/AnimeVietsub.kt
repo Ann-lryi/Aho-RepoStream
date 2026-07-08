@@ -284,16 +284,21 @@ class AnimeVietsubProvider : MainAPI() {
 
     private suspend fun webViewFetch(url: String): String? {
         return try {
+            // IMPORTANT: do NOT use additionalUrls = "." here. In the latest log
+            // WebView did load the real site, but WebViewResolver returned the tiny
+            // /cdn-cgi/speculation response (151 chars), so Cloudstream had nothing
+            // to parse. Capture ONLY the requested document URL.
+            val exactUrl = Regex("^${Regex.escape(url)}$".replace("/\$", "/?\$"))
             val resolver = WebViewResolver(
-                interceptUrl = Regex(Regex.escape(url)),
-                additionalUrls = listOf(Regex(".")),
+                interceptUrl = exactUrl,
+                additionalUrls = emptyList(),
                 useOkhttp = false,
                 userAgent = null
             )
             val resp = app.get(url, headers = withCookies(commonHeaders), interceptor = resolver)
             syncCookiesFromWebView()
             val html = resp.text
-            println("[AVSB] WebView fetch: $url (${html.length} chars)")
+            println("[AVSB] WebView document fetch: $url (${html.length} chars) preview=${html.take(120).replace("\n", " ")}")
             html.ifBlank { null }
         } catch (e: Exception) {
             println("[AVSB] WebView fetch failed: $url :: ${e.message}")
@@ -335,7 +340,7 @@ class AnimeVietsubProvider : MainAPI() {
         // If direct OkHttp is blocked, let a real WebView load the page once.
         // The screenshot shows the site works in a browser and loads /ajax/player;
         // this path mirrors that browser session and then reuses the resulting cookies.
-        println("[AVSB] httpGet short/blocked response for $url (${html1.length} chars) — trying WebView/browser session")
+        println("[AVSB] httpGet short/blocked response for $url (${html1.length} chars) preview=${html1.take(120).replace("\n", " ")} — trying WebView/browser session")
         webViewFetch(url)?.let { html ->
             if (html.length > html1.length && !looksBlocked(html)) return html
         }
