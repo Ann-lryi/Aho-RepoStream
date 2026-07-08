@@ -24,7 +24,6 @@ import org.jsoup.nodes.Element
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.URLEncoder
-import java.util.EnumSet
 
 /**
  * AnimeVietsub plugin for CloudStream 3.
@@ -542,9 +541,11 @@ class AnimeVietsubProvider : MainAPI() {
         return newAnimeSearchResponse(title, href, tvType) {
             this.posterUrl = poster
             if (quality != null) this.quality = quality
-            this.dubStatus = EnumSet.of(DubStatus.Subbed)
+            // Do not set AnimeSearchResponse.dubStatus / episodes properties directly.
+            // Some Cloudstream prerelease builds do not expose those setters at runtime
+            // (NoSuchMethodError: setDubStatus). Use the official helper instead.
             if (epCount != null && epCount > 0) {
-                this.episodes = mutableMapOf(DubStatus.Subbed to epCount)
+                addSub(epCount)
             }
         }
     }
