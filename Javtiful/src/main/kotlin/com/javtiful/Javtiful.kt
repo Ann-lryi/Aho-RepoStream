@@ -246,7 +246,7 @@ class JavtifulProvider : MainAPI() {
         "$mainUrl$VN/actresses" To " Diễn Viên"
     )
 
-    /** Cache duration for list-page fetches (5 minutes). */
+    /** Cache duration for list-page fetches (5 minutes). */ 
     private val listCacheTime = 300
 
     // ────────────────────────────────────────────────────────────────────
