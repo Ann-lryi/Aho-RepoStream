@@ -127,7 +127,7 @@ class AnimeVietsubProvider : MainAPI() {
     }
 
     private val mediaWebView: WebViewResolver by lazy {
-        val mediaRegex = Regex(""".*\.(m3u8|m3u|mp4)(\?.*)?$""", RegexOption.IGNORE_CASE)
+        val mediaRegex = Regex(""".*(\.(m3u8|m3u|mp4)(\?.*)?$|/manifest(\?.*)?$|/playlist(\?.*)?$|/stream(\?.*)?$|/source(\?.*)?$|videoplayback)""", RegexOption.IGNORE_CASE)
         WebViewResolver(
             interceptUrl = mediaRegex,
             // Do NOT include ajax/player here. In practice additionalUrls can
@@ -395,6 +395,18 @@ class AnimeVietsubProvider : MainAPI() {
         val base = mainUrl.removeSuffix("/")
         return if (cleanUrl.startsWith("/")) "$base$cleanUrl" else "$base/$cleanUrl"
     }
+
+    /**
+     * storage.googleapiscdn.com/player blocks top-level playback unless the
+     * browser/player flow appends isFinal=1. The user's DevTools screenshots show
+     * successful player/status requests using the player URL with ?isFinal=1.
+     */
+    private fun finalPlayerUrl(url: String): String {
+        if (!url.contains("storage.googleapiscdn.com/player", ignoreCase = true)) return url
+        if (url.contains("isFinal=", ignoreCase = true)) return url
+        return url + (if (url.contains("?")) "&" else "?") + "isFinal=1"
+    }
+
 
     /** Fetch a Document via httpGet (Cloudflare bypass through cfWebView interceptor).
      *  Returns null if the response was blank. */
@@ -1102,8 +1114,9 @@ class AnimeVietsubProvider : MainAPI() {
                         val url = linkStr.replace("\\/", "/")
                         if (url.startsWith("http")) {
                             println("[AVSB]   iframe URL: ${url.take(80)}")
-                            // Fetch the iframe page and extract m3u8 from it
-                            if (processEmbedUrl(url, referer, callback)) anyFound = true
+                            // Fetch the iframe page and extract m3u8 from it.
+                            // Add isFinal=1 for the protected storage.googleapiscdn player.
+                            if (processEmbedUrl(finalPlayerUrl(url), referer, callback)) anyFound = true
                         }
                     }
                 }
@@ -1216,11 +1229,12 @@ class AnimeVietsubProvider : MainAPI() {
         referer: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        val playerUrl = finalPlayerUrl(embedUrl)
         val embedHtml = try {
-            if (embedUrl.startsWith(mainUrl)) {
-                httpGet(embedUrl)
+            if (playerUrl.startsWith(mainUrl)) {
+                httpGet(playerUrl)
             } else {
-                app.get(embedUrl, headers = withCookies(mapOf(
+                app.get(playerUrl, headers = withCookies(mapOf(
                     "User-Agent" to USER_AGENT,
                     "Referer"    to referer,
                     "Accept"     to "text/html,application/xhtml+xml,*/*;q=0.8"
@@ -1231,7 +1245,7 @@ class AnimeVietsubProvider : MainAPI() {
             return false
         }
 
-        println("[AVSB]   embed fetch ${embedUrl.take(70)} len=${embedHtml.length} preview=${embedHtml.take(180).replace("\n", " ")}")
+        println("[AVSB]   embed fetch ${playerUrl.take(90)} len=${embedHtml.length} preview=${embedHtml.take(180).replace("\n", " ")}")
 
         fun cleanMediaUrl(raw: String): String {
             return raw
@@ -1270,13 +1284,13 @@ class AnimeVietsubProvider : MainAPI() {
         }
 
         suspend fun tryStatusEndpoint(): Boolean {
-            val origin = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: return false
-            val playerId = embedUrl.substringAfterLast("/").substringBefore("?")
+            val origin = Regex("""https?://[^/]+""").find(playerUrl)?.value ?: return false
+            val playerId = playerUrl.substringAfterLast("/").substringBefore("?")
             if (playerId.isBlank()) return false
             val statusUrl = "$origin/status/$playerId"
             val statusHeaders = withCookies(mapOf(
                 "User-Agent" to USER_AGENT,
-                "Referer" to embedUrl,
+                "Referer" to playerUrl,
                 "Origin" to origin,
                 "Accept" to "application/json, text/plain, */*",
                 "X-Requested-With" to "XMLHttpRequest",
@@ -1303,7 +1317,7 @@ class AnimeVietsubProvider : MainAPI() {
                     useOkhttp = false,
                     userAgent = null
                 )
-                val resp = app.get(embedUrl, headers = statusHeaders, interceptor = statusResolver)
+                val resp = app.get(playerUrl, headers = statusHeaders, interceptor = statusResolver)
                 val body = resp.text
                 println("[AVSB]   status WebView ${resp.url?.take(120)} len=${body.length} preview=${body.take(220).replace("\n", " ")}")
                 statusBodies += body
@@ -1315,7 +1329,7 @@ class AnimeVietsubProvider : MainAPI() {
                 val found = scanMediaUrls(body)
                 println("[AVSB]   status scan → ${found.size} media URLs")
                 for (mediaUrl in found) {
-                    if (tryM3U8Link(mediaUrl, embedUrl, callback)) return true
+                    if (tryM3U8Link(mediaUrl, playerUrl, callback)) return true
                 }
 
                 // Some player APIs return JSON-escaped strings or base64-ish blobs
@@ -1329,7 +1343,7 @@ class AnimeVietsubProvider : MainAPI() {
                             val nested = scanMediaUrls(decoded)
                             if (nested.isNotEmpty()) println("[AVSB]   status base64 nested scan → ${nested.size} media URLs")
                             for (mediaUrl in nested) {
-                                if (tryM3U8Link(mediaUrl, embedUrl, callback)) return true
+                                if (tryM3U8Link(mediaUrl, playerUrl, callback)) return true
                             }
                         } catch (_: Exception) {}
                     }
@@ -1343,7 +1357,7 @@ class AnimeVietsubProvider : MainAPI() {
 
         var anyFound = false
         for (mediaUrl in mediaUrls) {
-            if (tryM3U8Link(mediaUrl, embedUrl, callback)) anyFound = true
+            if (tryM3U8Link(mediaUrl, playerUrl, callback)) anyFound = true
         }
         if (anyFound) return true
 
@@ -1352,9 +1366,9 @@ class AnimeVietsubProvider : MainAPI() {
         // Static HTML had no direct URL. Execute the iframe in a real WebView and
         // capture the first requested m3u8/mp4. This is the correct fallback for
         // /ajax/player responses with playTech='iframe'.
-        println("[AVSB]   embed WebView media capture: ${embedUrl.take(80)}")
+        println("[AVSB]   embed WebView media capture: ${playerUrl.take(100)}")
         try {
-            val resp = app.get(embedUrl, headers = withCookies(mapOf(
+            val resp = app.get(playerUrl, headers = withCookies(mapOf(
                 "User-Agent" to USER_AGENT,
                 "Referer"    to referer,
                 "Accept"     to "text/html,application/xhtml+xml,*/*;q=0.8"
@@ -1363,11 +1377,11 @@ class AnimeVietsubProvider : MainAPI() {
             val content = resp.text
             println("[AVSB]   embed WebView captured URL: ${capturedUrl.take(160)} len=${content.length} preview=${content.take(120).replace("\n", " ")}")
             if (capturedUrl.contains(".m3u", true) || capturedUrl.contains(".mp4", true)) {
-                if (tryM3U8Link(capturedUrl, embedUrl, callback)) return true
+                if (tryM3U8Link(capturedUrl, playerUrl, callback)) return true
             }
             mediaUrls = scanMediaUrls(content)
             for (mediaUrl in mediaUrls) {
-                if (tryM3U8Link(mediaUrl, embedUrl, callback)) anyFound = true
+                if (tryM3U8Link(mediaUrl, playerUrl, callback)) anyFound = true
             }
         } catch (e: Exception) {
             println("[AVSB]   embed WebView capture failed: ${e.message}")
