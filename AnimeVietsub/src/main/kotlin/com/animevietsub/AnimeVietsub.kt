@@ -143,9 +143,16 @@ class AnimeVietsubProvider : MainAPI() {
 
     private fun hasSolvedCookies(url: String): Boolean {
         val cookies = android.webkit.CookieManager.getInstance().getCookie(url) ?: return false
-        // animevietsub.love sets a JS anti-bot token cookie + PHP/session cookies
-        // after the page runs in a real WebView. There is no cf_clearance cookie.
-        return cookies.contains("PHPSESSID") || cookies.contains("token")
+        // animevietsub.love does NOT set cf_clearance. It serves a tiny JS page
+        // that eventually sets BOTH:
+        //   1) app/session cookies (PHPSESSID/token...)
+        //   2) a dynamic 32-hex-name anti-bot cookie (e.g. a42a20...=...)
+        // The latest failing log showed we returned as soon as PHPSESSID/token
+        // existed, before the dynamic anti-bot cookie was present, so the retry
+        // still got the 798-byte challenge page. Wait for both classes.
+        val hasSession = cookies.contains("PHPSESSID") || cookies.contains("token")
+        val hasDynamicAntiBot = Regex("""(?:^|;\s*)[a-f0-9]{32}=""", RegexOption.IGNORE_CASE).containsMatchIn(cookies)
+        return hasSession && hasDynamicAntiBot
     }
 
     private fun syncCookiesFromWebView() {
@@ -183,6 +190,7 @@ class AnimeVietsubProvider : MainAPI() {
      *  httpGet (see waitMs below), so it can never cause the "Timed out
      *  waiting for 120000 ms" CloudStream framework error seen on-device
      *  when a previous version awaited resolveUsingWebView() directly here. */
+    @Synchronized
     private fun ensureSolving(): Deferred<Unit> {
         solveJob?.let { if (it.isActive) return it }
         val job = bgScope.async {
@@ -336,7 +344,7 @@ class AnimeVietsubProvider : MainAPI() {
      *  win either way: fast if the solve finishes quickly, and never blocks
      *  longer than waitMs regardless of how long the solve itself takes. */
     private suspend fun httpGet(url: String): String {
-        val waitMs = 8_000L
+        val waitMs = 10_000L
         val html1 = try {
             rawGet(url, withCookies(commonHeaders))
         } catch (e: kotlinx.coroutines.CancellationException) {
