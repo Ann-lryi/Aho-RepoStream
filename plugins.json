@@ -1,0 +1,85 @@
+[
+    {
+        "iconUrl": "https://www.animevietsub.love/favicon.ico",
+        "fileHash": "sha256-6ffb135a530792b1fb4ff1bd31ed96d1e989cde187438207645e9958f5235000",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Ann-lryi/Aho-RepoStream",
+        "fileSize": 59941,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "AnimeVietsub"
+        ],
+        "tvTypes": [
+            "Movie",
+            "AnimeMovie"
+        ],
+        "version": 1,
+        "internalName": "AnimeVietsub",
+        "description": "Vietnamese anime streaming site",
+        "url": "https://raw.githubusercontent.com/Ann-lryi/Aho-RepoStream/builds/AnimeVietsub.cs3",
+        "name": "AnimeVietsub"
+    },
+    {
+        "iconUrl": "https://hanime1.me/favicon.ico",
+        "fileHash": "sha256-aa2f911cce9e793e1d26453705568a4470871f85fc4e384b0a22611bf7173747",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Ann-lryi/Aho-RepoStream",
+        "fileSize": 22591,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "Hanime1"
+        ],
+        "tvTypes": [
+            "Movie",
+            "AnimeMovie"
+        ],
+        "version": 1,
+        "internalName": "Hanime1",
+        "description": "Vietnamese anime streaming site",
+        "url": "https://raw.githubusercontent.com/Ann-lryi/Aho-RepoStream/builds/Hanime1.cs3",
+        "name": "Hanime1"
+    },
+    {
+        "iconUrl": "https://javtiful.com/favicon.ico",
+        "fileHash": "sha256-ef5eb7627592c2507af94ec2dea8c3db791ea5a44763eddf387fdfcb00d9c551",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Ann-lryi/Aho-RepoStream",
+        "fileSize": 29323,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "Javtiful"
+        ],
+        "tvTypes": [
+            "NSFW"
+        ],
+        "version": 1,
+        "internalName": "Javtiful",
+        "description": "Vietnamese anime streaming site",
+        "url": "https://raw.githubusercontent.com/Ann-lryi/Aho-RepoStream/builds/Javtiful.cs3",
+        "name": "Javtiful"
+    },
+    {
+        "iconUrl": "https://phim.nguonc.com/favicon.ico",
+        "fileHash": "sha256-41f053f80c3a26736d63ea728a2c16839a13c6ef1dda5214c3d1e8b3bec055e5",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Ann-lryi/Aho-RepoStream",
+        "fileSize": 89010,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "NguonC"
+        ],
+        "tvTypes": [
+            "Movie",
+            "AnimeMovie"
+        ],
+        "version": 1,
+        "internalName": "NguonC",
+        "description": "Vietnamese anime streaming site",
+        "url": "https://raw.githubusercontent.com/Ann-lryi/Aho-RepoStream/builds/NguonC.cs3",
+        "name": "NguonC"
+    }
+]
