@@ -243,7 +243,7 @@ class JavtifulProvider : MainAPI() {
         "$mainUrl$VN/category/female-investigator" to "Đồ bó",
         "$mainUrl$VN/category/office-lady" to "công ty",
         "$mainUrl$VN/category/female-teacher" to "giáo viên",
-        "$mainUrl$VN/actresses" To " Diễn Viên"
+        "$mainUrl$VN/actresses" to " Diễn Viên"
     )
 
     /** Cache duration for list-page fetches (5 minutes). */ 
