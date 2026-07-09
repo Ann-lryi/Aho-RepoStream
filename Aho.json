@@ -4,6 +4,6 @@
     "description": "Aho-Repo",
     "manifestVersion": 1,
     "pluginLists": [
-      "https://raw.githubusercontent.com/Ann-lryi/Aho-RepoStream/refs/heads/builds/All-Plugin.json"
+      "https://raw.githubusercontent.com/Ann-lryi/Aho-RepoStream/refs/heads/builds/plugins.json"
     ]
 }
