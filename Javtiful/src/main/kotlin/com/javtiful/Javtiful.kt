@@ -238,10 +238,16 @@ class JavtifulProvider : MainAPI() {
 
     override val mainPage = mainPageOf(
         "$mainUrl$VN/videos" to "Mới",
-        "$mainUrl$VN/javhd" to "Jav",
-        "$mainUrl$VN/category/female-investigator" to "Đồ bó",
-        "$mainUrl$VN/category/office-lady" to "công ty",
-        "$mainUrl$VN/category/female-teacher" to "giáo viên"
+        "$mainUrl$VN/actress/itsukaichi-mei" to "itsukaichi-mei",
+        "$mainUrl$VN/actress/iioka-kanako" to "iioka-kanako",
+        "$mainUrl$VN/actress/yamamoto-shuri" to "yamamoto-shuri",
+        "$mainUrl$VN/actress/akari-tsumugi" to "akari-tsumugi",
+        "$mainUrl$VN/actress/suzumori-remu" to "suzumori-remu",
+        "$mainUrl$VN/actress/mitsumi-an" to "mitsumi-an",
+        "$mainUrl$VN/actress/nanatsumori-riri" to "nanatsumori-riri",
+        "$mainUrl$VN/actress/aizawa-minami" to "aizawa-minami",
+        "$mainUrl$VN/actress/kurimiya-futaba" to "kurimiya-futaba"
+        
     )
 
     /** Cache duration for list-page fetches (5 minutes). */ 
