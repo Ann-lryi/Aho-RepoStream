@@ -1289,6 +1289,208 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    //  NEW FLOW (reverse-engineered 2026-09): Stream Panel "lite-15-cf-free"
+    //  + "guard-7" anti-bot protection on streamc.xyz
+    //
+    //  What changed on the site (this is why the old data-obf flow broke):
+    //    1. GET /embed.php?hash=... now returns an EMPTY shell page — no
+    //       data-obf, no token, only a bootstrap JSON + cdn-start.js loader.
+    //    2. The page itself POSTs {"action":"bootstrap"} to the same embed.php
+    //       (Origin header REQUIRED, else 403 {"error":"wrong_origin"}) and
+    //       receives {bootstrap:<JWT ~3min>, nonce, turnstileEnabled, ...}.
+    //    3. When turnstileEnabled=true, the page must solve a Cloudflare
+    //       Turnstile challenge (widget #turnstile-container, action
+    //       "playback", cData=nonce, 150s timeout) — impossible via plain HTTP.
+    //    4. Then it POSTs {"action":"issue", bootstrap, turnstile_response,
+    //       "playlist_format":"hls"|"aesgcm", pretty_url:true, path_chunks:true}
+    //       -> {playlist:<url>, issuedAt, expiresAt}.
+    //       Mobile UA => "hls" => PLAIN #EXTM3U playlist.
+    //       No/invalid Turnstile token => 403 {"error":"verification_failed"}.
+    //    5. The playlist URL is a "pretty URL": same embed origin, path made of
+    //       80..5500 base64url chars, NO .m3u8/.m3u9 extension, query empty or
+    //       "?d" (or /conf.php?t=...). Extension-less ON PURPOSE to defeat naive
+    //       scrapers — hence the dedicated WebView regex below.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /** Mobile UA so the server hands out the PLAIN "hls" playlist format */
+    private val streamcMobileUA =
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 " +
+            "(KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+
+    /** Serializes the cheap HTTP handshake so parallel servers don't trip 429 */
+    private val streamcHttpMutex = Mutex()
+
+    /** Matches the extension-less "pretty URL" playlist (see flow description) */
+    private val streamcPlaylistInterceptor = WebViewResolver(
+        Regex("""https?://[A-Za-z0-9.-]*streamc\.xyz/(?:conf\.php\?t=[^&\s]+|(?!embed\.php)[A-Za-z0-9_/-]{80,6000}(?:\?d)?)""")
+    )
+
+    /** Minimal JSON string getter — avoids depending on JSON library signatures */
+    private fun streamcJsonString(json: String, key: String): String? {
+        val m = Regex(""""$key"\s*:\s*"((?:[^"\\]|\\.)*)"""").find(json) ?: return null
+        return m.groupValues[1].replace("\\/", "/")
+    }
+
+    /** Plain GET with the mobile identity (playlist fetches) */
+    private fun streamcGet(url: String, embedDomain: String, referer: String): String? {
+        return try {
+            val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            conn.connectTimeout = 15000
+            conn.readTimeout = 30000
+            conn.instanceFollowRedirects = true
+            conn.setRequestProperty("Accept", "*/*")
+            conn.setRequestProperty("Origin", embedDomain)
+            conn.setRequestProperty("Referer", referer)
+            conn.setRequestProperty("User-Agent", streamcMobileUA)
+            conn.connect()
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            val text = try { stream?.bufferedReader()?.use { it.readText() } } catch (_: Exception) { null }
+            try { conn.disconnect() } catch (_: Exception) {}
+            if (code in 200..299) text else null
+        } catch (e: Exception) {
+            println("[NguonC] [StreamcNew] GET failed: ${e.message}")
+            null
+        }
+    }
+
+    /** Raw JSON POST via HttpURLConnection (full control over Origin/UA) */
+    private fun streamcPostJson(
+        url: String, embedDomain: String, referer: String, body: String
+    ): Pair<Int, String?> {
+        return try {
+            val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.connectTimeout = 15000
+            conn.readTimeout = 20000
+            conn.instanceFollowRedirects = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.setRequestProperty("Accept", "application/json, text/plain, */*")
+            conn.setRequestProperty("Origin", embedDomain)
+            conn.setRequestProperty("Referer", referer)
+            conn.setRequestProperty("User-Agent", streamcMobileUA)
+            conn.doOutput = true
+            conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            val text = try { stream?.bufferedReader()?.use { it.readText() } } catch (_: Exception) { null }
+            try { conn.disconnect() } catch (_: Exception) {}
+            Pair(code, text)
+        } catch (e: Exception) {
+            println("[NguonC] [StreamcNew] POST failed: ${e.message}")
+            Pair(-1, null)
+        }
+    }
+
+    /**
+     * STEP 0a (NEW): fast plain-HTTP handshake.
+     * bootstrap -> issue (only possible when the video has Turnstile DISABLED)
+     * -> playlist -> register. If Turnstile is enabled we bail out instantly
+     * (the token cannot be obtained over plain HTTP) and the WebView flow runs.
+     */
+    private suspend fun tryStreamcDirectFlow(
+        embedUrl: String, embedDomain: String,
+        serverName: String, callback: (ExtractorLink) -> Unit
+    ): Boolean = streamcHttpMutex.withLock {
+        try {
+            println("[NguonC] [StreamcNew] 0a: bootstrap POST ${embedUrl.take(70)}")
+            val (code1, body1) = streamcPostJson(
+                embedUrl, embedDomain, embedUrl,
+                """{"action":"bootstrap","referrer":"$mainUrl/"}"""
+            )
+            if (code1 != 200 || body1 == null) {
+                println("[NguonC] [StreamcNew] bootstrap HTTP $code1: ${body1?.take(120)}")
+                return@withLock false
+            }
+            val err = streamcJsonString(body1, "error")
+            if (err != null) {
+                println("[NguonC] [StreamcNew] bootstrap error: $err")
+                return@withLock false
+            }
+            val bootstrapJwt = streamcJsonString(body1, "bootstrap")
+            if (bootstrapJwt.isNullOrBlank()) {
+                println("[NguonC] [StreamcNew] no bootstrap JWT in response")
+                return@withLock false
+            }
+            val turnstile = Regex(""""turnstileEnabled"\s*:\s*true""").containsMatchIn(body1)
+            println("[NguonC] [StreamcNew] bootstrap OK (turnstileEnabled=$turnstile)")
+            if (turnstile) return@withLock false  // needs a real browser challenge
+
+            // Turnstile disabled on this video -> request the playlist directly
+            val (code2, body2) = streamcPostJson(
+                embedUrl, embedDomain, embedUrl,
+                """{"action":"issue","bootstrap":"$bootstrapJwt","turnstile_response":"","playlist_format":"hls","pretty_url":true,"path_chunks":true}"""
+            )
+            val playlist = body2?.let { streamcJsonString(it, "playlist") }
+            if (code2 != 200 || playlist.isNullOrBlank()) {
+                println("[NguonC] [StreamcNew] issue HTTP $code2: ${body2?.take(120)}")
+                return@withLock false
+            }
+            println("[NguonC] [StreamcNew] issue OK: ${playlist.take(90)}")
+
+            val content = streamcGet(playlist, embedDomain, embedUrl) ?: return@withLock false
+            if (!content.contains("#EXTM3U") || content.contains("#ENC-AESGCM")) {
+                println("[NguonC] [StreamcNew] unexpected playlist content (${content.take(60)})")
+                return@withLock false
+            }
+            val base = playlist.substringBeforeLast("/") + "/"
+            registerM3U8Link(content, embedUrl, base, serverName, callback)
+        } catch (e: Exception) {
+            println("[NguonC] [StreamcNew] direct flow error: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * STEP 0b (NEW): let the REAL embed page run in a WebView — it performs
+     * bootstrap -> guard.js -> Cloudflare Turnstile -> issue -> playlist all by
+     * itself. We only wait for the final extension-less playlist request and
+     * capture it. Turnstile with appearance "interaction-only" usually resolves
+     * non-interactively in a genuine Android WebView within seconds.
+     */
+    private suspend fun tryStreamcWebViewFlow(
+        targetUrl: String, embedDomain: String,
+        serverName: String, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        try {
+            println("[NguonC] [StreamcNew] 0b: WebView flow on ${targetUrl.take(70)}")
+            val resp = app.get(
+                targetUrl,
+                interceptor = streamcPlaylistInterceptor,
+                headers = mapOf(
+                    "Referer" to "$mainUrl/",
+                    "User-Agent" to streamcMobileUA
+                )
+            )
+            val content = resp.text
+            val capturedUrl = resp.url ?: ""
+
+            if (content.contains("#EXTM3U") && !content.contains("#ENC-AESGCM")) {
+                println("[NguonC] [StreamcNew] WebView captured playlist: ${capturedUrl.take(90)}")
+                val base = if (capturedUrl.isNotEmpty()) capturedUrl.substringBeforeLast("/") + "/" else ""
+                if (registerM3U8Link(content, targetUrl, base, serverName, callback)) return true
+            }
+
+            // The resolver may re-fetch the captured URL with wrong headers —
+            // retry once manually with the exact mobile identity.
+            if (capturedUrl.contains("streamc.xyz") && !capturedUrl.contains("embed.php")) {
+                println("[NguonC] [StreamcNew] retrying captured URL manually: ${capturedUrl.take(90)}")
+                val content2 = streamcGet(capturedUrl, embedDomain, targetUrl)
+                if (content2 != null && content2.contains("#EXTM3U") && !content2.contains("#ENC-AESGCM")) {
+                    val base = capturedUrl.substringBeforeLast("/") + "/"
+                    if (registerM3U8Link(content2, targetUrl, base, serverName, callback)) return true
+                }
+            }
+
+            println("[NguonC] [StreamcNew] WebView flow captured nothing (Turnstile likely interactive)")
+            return false
+        } catch (e: Exception) {
+            println("[NguonC] [StreamcNew] WebView flow error: ${e.message}")
+            return false
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     //  Main link loading logic
     // ═══════════════════════════════════════════════════════════════════════════
     //
@@ -1341,6 +1543,22 @@ class PhimNguonCProvider : MainAPI() {
                         // ══════════════════════════════════════════════════════════════
                         if (targetUrl.contains("streamc.xyz") || targetUrl.contains("phimmoi.net")) {
                             println("[NguonC] === Processing: ${targetUrl.take(80)} ===")
+
+                            // ── STEP 0 (NEW 2026-09): Stream Panel "lite-15-cf-free"/"guard-7".
+                            // The embed page no longer carries data-obf; the playlist URL is
+                            // only issued AFTER a Cloudflare Turnstile check. Try the cheap
+                            // HTTP handshake first, then let the real page run in a WebView
+                            // (it solves Turnstile itself). Legacy fallbacks below untouched.
+                            if (!linkFound) {
+                                if (tryStreamcDirectFlow(targetUrl, embedDomain, serverName, callback)) {
+                                    linkFound = true; return@async
+                                }
+                            }
+                            if (!linkFound) {
+                                if (tryStreamcWebViewFlow(targetUrl, embedDomain, serverName, callback)) {
+                                    linkFound = true; return@async
+                                }
+                            }
 
                             var token: String? = null
                             var kX: String? = null
