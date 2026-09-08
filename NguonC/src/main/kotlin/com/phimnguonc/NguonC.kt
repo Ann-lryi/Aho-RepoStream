@@ -1,3 +1,5 @@
+// NguonC patch v4 (2026-09-08) + speed: /seg/ streaming 64KB + keep-alive,
+// playlist cache TTL 150s per hash, Cloudflare-403 domain memo (skip step 0a).
 package com.phimnguonc
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -603,32 +605,53 @@ class PhimNguonCProvider : MainAPI() {
                         output.write(body)
                     }
                     path.startsWith("/seg/") -> {
+                        // v4 PERF: stream the segment through instead of buffering it
+                        // whole (first byte reaches the player after ~1 RTT instead of
+                        // a full segment download), check the HTTP status so a
+                        // Cloudflare challenge page can never be served as "video",
+                        // and do NOT disconnect() on success — the JDK keep-alive pool
+                        // then reuses the TLS connection for the next segment.
                         val segUrl = java.net.URLDecoder.decode(path.removePrefix("/seg/"), "UTF-8")
-                        val bytes: ByteArray? = try {
-                            val conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
-                            conn.connectTimeout = 15000
-                            conn.readTimeout    = 30000
-                            conn.setRequestProperty("User-Agent", USER_AGENT)
-                            conn.setRequestProperty("Referer", segReferer)
-                            conn.connect()
-                            conn.inputStream.readBytes().also { runCatching { conn.disconnect() } }
-                        } catch (_: Exception) {
+                        var ok = false
+                        for (ua in listOf(USER_AGENT, streamcMobileUA)) {
+                            var conn: java.net.HttpURLConnection? = null
                             try {
-                                // Cloudflare may challenge the desktop UA — retry as mobile Safari
-                                val conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
-                                conn.connectTimeout = 15000
+                                conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
+                                conn.connectTimeout = 8000
                                 conn.readTimeout    = 30000
-                                conn.setRequestProperty("User-Agent", streamcMobileUA)
+                                conn.setRequestProperty("User-Agent", ua)
                                 conn.setRequestProperty("Referer", segReferer)
-                                conn.connect()
-                                conn.inputStream.readBytes().also { runCatching { conn.disconnect() } }
-                            } catch (_: Exception) { null }
+                                val code = conn.responseCode
+                                if (code !in 200..299) {
+                                    runCatching { conn.disconnect() }
+                                    continue
+                                }
+                                val len = conn.contentLength
+                                val head = StringBuilder("HTTP/1.1 200 OK").append(crlf)
+                                    .append("Content-Type: video/mp2t").append(crlf)
+                                    .append("Access-Control-Allow-Origin: *").append(crlf)
+                                if (len > 0) head.append("Content-Length: ").append(len).append(crlf)
+                                else head.append("Connection: close").append(crlf)
+                                head.append(crlf)
+                                output.write(head.toString().toByteArray())
+                                val buf = ByteArray(65536)
+                                conn.inputStream.use { stream ->
+                                    while (true) {
+                                        val n = stream.read(buf)
+                                        if (n < 0) break
+                                        output.write(buf, 0, n)
+                                        output.flush()
+                                    }
+                                }
+                                ok = true
+                                // no disconnect() — the pooled TLS connection is reused
+                                break
+                            } catch (_: Exception) {
+                                runCatching { conn?.disconnect() }
+                            }
                         }
-                        if (bytes == null) {
+                        if (!ok) {
                             output.write("HTTP/1.1 502 Bad Gateway${crlf}${crlf}".toByteArray())
-                        } else {
-                            output.write(("HTTP/1.1 200 OK${crlf}Content-Type: video/mp2t${crlf}Content-Length: ${bytes.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}").toByteArray())
-                            output.write(bytes)
                         }
                     }
                     else -> output.write("HTTP/1.1 404 Not Found${crlf}${crlf}".toByteArray())
@@ -1342,6 +1365,34 @@ class PhimNguonCProvider : MainAPI() {
     /** Serializes the cheap HTTP handshake so parallel servers don't trip 429 */
     private val streamcHttpMutex = Mutex()
 
+    // ── v4 PERF: short-lived replay cache ──────────────────────────────────
+    // The bootstrap JWT lives ~180s and CloudStream re-calls loadLinks more
+    // often than people think (reopen episode, quality switch, second source
+    // entry, player retry). Within 150s of an issue we replay the SAME
+    // playlist instead of re-running the whole WebView/Turnstile flow again.
+    // Key: video hash → (expiresAtEpochMs, playlistUrl, rawBody)
+    private val streamcPlaylistCache =
+        java.util.concurrent.ConcurrentHashMap<String, Triple<Long, String, String>>()
+
+    // v4 PERF: remember which embed domains answered a Cloudflare 403 to our
+    // plain HTTP bootstrap — skip the doomed 0a POST (~0.6s) for 10 minutes.
+    private val streamcCfBlockedUntil =
+        java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private fun streamcCacheGet(hash: String?): Pair<String, String>? {
+        if (hash.isNullOrBlank()) return null
+        val e = streamcPlaylistCache[hash] ?: return null
+        return if (System.currentTimeMillis() < e.first) Pair(e.second, e.third)
+        else { streamcPlaylistCache.remove(hash); null }
+    }
+
+    private fun streamcCachePut(hash: String?, url: String, rawBody: String) {
+        if (hash.isNullOrBlank() || !rawBody.contains("#EXTM3U")) return
+        if (streamcPlaylistCache.size >= 8) streamcPlaylistCache.clear()
+        streamcPlaylistCache[hash] =
+            Triple(System.currentTimeMillis() + 150_000L, url, rawBody)
+    }
+
     /** Minimal JSON string getter — avoids depending on JSON library signatures */
     private fun streamcJsonString(json: String, key: String): String? {
         val m = Regex(""""$key"\s*:\s*"((?:[^"\\]|\\.)*)"""").find(json) ?: return null
@@ -1410,6 +1461,13 @@ class PhimNguonCProvider : MainAPI() {
         serverName: String, callback: (ExtractorLink) -> Unit
     ): Boolean = streamcHttpMutex.withLock {
         try {
+            // v4 PERF: if Cloudflare 403'd this domain recently, the plain HTTP
+            // handshake is hopeless — skip straight to the WebView flow.
+            val cfBlockedUntil = streamcCfBlockedUntil[embedDomain] ?: 0L
+            if (System.currentTimeMillis() < cfBlockedUntil) {
+                println("[NguonC] [StreamcNew] 0a skipped (Cloudflare blocked this domain recently)")
+                return@withLock false
+            }
             println("[NguonC] [StreamcNew] 0a: bootstrap POST ${embedUrl.take(70)}")
             val (code1, body1) = streamcPostJson(
                 embedUrl, embedDomain, embedUrl,
@@ -1417,6 +1475,9 @@ class PhimNguonCProvider : MainAPI() {
             )
             if (code1 != 200 || body1 == null) {
                 println("[NguonC] [StreamcNew] bootstrap HTTP $code1: ${body1?.take(120)}")
+                if (code1 == 403) {
+                    streamcCfBlockedUntil[embedDomain] = System.currentTimeMillis() + 10 * 60_000L
+                }
                 return@withLock false
             }
             val err = streamcJsonString(body1, "error")
@@ -1740,7 +1801,9 @@ class PhimNguonCProvider : MainAPI() {
         val base = capturedUrl.substringBeforeLast("/") + "/"
         if (trimmed.startsWith("#EXTM3U") && !trimmed.contains("#ENC-AESGCM")) {
             println("[NguonC] [StreamcNew] captured PLAIN playlist: ${capturedUrl.take(80)}")
-            return registerM3U8Link(trimmed, referer, base, serverName, callback)
+            val ok = registerM3U8Link(trimmed, referer, base, serverName, callback)
+            if (ok) streamcCachePut(videoHash, capturedUrl, trimmed)
+            return ok
         }
         if (trimmed.contains("#ENC-AESGCM")) {
             if (videoHash == null) {
@@ -1750,7 +1813,9 @@ class PhimNguonCProvider : MainAPI() {
             val decrypted = streamcDecryptAesGcm(trimmed, videoHash)
             if (decrypted != null) {
                 println("[NguonC] [StreamcNew] captured ENCRYPTED playlist + decrypted OK: ${capturedUrl.take(80)}")
-                return registerM3U8Link(decrypted, referer, base, serverName, callback)
+                val ok = registerM3U8Link(decrypted, referer, base, serverName, callback)
+                if (ok) streamcCachePut(videoHash, capturedUrl, trimmed)
+                return ok
             }
             println("[NguonC] [StreamcNew] captured ENCRYPTED playlist but decrypt failed")
         }
@@ -1846,6 +1911,19 @@ class PhimNguonCProvider : MainAPI() {
                             // only issued AFTER a Cloudflare Turnstile check. Try the cheap
                             // HTTP handshake first, then let the real page run in a WebView
                             // (it solves Turnstile itself). Legacy fallbacks below untouched.
+                            if (!linkFound) {
+                                // v4 PERF: replay a recently-issued playlist for this
+                                // hash (valid ~150s — the bootstrap JWT lifetime) and
+                                // skip Turnstile entirely on re-loads.
+                                val cached = streamcCacheGet(urlHash)
+                                if (cached != null) {
+                                    println("[NguonC] [StreamcNew] 0c: playlist cache HIT (${urlHash?.take(12)}...)")
+                                    if (streamcRegisterCaptured(cached.first, cached.second, urlHash, targetUrl, serverName, callback)) {
+                                        linkFound = true; return@async
+                                    }
+                                    println("[NguonC] [StreamcNew] 0c: cached playlist no longer playable — falling through")
+                                }
+                            }
                             if (!linkFound) {
                                 if (tryStreamcDirectFlow(targetUrl, embedDomain, serverName, callback)) {
                                     linkFound = true; return@async
