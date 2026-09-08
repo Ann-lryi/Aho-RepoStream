@@ -11,11 +11,22 @@ import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.security.MessageDigest
 import android.util.Base64
+import android.graphics.Bitmap
+import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
@@ -593,20 +604,31 @@ class PhimNguonCProvider : MainAPI() {
                     }
                     path.startsWith("/seg/") -> {
                         val segUrl = java.net.URLDecoder.decode(path.removePrefix("/seg/"), "UTF-8")
-                        try {
+                        val bytes: ByteArray? = try {
                             val conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
                             conn.connectTimeout = 15000
                             conn.readTimeout    = 30000
                             conn.setRequestProperty("User-Agent", USER_AGENT)
                             conn.setRequestProperty("Referer", segReferer)
                             conn.connect()
-                            val bytes = conn.inputStream.readBytes()
-                            conn.disconnect()
-
+                            conn.inputStream.readBytes().also { runCatching { conn.disconnect() } }
+                        } catch (_: Exception) {
+                            try {
+                                // Cloudflare may challenge the desktop UA — retry as mobile Safari
+                                val conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
+                                conn.connectTimeout = 15000
+                                conn.readTimeout    = 30000
+                                conn.setRequestProperty("User-Agent", streamcMobileUA)
+                                conn.setRequestProperty("Referer", segReferer)
+                                conn.connect()
+                                conn.inputStream.readBytes().also { runCatching { conn.disconnect() } }
+                            } catch (_: Exception) { null }
+                        }
+                        if (bytes == null) {
+                            output.write("HTTP/1.1 502 Bad Gateway${crlf}${crlf}".toByteArray())
+                        } else {
                             output.write(("HTTP/1.1 200 OK${crlf}Content-Type: video/mp2t${crlf}Content-Length: ${bytes.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}").toByteArray())
                             output.write(bytes)
-                        } catch (_: Exception) {
-                            output.write("HTTP/1.1 502 Bad Gateway${crlf}${crlf}".toByteArray())
                         }
                     }
                     else -> output.write("HTTP/1.1 404 Not Found${crlf}${crlf}".toByteArray())
@@ -1320,11 +1342,6 @@ class PhimNguonCProvider : MainAPI() {
     /** Serializes the cheap HTTP handshake so parallel servers don't trip 429 */
     private val streamcHttpMutex = Mutex()
 
-    /** Matches the extension-less "pretty URL" playlist (see flow description) */
-    private val streamcPlaylistInterceptor = WebViewResolver(
-        Regex("""https?://[A-Za-z0-9.-]*streamc\.xyz/(?:conf\.php\?t=[^&\s]+|(?!embed\.php)[A-Za-z0-9_/-]{80,6000}(?:\?d)?)""")
-    )
-
     /** Minimal JSON string getter — avoids depending on JSON library signatures */
     private fun streamcJsonString(json: String, key: String): String? {
         val m = Regex(""""$key"\s*:\s*"((?:[^"\\]|\\.)*)"""").find(json) ?: return null
@@ -1442,51 +1459,282 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     /**
-     * STEP 0b (NEW): let the REAL embed page run in a WebView — it performs
-     * bootstrap -> guard.js -> Cloudflare Turnstile -> issue -> playlist all by
-     * itself. We only wait for the final extension-less playlist request and
-     * capture it. Turnstile with appearance "interaction-only" usually resolves
-     * non-interactively in a genuine Android WebView within seconds.
+     * STEP 0b (NEW v2): run the REAL embed page in a WebView and let it perform
+     * bootstrap -> guard.js -> Cloudflare Turnstile -> issue -> playlist entirely
+     * by itself. Key facts from the 08-09 incident log that shape this design:
+     *  - EVERY plain-HTTP request from the user's device (okhttp/HttpURLConnection)
+     *    to streamc.xyz gets 403-challenged by Cloudflare, so the playlist BODY can
+     *    NOT be fetched outside the WebView.
+     *  - With the default Android WebView UA the page asks for the "aesgcm"
+     *    playlist format (player.js: r=/iphone|ipad|macintosh/ test on UA).
+     *    The envelope is 4 lines: #EXTM3U / #ENC-AESGCM;iv=<24 hex> /
+     *    #EXT-X-B65:0-138 / base64(ciphertext || 16-byte GCM tag).
+     *  - Key derivation (player.js decryptM3U8): AES-256-GCM key =
+     *    HMAC-SHA256(key="stream-derive-v1", msg=videoHash) where videoHash is
+     *    the `hash` query parameter of the embed URL. IV = 12 bytes from hex.
+     * A tiny JS hook is injected into the page BEFORE its scripts run; it
+     * forwards every fetch/XHR response that looks like a playlist or an issue
+     * JSON to the Kotlin bridge, so no second fetch (and no Cloudflare risk)
+     * is ever needed.
      */
     private suspend fun tryStreamcWebViewFlow(
         targetUrl: String, embedDomain: String,
         serverName: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
+        var webView: WebView? = null
+        var dialog: android.app.Dialog? = null
         try {
-            println("[NguonC] [StreamcNew] 0b: WebView flow on ${targetUrl.take(70)}")
-            val resp = app.get(
-                targetUrl,
-                interceptor = streamcPlaylistInterceptor,
-                headers = mapOf(
-                    "Referer" to "$mainUrl/",
-                    "User-Agent" to streamcMobileUA
-                )
-            )
-            val content = resp.text
-            val capturedUrl = resp.url ?: ""
+            val videoHash = Regex("""[?&]hash=([a-fA-F0-9]{8,})""").find(targetUrl)?.groupValues?.get(1)
+            println("[NguonC] [StreamcNew] 0b: WebView fetch-hook flow on ${targetUrl.take(70)}")
 
-            if (content.contains("#EXTM3U") && !content.contains("#ENC-AESGCM")) {
-                println("[NguonC] [StreamcNew] WebView captured playlist: ${capturedUrl.take(90)}")
-                val base = if (capturedUrl.isNotEmpty()) capturedUrl.substringBeforeLast("/") + "/" else ""
-                if (registerM3U8Link(content, targetUrl, base, serverName, callback)) return true
+            val ctx = streamcAppContext()
+            if (ctx == null) {
+                println("[NguonC] [StreamcNew] no app context available for WebView")
+                return false
             }
 
-            // The resolver may re-fetch the captured URL with wrong headers —
-            // retry once manually with the exact mobile identity.
-            if (capturedUrl.contains("streamc.xyz") && !capturedUrl.contains("embed.php")) {
-                println("[NguonC] [StreamcNew] retrying captured URL manually: ${capturedUrl.take(90)}")
-                val content2 = streamcGet(capturedUrl, embedDomain, targetUrl)
-                if (content2 != null && content2.contains("#EXTM3U") && !content2.contains("#ENC-AESGCM")) {
-                    val base = capturedUrl.substringBeforeLast("/") + "/"
-                    if (registerM3U8Link(content2, targetUrl, base, serverName, callback)) return true
+            val captures = Channel<Pair<String, String>>(Channel.UNLIMITED)
+            val issuePlaylistUrl = java.util.concurrent.atomic.AtomicReference<String?>(null)
+
+            withContext(Dispatchers.Main) {
+                val wv = WebView(ctx)
+                webView = wv
+                wv.settings.javaScriptEnabled = true
+                wv.settings.domStorageEnabled = true
+                wv.settings.allowFileAccess = false
+                wv.settings.allowContentAccess = false
+                wv.settings.mediaPlaybackRequiresUserGesture = false
+                CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+                wv.addJavascriptInterface(
+                    StreamcCaptureBridge { url, body ->
+                        val t = body.trim()
+                        if (t.startsWith("#EXTM3U")) {
+                            captures.trySend(url to body)
+                        } else if (t.contains("\"playlist\"")) {
+                            streamcJsonString(t, "playlist")?.let { issuePlaylistUrl.compareAndSet(null, it) }
+                        }
+                    },
+                    "__ngcBridge"
+                )
+                wv.webChromeClient = WebChromeClient()
+                wv.webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                        view?.evaluateJavascript(streamcHookJs, null)
+                    }
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        view?.evaluateJavascript(streamcHookJs, null)
+                    }
+                }
+
+                // Show the page in a real dialog window when an Activity is
+                // reachable: gives Turnstile a genuine window environment and,
+                // in the rare interactive case, lets the user tap the checkbox.
+                if (ctx is android.app.Activity && !ctx.isFinishing) {
+                    try {
+                        val dlg = android.app.Dialog(ctx)
+                        dlg.setContentView(
+                            wv,
+                            android.view.ViewGroup.LayoutParams(
+                                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                                android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                            )
+                        )
+                        dlg.window?.setLayout(
+                            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                            android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                        dlg.setCanceledOnTouchOutside(false)
+                        dlg.setOnDismissListener { captures.close() }  // user closed -> abort flow
+                        dlg.show()
+                        dialog = dlg
+                    } catch (e: Exception) {
+                        println("[NguonC] [StreamcNew] dialog unavailable (${e.message}), running headless")
+                    }
+                }
+
+                wv.loadUrl(targetUrl, mapOf("Referer" to "$mainUrl/"))
+            }
+
+            var registered = withTimeoutOrNull(60_000L) {
+                var ok = false
+                var tries = 0
+                while (!ok && tries < 8) {
+                    tries++
+                    val (capUrl, capBody) = captures.receive()
+                    ok = streamcRegisterCaptured(capUrl, capBody, videoHash, targetUrl, serverName, callback)
+                }
+                ok
+            } ?: false
+
+            if (!registered) {
+                // The issue JSON told us the playlist URL but the in-page fetch
+                // never came through the hook — try one manual GET (may hit CF).
+                issuePlaylistUrl.get()?.let { pUrl ->
+                    println("[NguonC] [StreamcNew] issue gave playlist, fetching manually: ${pUrl.take(70)}")
+                    val manual = streamcGet(pUrl, embedDomain, targetUrl)
+                    if (manual != null) {
+                        registered = streamcRegisterCaptured(pUrl, manual, videoHash, targetUrl, serverName, callback)
+                    }
                 }
             }
 
-            println("[NguonC] [StreamcNew] WebView flow captured nothing (Turnstile likely interactive)")
-            return false
+            println(
+                if (registered) "[NguonC] [StreamcNew] WebView flow SUCCESS"
+                else "[NguonC] [StreamcNew] WebView flow captured nothing (Turnstile likely interactive)"
+            )
+            return registered
         } catch (e: Exception) {
             println("[NguonC] [StreamcNew] WebView flow error: ${e.message}")
             return false
+        } finally {
+            try {
+                withContext(NonCancellable + Dispatchers.Main) {
+                    dialog?.dismiss()
+                    webView?.stopLoading()
+                    webView?.destroy()
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * JS injected in onPageStarted/Finished (idempotent). Wraps window.fetch and
+     * XMLHttpRequest so that every response body which looks like an HLS playlist
+     * (#EXTM3U / #ENC-AESGCM) or an issue JSON ("playlist": "...") is forwarded to
+     * the Kotlin bridge. Plain string concat only — no template literals.
+     */
+    private val streamcHookJs = """
+(function(){
+  if (window.__ngcHooked) return; window.__ngcHooked = true;
+  function pass(u, b){
+    try {
+      if (!b || b.length < 16) return;
+      if (b.indexOf('#EXTM3U') === 0 || b.indexOf('#ENC-AESGCM') >= 0) {
+        window.__ngcBridge.onCapture(String(u), b); return;
+      }
+      if (b.indexOf('"playlist"') >= 0 && String(u).indexOf('streamc.xyz') >= 0) {
+        window.__ngcBridge.onCapture(String(u), b);
+      }
+    } catch (e) {}
+  }
+  try {
+    var of = window.fetch;
+    if (of) {
+      window.fetch = function(){
+        var args = arguments;
+        var u = (args[0] && args[0].url) ? String(args[0].url) : String(args[0]);
+        return of.apply(this, args).then(function(res){
+          try { res.clone().text().then(function(t){ pass(u, t); }, function(){}); } catch (e) {}
+          return res;
+        });
+      };
+    }
+  } catch (e) {}
+  try {
+    var oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(m, u){ this.__ngcU = u; return oo.apply(this, arguments); };
+    XMLHttpRequest.prototype.send = function(){
+      var self = this;
+      this.addEventListener('load', function(){ try { pass(self.__ngcU, self.responseText); } catch (e) {} });
+      return os.apply(this, arguments);
+    };
+  } catch (e) {}
+})();
+"""
+
+    /** JS -> Kotlin bridge for the WebView capture flow */
+    private class StreamcCaptureBridge(
+        private val onCapture: (String, String) -> Unit
+    ) {
+        @JavascriptInterface
+        fun onCapture(url: String?, body: String?) {
+            if (url.isNullOrBlank() || body.isNullOrBlank()) return
+            try { onCapture(url, body) } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Best-effort Context for the WebView: prefer the foreground Activity that
+     * CloudStream tracks (gives Turnstile a real window), fall back to the
+     * Application context via ActivityThread reflection. No CloudStream API
+     * version dependency.
+     */
+    private fun streamcAppContext(): android.content.Context? {
+        try {
+            val cls = Class.forName("com.lagradost.cloudstream3.CommonActivity")
+            for (name in listOf("activity", "currentActivity")) {
+                try {
+                    val f = cls.getDeclaredField(name)
+                    f.isAccessible = true
+                    (f.get(null) as? android.content.Context)?.let { return it }
+                } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
+        return try {
+            val at = Class.forName("android.app.ActivityThread")
+            val m = at.getDeclaredMethod("currentApplication")
+            m.isAccessible = true
+            m.invoke(null) as? android.content.Context
+        } catch (_: Exception) { null }
+    }
+
+    /**
+     * Register a captured playlist body. Handles both formats the server hands
+     * out: plain "hls" (#EXTM3U ...) and encrypted "aesgcm" (4-line envelope,
+     * decrypted with the hash-derived key — see streamcDecryptAesGcm).
+     */
+    private suspend fun streamcRegisterCaptured(
+        capturedUrl: String, body: String, videoHash: String?,
+        referer: String, serverName: String, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val trimmed = body.trim()
+        val base = capturedUrl.substringBeforeLast("/") + "/"
+        if (trimmed.startsWith("#EXTM3U") && !trimmed.contains("#ENC-AESGCM")) {
+            println("[NguonC] [StreamcNew] captured PLAIN playlist: ${capturedUrl.take(80)}")
+            return registerM3U8Link(trimmed, referer, base, serverName, callback)
+        }
+        if (trimmed.contains("#ENC-AESGCM")) {
+            if (videoHash == null) {
+                println("[NguonC] [StreamcNew] encrypted playlist but no hash param in URL")
+                return false
+            }
+            val decrypted = streamcDecryptAesGcm(trimmed, videoHash)
+            if (decrypted != null) {
+                println("[NguonC] [StreamcNew] captured ENCRYPTED playlist + decrypted OK: ${capturedUrl.take(80)}")
+                return registerM3U8Link(decrypted, referer, base, serverName, callback)
+            }
+            println("[NguonC] [StreamcNew] captured ENCRYPTED playlist but decrypt failed")
+        }
+        return false
+    }
+
+    /**
+     * Decrypt the Stream Panel "aesgcm" playlist envelope (mirrors player.js):
+     *   line0: #EXTM3U
+     *   line1: #ENC-AESGCM;iv=<24 hex chars = 12-byte GCM IV>
+     *   line2: #EXT-X-B65:0-138
+     *   line3: base64(ciphertext || 16-byte GCM tag)
+     * key = HMAC-SHA256(key="stream-derive-v1", msg=videoHash), AES-256-GCM, tag 128.
+     */
+    private fun streamcDecryptAesGcm(content: String, videoHash: String): String? {
+        return try {
+            val lines = content.trim().lines().map { it.trim() }
+            if (lines.size < 4 || !lines[0].startsWith("#EXTM3U")) return null
+            val ivHex = Regex("""^#ENC-AESGCM;iv=([a-fA-F0-9]{24})$""").find(lines[1])?.groupValues?.get(1)
+                ?: return null
+            val data = Base64.decode(lines[3], Base64.DEFAULT)
+            if (data.size <= 16) return null
+            val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+            mac.init(SecretKeySpec("stream-derive-v1".toByteArray(Charsets.UTF_8), "HmacSHA256"))
+            val key = mac.doFinal(videoHash.toByteArray(Charsets.UTF_8))
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, hexToBytes(ivHex)))
+            val plain = cipher.doFinal(data)
+            val text = String(plain, Charsets.UTF_8)
+            if (text.startsWith("#EXTM3U")) text else null
+        } catch (e: Exception) {
+            println("[NguonC] [StreamcNew] AESGCM decrypt failed: ${e.message}")
+            null
         }
     }
 
