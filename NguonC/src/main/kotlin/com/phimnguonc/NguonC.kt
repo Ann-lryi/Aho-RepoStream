@@ -1507,6 +1507,8 @@ class PhimNguonCProvider : MainAPI() {
                 CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
                 wv.addJavascriptInterface(
                     StreamcCaptureBridge { url, body ->
+                        // v3: always log the arrival — proves the JS->Kotlin path works
+                        println("[NguonC] [StreamcNew] bridge capture: url=${url.take(60)} len=${body.length} head=${body.take(12)}")
                         val t = body.trim()
                         if (t.startsWith("#EXTM3U")) {
                             captures.trySend(url to body)
@@ -1602,20 +1604,57 @@ class PhimNguonCProvider : MainAPI() {
      * XMLHttpRequest so that every response body which looks like an HLS playlist
      * (#EXTM3U / #ENC-AESGCM) or an issue JSON ("playlist": "...") is forwarded to
      * the Kotlin bridge. Plain string concat only — no template literals.
+     * v3 hardening:
+     *  - URLs are normalized to ABSOLUTE before forwarding (XHR may hand us a
+     *    relative path; Kotlin needs the absolute playlist URL as segment base).
+     *  - XHR bodies are recovered even when responseType is arraybuffer/blob
+     *    (responseText throws there) via TextDecoder.
+     *  - When the issue JSON passes by, the hook itself fetches the playlist URL
+     *    in-page (same origin -> no Cloudflare risk) and forwards its body, so a
+     *    native-video playback path that bypasses fetch/XHR cannot hide it.
+     *  - Seen-response dedupe keeps the bridge from receiving duplicates.
      */
     private val streamcHookJs = """
 (function(){
   if (window.__ngcHooked) return; window.__ngcHooked = true;
+  function abs(u){
+    var s = String(u);
+    if (s.indexOf('http') === 0) return s;
+    if (s.charAt(0) === '/') return location.origin + s;
+    return location.origin + '/' + s;
+  }
   function pass(u, b){
     try {
       if (!b || b.length < 16) return;
+      var sig = (String(u).length + ':' + b.length + ':' + b.substring(0, 24));
+      window.__ngcSeen = window.__ngcSeen || {};
+      if (window.__ngcSeen[sig]) return;
+      if (Object.keys(window.__ngcSeen).length > 64) window.__ngcSeen = {};
+      window.__ngcSeen[sig] = 1;
+      var au = abs(u);
       if (b.indexOf('#EXTM3U') === 0 || b.indexOf('#ENC-AESGCM') >= 0) {
-        window.__ngcBridge.onCapture(String(u), b); return;
+        window.__ngcBridge.onCapture(au, b); return;
       }
-      if (b.indexOf('"playlist"') >= 0 && String(u).indexOf('streamc.xyz') >= 0) {
-        window.__ngcBridge.onCapture(String(u), b);
+      if (b.indexOf('"playlist"') >= 0 && au.indexOf('streamc.xyz') >= 0) {
+        window.__ngcBridge.onCapture(au, b);
+        if (!window.__ngcFetched) {
+          window.__ngcFetched = 1;
+          try {
+            var pu = JSON.parse(b).playlist;
+            if (pu) {
+              fetch(abs(pu), {credentials:'include'}).then(function(r){
+                return r.text();
+              }).then(function(t){ pass(pu, t); }, function(){});
+            }
+          } catch (e) {}
+        }
       }
     } catch (e) {}
+  }
+  function xhrText(x){
+    try { return x.responseText; } catch (e) {}
+    try { return new TextDecoder('utf-8').decode(x.response); } catch (e) {}
+    return null;
   }
   try {
     var of = window.fetch;
@@ -1635,21 +1674,31 @@ class PhimNguonCProvider : MainAPI() {
     XMLHttpRequest.prototype.open = function(m, u){ this.__ngcU = u; return oo.apply(this, arguments); };
     XMLHttpRequest.prototype.send = function(){
       var self = this;
-      this.addEventListener('load', function(){ try { pass(self.__ngcU, self.responseText); } catch (e) {} });
+      this.addEventListener('load', function(){
+        try { var t = xhrText(self); if (t) { pass(self.__ngcU, t); } } catch (e) {}
+      });
       return os.apply(this, arguments);
     };
   } catch (e) {}
 })();
 """
 
-    /** JS -> Kotlin bridge for the WebView capture flow */
+    /**
+     * JS -> Kotlin bridge for the WebView capture flow.
+     * v3 FIX: the constructor lambda MUST NOT be named `onCapture` — in v2 the
+     * member function `fun onCapture(...)` shadowed the lambda property of the
+     * same name, so the body called ITSELF (infinite recursion) and every
+     * capture died with StackOverflowError before reaching Kotlin. Renamed to
+     * `handler`, and Throwable (not just Exception) is caught so no Error can
+     * ever kill the data path again.
+     */
     private class StreamcCaptureBridge(
-        private val onCapture: (String, String) -> Unit
+        private val handler: (String, String) -> Unit
     ) {
         @JavascriptInterface
         fun onCapture(url: String?, body: String?) {
             if (url.isNullOrBlank() || body.isNullOrBlank()) return
-            try { onCapture(url, body) } catch (_: Exception) {}
+            try { handler(url, body) } catch (_: Throwable) {}
         }
     }
 
