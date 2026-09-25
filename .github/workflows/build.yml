@@ -77,11 +77,13 @@ jobs:
         uses: actions/setup-java@v5
         with:
           java-version: 17
-          distribution: adopt
+          distribution: temurin
           cache: gradle
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3.2.2
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
 
       - name: Access Secrets
         env:
