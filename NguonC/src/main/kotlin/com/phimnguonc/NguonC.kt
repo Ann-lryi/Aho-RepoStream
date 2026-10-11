@@ -1,5 +1,8 @@
 // NguonC patch v4 (2026-09-08) + speed: /seg/ streaming 64KB + keep-alive,
 // playlist cache TTL 150s per hash, Cloudflare-403 domain memo (skip step 0a).
+// NguonC patch v5 (2026-10-12): tolerant AES-GCM envelope parser, direct flow now decrypts
+// "aesgcm" playlists, /seg/ proxy tries several header profiles per host + logs upstream
+// HTTP status (ExoPlayer 2004 = ERROR_CODE_IO_BAD_HTTP_STATUS), embed URL preferred over m3u8 field.
 package com.phimnguonc
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -458,10 +461,14 @@ class PhimNguonCProvider : MainAPI() {
 
                 // Prefer direct m3u8 URL (already contains the token) over the
                 // embed page URL — saves one HTTP round-trip in loadLinks().
+                // v5: the current Stream Panel flow needs the `hash` of the embed URL (key
+                // derivation + handshake). A token-style m3u8 URL carries no hash param, so
+                // prefer the embed URL whenever it has one.
                 val url2 = when {
-                    directM3u8.isNotBlank() -> directM3u8
-                    embed.isNotBlank()      -> embed
-                    else                    -> return@forEach
+                    embed.isNotBlank() && embed.contains("hash=") -> embed
+                    directM3u8.isNotBlank()                       -> directM3u8
+                    embed.isNotBlank()                            -> embed
+                    else                                          -> return@forEach
                 }
 
                 val list = epMap.getOrPut(epName) { mutableListOf() }
@@ -564,6 +571,10 @@ class PhimNguonCProvider : MainAPI() {
 
     private val activeServers = mutableListOf<NguonCProxyServer>()
 
+    // v5: index of the header profile (see NguonCProxyServer /seg/ handler) that last
+    // succeeded per segment host, so a rejected profile is not retried on every segment.
+    private val segProfileByHost = ConcurrentHashMap<String, Int>()
+
     inner class NguonCProxyServer(
         private val segReferer: String
     ) {
@@ -606,52 +617,86 @@ class PhimNguonCProvider : MainAPI() {
                     }
                     path.startsWith("/seg/") -> {
                         // v4 PERF: stream the segment through instead of buffering it
-                        // whole (first byte reaches the player after ~1 RTT instead of
-                        // a full segment download), check the HTTP status so a
-                        // Cloudflare challenge page can never be served as "video",
-                        // and do NOT disconnect() on success — the JDK keep-alive pool
-                        // then reuses the TLS connection for the next segment.
+                        // whole, check the HTTP status so a Cloudflare challenge page can
+                        // never be served as "video", keep-alive reuse on success.
+                        // v5: several header profiles (UA x Referer/Origin) per host, the
+                        // working one is remembered; every upstream failure is logged
+                        // because ExoPlayer only reports "2004" (bad HTTP status) for the
+                        // local 502 and the real upstream status was previously swallowed.
                         val segUrl = java.net.URLDecoder.decode(path.removePrefix("/seg/"), "UTF-8")
+                        val segHost = runCatching { java.net.URL(segUrl).host }.getOrDefault("")
+                        val segOrigin = Regex("""^(https?://[^/]+)""").find(segReferer)?.groupValues?.get(1) ?: ""
+                        val profiles: List<Triple<String, String, String?>> = listOf(
+                            Triple(USER_AGENT, segReferer, null),
+                            Triple(streamcMobileUA, segReferer, null),
+                            Triple(USER_AGENT, "$segOrigin/", segOrigin),
+                            Triple(streamcMobileUA, "$segOrigin/", segOrigin)
+                        )
+                        val pref = segProfileByHost[segHost]
+                        val order: List<Int> =
+                            if (pref != null && pref in profiles.indices)
+                                listOf(pref) + profiles.indices.filter { it != pref }
+                            else profiles.indices.toList()
+
                         var ok = false
-                        for (ua in listOf(USER_AGENT, streamcMobileUA)) {
-                            var conn: java.net.HttpURLConnection? = null
-                            try {
-                                conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
-                                conn.connectTimeout = 8000
-                                conn.readTimeout    = 30000
-                                conn.setRequestProperty("User-Agent", ua)
-                                conn.setRequestProperty("Referer", segReferer)
-                                val code = conn.responseCode
-                                if (code !in 200..299) {
-                                    runCatching { conn.disconnect() }
-                                    continue
-                                }
-                                val len = conn.contentLength
-                                val head = StringBuilder("HTTP/1.1 200 OK").append(crlf)
-                                    .append("Content-Type: video/mp2t").append(crlf)
-                                    .append("Access-Control-Allow-Origin: *").append(crlf)
-                                if (len > 0) head.append("Content-Length: ").append(len).append(crlf)
-                                else head.append("Connection: close").append(crlf)
-                                head.append(crlf)
-                                output.write(head.toString().toByteArray())
-                                val buf = ByteArray(65536)
-                                conn.inputStream.use { stream ->
-                                    while (true) {
-                                        val n = stream.read(buf)
-                                        if (n < 0) break
-                                        output.write(buf, 0, n)
-                                        output.flush()
+                        var headersSent = false
+                        var lastCode = -1
+                        for (round in 0..1) {
+                            for (idx in order) {
+                                val (ua, ref, origin) = profiles[idx]
+                                var conn: java.net.HttpURLConnection? = null
+                                try {
+                                    conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
+                                    conn.connectTimeout = 8000
+                                    conn.readTimeout    = 30000
+                                    conn.setRequestProperty("User-Agent", ua)
+                                    conn.setRequestProperty("Referer", ref)
+                                    conn.setRequestProperty("Accept", "*/*")
+                                    if (origin != null) conn.setRequestProperty("Origin", origin)
+                                    val code = conn.responseCode
+                                    lastCode = code
+                                    if (code !in 200..299) {
+                                        println("[NguonC] [Seg] HTTP $code profile=$idx host=$segHost url=...${segUrl.takeLast(48)}")
+                                        runCatching { conn.disconnect() }
+                                        continue
                                     }
+                                    val len = conn.contentLength
+                                    val head = StringBuilder("HTTP/1.1 200 OK").append(crlf)
+                                        .append("Content-Type: video/mp2t").append(crlf)
+                                        .append("Access-Control-Allow-Origin: *").append(crlf)
+                                    if (len > 0) head.append("Content-Length: ").append(len).append(crlf)
+                                    else head.append("Connection: close").append(crlf)
+                                    head.append(crlf)
+                                    output.write(head.toString().toByteArray())
+                                    headersSent = true
+                                    val buf = ByteArray(65536)
+                                    conn.inputStream.use { stream ->
+                                        while (true) {
+                                            val n = stream.read(buf)
+                                            if (n < 0) break
+                                            output.write(buf, 0, n)
+                                            output.flush()
+                                        }
+                                    }
+                                    ok = true
+                                    segProfileByHost[segHost] = idx
+                                    // no disconnect() — the pooled TLS connection is reused
+                                    break
+                                } catch (e: Exception) {
+                                    println("[NguonC] [Seg] error profile=$idx host=$segHost: ${e.message}")
+                                    runCatching { conn?.disconnect() }
+                                    // headers already on the wire -> a second response on the
+                                    // same socket would corrupt the stream; give up on this segment
+                                    if (headersSent) { ok = true; break }
                                 }
-                                ok = true
-                                // no disconnect() — the pooled TLS connection is reused
-                                break
-                            } catch (_: Exception) {
-                                runCatching { conn?.disconnect() }
                             }
+                            if (ok) break
+                            if (lastCode == 429 || lastCode >= 500) {
+                                try { Thread.sleep(500) } catch (_: InterruptedException) { break }
+                            } else break
                         }
                         if (!ok) {
-                            output.write("HTTP/1.1 502 Bad Gateway${crlf}${crlf}".toByteArray())
+                            output.write("HTTP/1.1 502 Bad Gateway${crlf}X-Upstream-Status: $lastCode${crlf}Content-Length: 0${crlf}${crlf}".toByteArray())
                         }
                     }
                     else -> output.write("HTTP/1.1 404 Not Found${crlf}${crlf}".toByteArray())
@@ -698,6 +743,10 @@ class PhimNguonCProvider : MainAPI() {
         serverName: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
         if (!m3u8Content.contains("#EXTM3U")) return false
+        run {
+            val segs = m3u8Content.lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }
+            println("[NguonC] registerM3U8Link: segments=${segs.size} first=${segs.firstOrNull()?.take(110)} base=${m3u8BaseUrl.take(60)} referer=${referer.take(70)}")
+        }
         val server = NguonCProxyServer(referer)
         server.start(); activeServers.add(server)
         val proxyBase = "http://127.0.0.1:${server.port}"
@@ -1507,12 +1556,14 @@ class PhimNguonCProvider : MainAPI() {
             println("[NguonC] [StreamcNew] issue OK: ${playlist.take(90)}")
 
             val content = streamcGet(playlist, embedDomain, embedUrl) ?: return@withLock false
-            if (!content.contains("#EXTM3U") || content.contains("#ENC-AESGCM")) {
+            if (!content.contains("#EXTM3U")) {
                 println("[NguonC] [StreamcNew] unexpected playlist content (${content.take(60)})")
                 return@withLock false
             }
-            val base = playlist.substringBeforeLast("/") + "/"
-            registerM3U8Link(content, embedUrl, base, serverName, callback)
+            // v5: server may answer "aesgcm" even for the mobile UA -> decrypt via the shared
+            // handler (plain + encrypted) instead of rejecting #ENC-AESGCM.
+            val directHash = Regex("""[?&]hash=([a-fA-F0-9]{8,})""").find(embedUrl)?.groupValues?.get(1)
+            streamcRegisterCaptured(playlist, content, directHash, embedUrl, serverName, callback)
         } catch (e: Exception) {
             println("[NguonC] [StreamcNew] direct flow error: ${e.message}")
             false
@@ -1824,19 +1875,40 @@ class PhimNguonCProvider : MainAPI() {
 
     /**
      * Decrypt the Stream Panel "aesgcm" playlist envelope (mirrors player.js):
-     *   line0: #EXTM3U
-     *   line1: #ENC-AESGCM;iv=<24 hex chars = 12-byte GCM IV>
-     *   line2: #EXT-X-B65:0-138
-     *   line3: base64(ciphertext || 16-byte GCM tag)
+     *   #EXTM3U
+     *   #ENC-AESGCM<;|:>iv=<24 hex chars = 12-byte GCM IV>
+     *   #EXT-X-B65:<range>
+     *   base64(ciphertext || 16-byte GCM tag)   (tolerated when wrapped over several lines)
      * key = HMAC-SHA256(key="stream-derive-v1", msg=videoHash), AES-256-GCM, tag 128.
+     * v5: verified 2026-10-12 against a captured envelope (hash e6435cc0...): this key
+     * derivation yields "#EXTM3U / #EXT-X-VERSION:3 / #EXT-X-TARGETDURATION:2 /
+     * #EXT-X-PLAYLIST-TYPE:VOD" with absolute segment URLs
+     * https://indossNN.amassNN.top/<hash>/streamaaaNNNN.png
      */
     private fun streamcDecryptAesGcm(content: String, videoHash: String): String? {
         return try {
-            val lines = content.trim().lines().map { it.trim() }
-            if (lines.size < 4 || !lines[0].startsWith("#EXTM3U")) return null
-            val ivHex = Regex("""^#ENC-AESGCM;iv=([a-fA-F0-9]{24})$""").find(lines[1])?.groupValues?.get(1)
-                ?: return null
-            val data = Base64.decode(lines[3], Base64.DEFAULT)
+            val lines = content.trim().lines().map { it.trim() }.filter { it.isNotEmpty() }
+            if (lines.isEmpty() || !lines[0].startsWith("#EXTM3U")) {
+                println("[NguonC] [StreamcNew] AESGCM envelope: no #EXTM3U header")
+                return null
+            }
+            val ivRegex = Regex("""^#ENC-AESGCM\s*[;:,]\s*iv=([a-fA-F0-9]{24})""")
+            var ivHex: String? = null
+            for (l in lines) {
+                val m = ivRegex.find(l)
+                if (m != null) { ivHex = m.groupValues[1]; break }
+            }
+            if (ivHex == null) {
+                println("[NguonC] [StreamcNew] AESGCM envelope: IV line not recognised: ${lines.getOrNull(1)?.take(60)}")
+                return null
+            }
+            val b64 = lines.filter { !it.startsWith("#") }.joinToString("")
+                .replace('-', '+').replace('_', '/').trimEnd('=')
+            if (b64.isEmpty()) {
+                println("[NguonC] [StreamcNew] AESGCM envelope: empty ciphertext")
+                return null
+            }
+            val data = Base64.decode(padBase64(b64), Base64.DEFAULT)
             if (data.size <= 16) return null
             val mac = javax.crypto.Mac.getInstance("HmacSHA256")
             mac.init(SecretKeySpec("stream-derive-v1".toByteArray(Charsets.UTF_8), "HmacSHA256"))
