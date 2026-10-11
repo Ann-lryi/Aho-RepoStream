@@ -3,6 +3,8 @@
 // NguonC patch v5 (2026-10-12): tolerant AES-GCM envelope parser, direct flow now decrypts
 // "aesgcm" playlists, /seg/ proxy tries several header profiles per host + logs upstream
 // HTTP status (ExoPlayer 2004 = ERROR_CODE_IO_BAD_HTTP_STATUS), embed URL preferred over m3u8 field.
+// NguonC patch v6 (2026-10-12): logcat unreadable on Android 17 -> in-app diagnostics: Toast
+// per stage + file <externalFilesDir>/nguonc_diag.txt (see nlog / ntoast).
 package com.phimnguonc
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -575,6 +577,58 @@ class PhimNguonCProvider : MainAPI() {
     // succeeded per segment host, so a rejected profile is not retried on every segment.
     private val segProfileByHost = ConcurrentHashMap<String, Int>()
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  v6 diagnostics — logcat is unreadable on the target device (Android 17), so every
+    //  [NguonC] log line is ALSO appended to <externalFilesDir>/nguonc_diag.txt and the
+    //  key stages are shown as Toasts.
+    // ═══════════════════════════════════════════════════════════════════════════
+    private val NG_BUILD = "v6"
+    private val diagLock = Any()
+    @Volatile private var diagCtx: android.content.Context? = null
+    @Volatile private var diagPathShown = false
+    private val segLogCount = java.util.concurrent.atomic.AtomicInteger(0)
+    private val toastPending = java.util.concurrent.atomic.AtomicInteger(0)
+
+    private fun diagContext(): android.content.Context? {
+        diagCtx?.let { return it }
+        val c = streamcAppContext() ?: return null
+        diagCtx = c.applicationContext ?: c
+        return diagCtx
+    }
+
+    private fun ntoast(msg: String) {
+        try {
+            val ctx = diagContext() ?: return
+            if (toastPending.get() >= 5) return
+            toastPending.incrementAndGet()
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                try {
+                    android.widget.Toast.makeText(ctx, msg.take(160), android.widget.Toast.LENGTH_LONG).show()
+                } catch (_: Throwable) {}
+                toastPending.decrementAndGet()
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun nlog(msg: String) {
+        println(msg)
+        try {
+            if (msg.contains("[Seg]") && segLogCount.incrementAndGet() > 24) return
+            val ctx = diagContext() ?: return
+            val dir = ctx.getExternalFilesDir(null) ?: ctx.filesDir
+            val f = java.io.File(dir, "nguonc_diag.txt")
+            synchronized(diagLock) {
+                if (f.exists() && f.length() > 96 * 1024) f.writeText("")
+                val ts = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US).format(java.util.Date())
+                f.appendText("$ts $NG_BUILD $msg\n")
+            }
+            if (!diagPathShown) {
+                diagPathShown = true
+                ntoast("NguonC $NG_BUILD log: ${f.absolutePath}")
+            }
+        } catch (_: Throwable) {}
+    }
+
     inner class NguonCProxyServer(
         private val segReferer: String
     ) {
@@ -582,6 +636,8 @@ class PhimNguonCProvider : MainAPI() {
         val port: Int get() = serverSocket?.localPort ?: 0
         private val threadPool = java.util.concurrent.Executors.newCachedThreadPool()
         @Volatile private var _m3u8: String = ""
+        @Volatile private var segFailToasted = false
+        @Volatile private var segOkToasted = false
 
         fun setM3U8(content: String) { _m3u8 = content }
         private fun getM3U8(): String = _m3u8
@@ -612,6 +668,7 @@ class PhimNguonCProvider : MainAPI() {
                 when {
                     path == "/stream.m3u8" -> {
                         val body = getM3U8().toByteArray(Charsets.UTF_8)
+                        nlog("[NguonC] [Proxy] stream.m3u8 served bytes=${body.size} port=$port")
                         output.write(("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${body.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}").toByteArray())
                         output.write(body)
                     }
@@ -641,6 +698,7 @@ class PhimNguonCProvider : MainAPI() {
                         var ok = false
                         var headersSent = false
                         var lastCode = -1
+                        var lastInfo = ""
                         for (round in 0..1) {
                             for (idx in order) {
                                 val (ua, ref, origin) = profiles[idx]
@@ -656,7 +714,22 @@ class PhimNguonCProvider : MainAPI() {
                                     val code = conn.responseCode
                                     lastCode = code
                                     if (code !in 200..299) {
-                                        println("[NguonC] [Seg] HTTP $code profile=$idx host=$segHost url=...${segUrl.takeLast(48)}")
+                                        val info = StringBuilder()
+                                        runCatching {
+                                            info.append(" ct=").append(conn.contentType)
+                                            info.append(" srv=").append(conn.getHeaderField("Server"))
+                                            info.append(" cfm=").append(conn.getHeaderField("cf-mitigated"))
+                                            info.append(" cfray=").append(conn.getHeaderField("cf-ray"))
+                                            val es = conn.errorStream
+                                            if (es != null) {
+                                                val eb = ByteArray(160)
+                                                val en = es.read(eb)
+                                                if (en > 0) info.append(" body=").append(String(eb, 0, en, Charsets.UTF_8).replace(Regex("\\s+"), " "))
+                                                runCatching { es.close() }
+                                            }
+                                        }
+                                        lastInfo = info.toString()
+                                        nlog("[NguonC] [Seg] HTTP $code profile=$idx host=$segHost url=...${segUrl.takeLast(48)}$lastInfo")
                                         runCatching { conn.disconnect() }
                                         continue
                                     }
@@ -679,11 +752,16 @@ class PhimNguonCProvider : MainAPI() {
                                         }
                                     }
                                     ok = true
+                                    if (!segOkToasted) {
+                                        segOkToasted = true
+                                        nlog("[NguonC] [Seg] first segment OK profile=$idx host=$segHost")
+                                        ntoast("NguonC $NG_BUILD: segment OK (profile $idx) $segHost")
+                                    }
                                     segProfileByHost[segHost] = idx
                                     // no disconnect() — the pooled TLS connection is reused
                                     break
                                 } catch (e: Exception) {
-                                    println("[NguonC] [Seg] error profile=$idx host=$segHost: ${e.message}")
+                                    nlog("[NguonC] [Seg] error profile=$idx host=$segHost: ${e.message}")
                                     runCatching { conn?.disconnect() }
                                     // headers already on the wire -> a second response on the
                                     // same socket would corrupt the stream; give up on this segment
@@ -696,10 +774,19 @@ class PhimNguonCProvider : MainAPI() {
                             } else break
                         }
                         if (!ok) {
+                            if (!segFailToasted) {
+                                segFailToasted = true
+                                val ct = Regex("ct=(\\S+)").find(lastInfo)?.groupValues?.get(1)
+                                val srv = Regex("srv=(\\S+)").find(lastInfo)?.groupValues?.get(1)
+                                ntoast("NguonC $NG_BUILD: segment HTTP $lastCode $segHost srv=$srv ct=$ct")
+                            }
                             output.write("HTTP/1.1 502 Bad Gateway${crlf}X-Upstream-Status: $lastCode${crlf}Content-Length: 0${crlf}${crlf}".toByteArray())
                         }
                     }
-                    else -> output.write("HTTP/1.1 404 Not Found${crlf}${crlf}".toByteArray())
+                    else -> {
+                        nlog("[NguonC] [Proxy] 404 for path=${path.take(80)}")
+                        output.write("HTTP/1.1 404 Not Found${crlf}${crlf}".toByteArray())
+                    }
                 }
                 output.flush()
                 client.close()
@@ -745,7 +832,9 @@ class PhimNguonCProvider : MainAPI() {
         if (!m3u8Content.contains("#EXTM3U")) return false
         run {
             val segs = m3u8Content.lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }
-            println("[NguonC] registerM3U8Link: segments=${segs.size} first=${segs.firstOrNull()?.take(110)} base=${m3u8BaseUrl.take(60)} referer=${referer.take(70)}")
+            nlog("[NguonC] registerM3U8Link: segments=${segs.size} first=${segs.firstOrNull()?.take(110)} base=${m3u8BaseUrl.take(60)} referer=${referer.take(70)}")
+            val firstHost = segs.firstOrNull()?.let { Regex("^https?://([^/]+)").find(it)?.groupValues?.get(1) } ?: "relative"
+            ntoast("NguonC $NG_BUILD: playlist OK ${segs.size} seg @ $firstHost")
         }
         val server = NguonCProxyServer(referer)
         server.start(); activeServers.add(server)
@@ -788,7 +877,7 @@ class PhimNguonCProvider : MainAPI() {
                 val h = Regex(""""h"\s*:\s*"([a-fA-F0-9]+)"""").find(decoded)?.groupValues?.get(1)
                 val t = Regex(""""t"\s*:\s*"([a-fA-F0-9]+)"""").find(decoded)?.groupValues?.get(1)
                 if (h != null && t != null) {
-                    println("[NguonC] Decoded token ($method): h=${h.length}hex, t=${t.length}hex")
+                    nlog("[NguonC] Decoded token ($method): h=${h.length}hex, t=${t.length}hex")
                     return Triple(decoded, h, t)
                 }
             } catch (_: Exception) { continue }
@@ -816,7 +905,7 @@ class PhimNguonCProvider : MainAPI() {
         for ((methodName, decoder) in decodeMethods) {
             try {
                 val obfJson = String(decoder(), Charsets.UTF_8)
-                println("[NguonC] data-obf decoded ($methodName): ${obfJson.take(200)}")
+                nlog("[NguonC] data-obf decoded ($methodName): ${obfJson.take(200)}")
 
                 // Try multiple field name patterns (site may use different names)
                 val tokenPatterns = listOf("sUb", "sub", "token", "tkn", "sU", "Su")
@@ -841,7 +930,7 @@ class PhimNguonCProvider : MainAPI() {
                 }
 
                 if (sUb != null || hD != null || kX != null) {
-                    println("[NguonC] data-obf ($methodName): sUb=${sUb?.take(20)}... hD=${hD?.take(20)}... kX=${kX?.take(20)}...")
+                    nlog("[NguonC] data-obf ($methodName): sUb=${sUb?.take(20)}... hD=${hD?.take(20)}... kX=${kX?.take(20)}...")
                     return Triple(sUb, hD, kX)
                 }
 
@@ -852,19 +941,19 @@ class PhimNguonCProvider : MainAPI() {
                     for (match in allValues) {
                         val key = match.groupValues[1]
                         val value = match.groupValues[2]
-                        println("[NguonC] data-obf found field: $key = ${value.take(20)}...")
+                        nlog("[NguonC] data-obf found field: $key = ${value.take(20)}...")
                         // Heuristic: if value looks like base64 JSON token, use it as sUb
                         if (value.length > 30 && (value.contains("=") || value.any { it in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" })) {
                             if (sUb == null) {
                                 sUb = value
-                                println("[NguonC] data-obf heuristic: using $key as sUb")
+                                nlog("[NguonC] data-obf heuristic: using $key as sUb")
                             }
                         }
                     }
                     if (sUb != null) return Triple(sUb, hD, kX)
                 }
             } catch (e: Exception) {
-                println("[NguonC] data-obf decode error ($methodName): ${e.message}")
+                nlog("[NguonC] data-obf decode error ($methodName): ${e.message}")
             }
         }
         return null
@@ -892,7 +981,7 @@ class PhimNguonCProvider : MainAPI() {
             for (match in matches) {
                 val token = match.groupValues.getOrNull(1)
                 if (token != null && token.length > 10 && !token.startsWith("blob:") && !token.startsWith("http")) {
-                    println("[NguonC] Found token in HTML: ${token.take(20)}... (len=${token.length}, pattern=${pattern.pattern.take(40)})")
+                    nlog("[NguonC] Found token in HTML: ${token.take(20)}... (len=${token.length}, pattern=${pattern.pattern.take(40)})")
                     return token
                 }
             }
@@ -905,7 +994,7 @@ class PhimNguonCProvider : MainAPI() {
         // Source 1: data-obf
         val obfData = extractObfData(html)
         if (obfData != null && obfData.third != null) {
-            println("[NguonC] Found kX from data-obf: ${obfData.third}")
+            nlog("[NguonC] Found kX from data-obf: ${obfData.third}")
             return obfData.third
         }
 
@@ -917,7 +1006,7 @@ class PhimNguonCProvider : MainAPI() {
             if (match != null) {
                 val key = match.groupValues[1]
                 if (key.length >= 32) {
-                    println("[NguonC] Found kX in inline script: ${key.take(20)}...")
+                    nlog("[NguonC] Found kX in inline script: ${key.take(20)}...")
                     return key
                 }
             }
@@ -940,7 +1029,7 @@ class PhimNguonCProvider : MainAPI() {
                     )) {
                         val match = pattern.find(jsContent)
                         if (match != null) {
-                            println("[NguonC] Found kX in $jsName.js: ${match.groupValues[1].take(20)}...")
+                            nlog("[NguonC] Found kX in $jsName.js: ${match.groupValues[1].take(20)}...")
                             return match.groupValues[1]
                         }
                     }
@@ -956,7 +1045,7 @@ class PhimNguonCProvider : MainAPI() {
         val scriptSrcs = Regex("""src=["']([^"']*\.js[^"']*)["']""", RegexOption.IGNORE_CASE)
             .findAll(html).map { it.groupValues[1] }.toList()
 
-        println("[NguonC] Found ${scriptSrcs.size} script sources in HTML")
+        nlog("[NguonC] Found ${scriptSrcs.size} script sources in HTML")
 
         for (jsPath in scriptSrcs) {
             val jsUrl = if (jsPath.startsWith("http")) jsPath else "$embedDomain/$jsPath"
@@ -964,7 +1053,7 @@ class PhimNguonCProvider : MainAPI() {
                 val jsContent = app.get(jsUrl, headers = mapOf(
                     "Referer" to referer, "User-Agent" to USER_AGENT
                 )).text
-                println("[NguonC] Downloaded JS: ${jsPath.take(40)} (${jsContent.length} chars)")
+                nlog("[NguonC] Downloaded JS: ${jsPath.take(40)} (${jsContent.length} chars)")
 
                 // Look for token-like patterns: base64 strings that end up in URLs
                 // Pattern 1: variable = "BASE64STRING" where BASE64 is long enough to be a token
@@ -975,7 +1064,7 @@ class PhimNguonCProvider : MainAPI() {
                     try {
                         val decoded = String(Base64.decode(padBase64(candidate.replace('-', '+').replace('_', '/')), Base64.DEFAULT), Charsets.UTF_8)
                         if (decoded.contains("\"h\"") && decoded.contains("\"t\"")) {
-                            println("[NguonC] Found token in JS: ${candidate.take(20)}... (decoded: ${decoded.take(50)})")
+                            nlog("[NguonC] Found token in JS: ${candidate.take(20)}... (decoded: ${decoded.take(50)})")
                             // Also try to find kX in the same JS
                             val kXMatch = Regex("""(?:kX|key|aesKey)\s*[:=]\s*["']([a-fA-F0-9]{32,})["']""").find(jsContent)
                             return Pair(candidate, kXMatch?.groupValues?.get(1))
@@ -988,7 +1077,7 @@ class PhimNguonCProvider : MainAPI() {
                 if (urlPattern != null) {
                     val tokenStr = urlPattern.groupValues[1]
                     if (tokenStr.length > 20) {
-                        println("[NguonC] Found token-like URL in JS: ${tokenStr.take(20)}...")
+                        nlog("[NguonC] Found token-like URL in JS: ${tokenStr.take(20)}...")
                         val kXMatch = Regex("""(?:kX|key|aesKey)\s*[:=]\s*["']([a-fA-F0-9]{32,})["']""").find(jsContent)
                         return Pair(tokenStr, kXMatch?.groupValues?.get(1))
                     }
@@ -997,7 +1086,7 @@ class PhimNguonCProvider : MainAPI() {
                 // Pattern 3: Look for btoa/atob usage with token construction
                 val tokenConstruct = Regex("""(?:btoa|atob|Base64)\s*\(\s*(?:JSON\.stringify\s*\(\s*\{[^}]*"h"[^}]*\})""").find(jsContent)
                 if (tokenConstruct != null) {
-                    println("[NguonC] Found token construction in JS: ${tokenConstruct.value.take(60)}...")
+                    nlog("[NguonC] Found token construction in JS: ${tokenConstruct.value.take(60)}...")
                 }
             } catch (_: Exception) {}
         }
@@ -1013,7 +1102,7 @@ class PhimNguonCProvider : MainAPI() {
             val ivMatch = Regex("""#ENC-AESGCM;iv=([a-f0-9A-F]+)""").find(content) ?: return null
             val ivHex = ivMatch.groupValues[1]
             val iv = hexToBytes(ivHex)
-            println("[NguonC] Decrypt: iv=${ivHex.take(16)}... (${ivHex.length}hex), kX=$kX")
+            nlog("[NguonC] Decrypt: iv=${ivHex.take(16)}... (${ivHex.length}hex), kX=$kX")
 
             // Parse B65 header - supports both #EXT-X-B65:offset-length and #EXT-X-B65:offset
             val b65Match = Regex("""#EXT-X-B65:(\d+)(?:-(\d+))?""").find(content)
@@ -1024,7 +1113,7 @@ class PhimNguonCProvider : MainAPI() {
             val dataLines = content.lines().dropWhile { it.startsWith("#") || it.isBlank() }
             val b64Data = dataLines.joinToString("").trim()
             if (b64Data.isEmpty()) {
-                println("[NguonC] Decrypt: no data after headers")
+                nlog("[NguonC] Decrypt: no data after headers")
                 return null
             }
 
@@ -1035,7 +1124,7 @@ class PhimNguonCProvider : MainAPI() {
                           else encData
             }
 
-            println("[NguonC] Decrypt: encData size=${encData.size}, offset=$offset, length=$length")
+            nlog("[NguonC] Decrypt: encData size=${encData.size}, offset=$offset, length=$length")
 
             // Build key candidates - ordered by likelihood
             val keyCandidates = mutableListOf<Pair<String, ByteArray>>()
@@ -1083,7 +1172,7 @@ class PhimNguonCProvider : MainAPI() {
                 try { keyCandidates.add(Pair("kX-padded-32hex", hexToBytes(padded))) } catch (_: Exception) {}
             }
 
-            println("[NguonC] Trying ${keyCandidates.size} key candidates...")
+            nlog("[NguonC] Trying ${keyCandidates.size} key candidates...")
 
             for ((desc, keyBytes) in keyCandidates) {
                 if (keyBytes.size != 16 && keyBytes.size != 32) continue
@@ -1092,7 +1181,7 @@ class PhimNguonCProvider : MainAPI() {
                     cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, iv))
                     val result = String(cipher.doFinal(encData), Charsets.UTF_8)
                     if (result.contains("#EXTM3U")) {
-                        println("[NguonC] Decryption OK with $desc!")
+                        nlog("[NguonC] Decryption OK with $desc!")
                         return result
                     }
                 } catch (_: Exception) {}
@@ -1101,7 +1190,7 @@ class PhimNguonCProvider : MainAPI() {
             // 5. Try with different IV sizes (96 bits = 12 bytes is standard for GCM)
             // But some implementations might use different IV sizes
             if (iv.size != 12) {
-                println("[NguonC] IV size is ${iv.size} bytes (expected 12), trying standard size...")
+                nlog("[NguonC] IV size is ${iv.size} bytes (expected 12), trying standard size...")
                 for ((desc, keyBytes) in keyCandidates) {
                     if (keyBytes.size != 16 && keyBytes.size != 32) continue
                     try {
@@ -1111,16 +1200,16 @@ class PhimNguonCProvider : MainAPI() {
                         cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, truncatedIv))
                         val result = String(cipher.doFinal(encData), Charsets.UTF_8)
                         if (result.contains("#EXTM3U")) {
-                            println("[NguonC] Decryption OK with $desc (truncated IV)!")
+                            nlog("[NguonC] Decryption OK with $desc (truncated IV)!")
                             return result
                         }
                     } catch (_: Exception) {}
                 }
             }
 
-            println("[NguonC] All decryption attempts failed")
+            nlog("[NguonC] All decryption attempts failed")
         } catch (e: Exception) {
-            println("[NguonC] Decryption error: ${e.message}")
+            nlog("[NguonC] Decryption error: ${e.message}")
         }
         return null
     }
@@ -1142,17 +1231,17 @@ class PhimNguonCProvider : MainAPI() {
             if (html.contains("data-obf") || html.contains("jwplayer") || html.contains("player1") ||
                 html.contains("streamc") || html.contains("embed") || html.contains("<video") ||
                 html.contains("m3u8") || html.contains("m3u9")) {
-                println("[NguonC] Direct HTML OK: ${html.length} chars")
+                nlog("[NguonC] Direct HTML OK: ${html.length} chars")
                 return html
             }
             // Even if no known markers, return it if it's a substantial HTML page
             if (html.length > 500 && html.contains("<")) {
-                println("[NguonC] Direct HTML (no markers but substantial): ${html.take(200)}")
+                nlog("[NguonC] Direct HTML (no markers but substantial): ${html.take(200)}")
                 return html
             }
-            println("[NguonC] Direct HTML not embed page: ${html.take(100)}")
+            nlog("[NguonC] Direct HTML not embed page: ${html.take(100)}")
         } catch (e: Exception) {
-            println("[NguonC] Direct HTML failed: ${e.message}")
+            nlog("[NguonC] Direct HTML failed: ${e.message}")
         }
 
         // Method 2: WebView with embedPageInterceptor (for CloudFlare bypass)
@@ -1164,11 +1253,11 @@ class PhimNguonCProvider : MainAPI() {
             if (html.contains("data-obf") || html.contains("jwplayer") || html.contains("player1") ||
                 html.contains("streamc") || html.contains("embed") || html.contains("<video") ||
                 html.contains("m3u8") || html.contains("m3u9") || html.length > 500) {
-                println("[NguonC] WebView embed HTML OK: ${html.length} chars")
+                nlog("[NguonC] WebView embed HTML OK: ${html.length} chars")
                 return html
             }
         } catch (e: Exception) {
-            println("[NguonC] WebView embed HTML failed: ${e.message}")
+            nlog("[NguonC] WebView embed HTML failed: ${e.message}")
         }
 
         // Method 3: WebView with cfInterceptor (broader, for tough CloudFlare)
@@ -1180,14 +1269,14 @@ class PhimNguonCProvider : MainAPI() {
             if (html.contains("data-obf") || html.contains("jwplayer") || html.contains("player1") ||
                 html.contains("streamc") || html.contains("embed") || html.contains("<video") ||
                 html.contains("m3u8") || html.contains("m3u9") || html.length > 500) {
-                println("[NguonC] cfInterceptor HTML OK: ${html.length} chars")
+                nlog("[NguonC] cfInterceptor HTML OK: ${html.length} chars")
                 return html
             }
         } catch (e: Exception) {
-            println("[NguonC] cfInterceptor HTML failed: ${e.message}")
+            nlog("[NguonC] cfInterceptor HTML failed: ${e.message}")
         }
 
-        println("[NguonC] All HTML fetch methods failed for: $embedUrl")
+        nlog("[NguonC] All HTML fetch methods failed for: $embedUrl")
         return null
     }
 
@@ -1204,17 +1293,17 @@ class PhimNguonCProvider : MainAPI() {
             val resp = app.get(url, headers = headers)
             val content = resp.text
             if (content.contains("#EXTM3U") || content.contains("#ENC-AESGCM")) {
-                println("[NguonC] Direct fetch OK: ${url.take(60)}")
+                nlog("[NguonC] Direct fetch OK: ${url.take(60)}")
                 return content
             }
-            println("[NguonC] Direct fetch response: ${content.take(80)}")
+            nlog("[NguonC] Direct fetch response: ${content.take(80)}")
         } catch (_: Exception) {}
         // Try with cfInterceptor
         try {
             val resp = app.get(url, headers = headers, interceptor = cfInterceptor)
             val content = resp.text
             if (content.contains("#EXTM3U") || content.contains("#ENC-AESGCM")) {
-                println("[NguonC] cfInterceptor fetch OK: ${url.take(60)}")
+                nlog("[NguonC] cfInterceptor fetch OK: ${url.take(60)}")
                 return content
             }
         } catch (_: Exception) {}
@@ -1252,13 +1341,13 @@ class PhimNguonCProvider : MainAPI() {
         for ((tokenVariant, desc) in urlVariations) {
             for (ext in listOf(".m3u9", ".m3u8")) {
                 val m3u8Url = "$embedDomain/$tokenVariant$ext"
-                println("[NguonC] Trying $desc token: ${m3u8Url.take(80)}")
+                nlog("[NguonC] Trying $desc token: ${m3u8Url.take(80)}")
                 val m3u8Content = fetchDirect(m3u8Url, referer, embedDomain)
 
                 if (m3u8Content != null) {
                     // Plain m3u8
                     if (m3u8Content.contains("#EXTM3U") && !m3u8Content.contains("#ENC-AESGCM")) {
-                        println("[NguonC] Got plain m3u8 with $desc + $ext!")
+                        nlog("[NguonC] Got plain m3u8 with $desc + $ext!")
                         val m3u8Base = m3u8Url.substringBeforeLast("/") + "/"
                         if (registerM3U8Link(m3u8Content, referer, m3u8Base, serverName, callback)) {
                             return true
@@ -1266,17 +1355,17 @@ class PhimNguonCProvider : MainAPI() {
                     }
                     // Encrypted m3u8
                     if (m3u8Content.contains("#ENC-AESGCM")) {
-                        println("[NguonC] Got encrypted m3u8 with $desc + $ext, trying decrypt...")
+                        nlog("[NguonC] Got encrypted m3u8 with $desc + $ext, trying decrypt...")
                         if (kX != null) {
                             val decrypted = decryptStreamcM3u8(m3u8Content, kX, tokenVariant)
                             if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
-                                println("[NguonC] Decrypted m3u8 OK!")
+                                nlog("[NguonC] Decrypted m3u8 OK!")
                                 if (registerM3U8Link(decrypted, referer, "", serverName, callback)) {
                                     return true
                                 }
                             }
                         } else {
-                            println("[NguonC] No kX for decryption")
+                            nlog("[NguonC] No kX for decryption")
                         }
                     }
                 }
@@ -1321,19 +1410,19 @@ class PhimNguonCProvider : MainAPI() {
             "Accept"       to "application/json, text/plain, */*",
             "User-Agent"   to USER_AGENT
         )
-        println("[NguonC] [MobileFlow] POST $postUrl")
+        nlog("[NguonC] [MobileFlow] POST $postUrl")
         val accessResp = try {
             app.post(postUrl, headers = postHeaders).parsedSafe<StreamcAccessResponse>()
         } catch (e: Exception) {
-            println("[NguonC] [MobileFlow] POST failed: ${e.message}")
+            nlog("[NguonC] [MobileFlow] POST failed: ${e.message}")
             null
         }
         val xat = accessResp?.xat
         if (xat.isNullOrBlank()) {
-            println("[NguonC] [MobileFlow] No xat in response (ok=${accessResp?.ok})")
+            nlog("[NguonC] [MobileFlow] No xat in response (ok=${accessResp?.ok})")
             return false
         }
-        println("[NguonC] [MobileFlow] Got xat: ${xat.take(20)}... (len=${xat.length})")
+        nlog("[NguonC] [MobileFlow] Got xat: ${xat.take(20)}... (len=${xat.length})")
 
         // ── Step 2: GET /{token}.m3u9?xat=<xat> to fetch the PLAIN m3u8 ──
         val m3u8Url = "$embedDomain/$accessTokenPath.m3u9?xat=$xat"
@@ -1343,39 +1432,39 @@ class PhimNguonCProvider : MainAPI() {
             "Accept"     to "*/*",
             "User-Agent" to USER_AGENT
         )
-        println("[NguonC] [MobileFlow] GET $m3u8Url")
+        nlog("[NguonC] [MobileFlow] GET $m3u8Url")
         val m3u8Content = try {
             app.get(m3u8Url, headers = getHeaders).text
         } catch (e: Exception) {
-            println("[NguonC] [MobileFlow] GET failed: ${e.message}")
+            nlog("[NguonC] [MobileFlow] GET failed: ${e.message}")
             null
         }
         if (m3u8Content.isNullOrBlank() || !m3u8Content.contains("#EXTM3U")) {
-            println("[NguonC] [MobileFlow] Response is not a valid m3u8 (len=${m3u8Content?.length ?: 0})")
+            nlog("[NguonC] [MobileFlow] Response is not a valid m3u8 (len=${m3u8Content?.length ?: 0})")
             // Try .m3u8 extension as a fallback (desktop endpoint, may be encrypted)
             val altUrl = "$embedDomain/$accessTokenPath.m3u8?xat=$xat"
-            println("[NguonC] [MobileFlow] Trying .m3u8: $altUrl")
+            nlog("[NguonC] [MobileFlow] Trying .m3u8: $altUrl")
             val altContent = try { app.get(altUrl, headers = getHeaders).text } catch (_: Exception) { null }
             if (altContent.isNullOrBlank() || !altContent.contains("#EXTM3U")) {
-                println("[NguonC] [MobileFlow] .m3u8 also failed")
+                nlog("[NguonC] [MobileFlow] .m3u8 also failed")
                 return false
             }
             // If the .m3u8 endpoint returned a PLAIN m3u8, register it.
             // (If it's encrypted #ENC-AESGCM, we can't decrypt it here — let the
             // legacy fallbacks try.)
             if (altContent.contains("#ENC-AESGCM")) {
-                println("[NguonC] [MobileFlow] .m3u8 is encrypted, deferring to legacy fallbacks")
+                nlog("[NguonC] [MobileFlow] .m3u8 is encrypted, deferring to legacy fallbacks")
                 return false
             }
             return registerM3U8Link(altContent, embedUrl, "", serverName, callback)
         }
 
         if (m3u8Content.contains("#ENC-AESGCM")) {
-            println("[NguonC] [MobileFlow] .m3u9 unexpectedly encrypted, deferring to legacy fallbacks")
+            nlog("[NguonC] [MobileFlow] .m3u9 unexpectedly encrypted, deferring to legacy fallbacks")
             return false
         }
 
-        println("[NguonC] [MobileFlow] Got plain m3u8 (${m3u8Content.length} chars, ${m3u8Content.split("\n").count { it.startsWith("#EXTINF") }} segments)")
+        nlog("[NguonC] [MobileFlow] Got plain m3u8 (${m3u8Content.length} chars, ${m3u8Content.split("\n").count { it.startsWith("#EXTINF") }} segments)")
         // Segments in this playlist are absolute https URLs (e.g. on hihihoho*.top),
         // so pass empty m3u8BaseUrl. The proxy will rewrite them and fetch with
         // Referer = embedUrl, which is exactly what the segment CDN requires.
@@ -1466,7 +1555,7 @@ class PhimNguonCProvider : MainAPI() {
             try { conn.disconnect() } catch (_: Exception) {}
             if (code in 200..299) text else null
         } catch (e: Exception) {
-            println("[NguonC] [StreamcNew] GET failed: ${e.message}")
+            nlog("[NguonC] [StreamcNew] GET failed: ${e.message}")
             null
         }
     }
@@ -1494,7 +1583,7 @@ class PhimNguonCProvider : MainAPI() {
             try { conn.disconnect() } catch (_: Exception) {}
             Pair(code, text)
         } catch (e: Exception) {
-            println("[NguonC] [StreamcNew] POST failed: ${e.message}")
+            nlog("[NguonC] [StreamcNew] POST failed: ${e.message}")
             Pair(-1, null)
         }
     }
@@ -1514,16 +1603,16 @@ class PhimNguonCProvider : MainAPI() {
             // handshake is hopeless — skip straight to the WebView flow.
             val cfBlockedUntil = streamcCfBlockedUntil[embedDomain] ?: 0L
             if (System.currentTimeMillis() < cfBlockedUntil) {
-                println("[NguonC] [StreamcNew] 0a skipped (Cloudflare blocked this domain recently)")
+                nlog("[NguonC] [StreamcNew] 0a skipped (Cloudflare blocked this domain recently)")
                 return@withLock false
             }
-            println("[NguonC] [StreamcNew] 0a: bootstrap POST ${embedUrl.take(70)}")
+            nlog("[NguonC] [StreamcNew] 0a: bootstrap POST ${embedUrl.take(70)}")
             val (code1, body1) = streamcPostJson(
                 embedUrl, embedDomain, embedUrl,
                 """{"action":"bootstrap","referrer":"$mainUrl/"}"""
             )
             if (code1 != 200 || body1 == null) {
-                println("[NguonC] [StreamcNew] bootstrap HTTP $code1: ${body1?.take(120)}")
+                nlog("[NguonC] [StreamcNew] bootstrap HTTP $code1: ${body1?.take(120)}")
                 if (code1 == 403) {
                     streamcCfBlockedUntil[embedDomain] = System.currentTimeMillis() + 10 * 60_000L
                 }
@@ -1531,16 +1620,16 @@ class PhimNguonCProvider : MainAPI() {
             }
             val err = streamcJsonString(body1, "error")
             if (err != null) {
-                println("[NguonC] [StreamcNew] bootstrap error: $err")
+                nlog("[NguonC] [StreamcNew] bootstrap error: $err")
                 return@withLock false
             }
             val bootstrapJwt = streamcJsonString(body1, "bootstrap")
             if (bootstrapJwt.isNullOrBlank()) {
-                println("[NguonC] [StreamcNew] no bootstrap JWT in response")
+                nlog("[NguonC] [StreamcNew] no bootstrap JWT in response")
                 return@withLock false
             }
             val turnstile = Regex(""""turnstileEnabled"\s*:\s*true""").containsMatchIn(body1)
-            println("[NguonC] [StreamcNew] bootstrap OK (turnstileEnabled=$turnstile)")
+            nlog("[NguonC] [StreamcNew] bootstrap OK (turnstileEnabled=$turnstile)")
             if (turnstile) return@withLock false  // needs a real browser challenge
 
             // Turnstile disabled on this video -> request the playlist directly
@@ -1550,14 +1639,14 @@ class PhimNguonCProvider : MainAPI() {
             )
             val playlist = body2?.let { streamcJsonString(it, "playlist") }
             if (code2 != 200 || playlist.isNullOrBlank()) {
-                println("[NguonC] [StreamcNew] issue HTTP $code2: ${body2?.take(120)}")
+                nlog("[NguonC] [StreamcNew] issue HTTP $code2: ${body2?.take(120)}")
                 return@withLock false
             }
-            println("[NguonC] [StreamcNew] issue OK: ${playlist.take(90)}")
+            nlog("[NguonC] [StreamcNew] issue OK: ${playlist.take(90)}")
 
             val content = streamcGet(playlist, embedDomain, embedUrl) ?: return@withLock false
             if (!content.contains("#EXTM3U")) {
-                println("[NguonC] [StreamcNew] unexpected playlist content (${content.take(60)})")
+                nlog("[NguonC] [StreamcNew] unexpected playlist content (${content.take(60)})")
                 return@withLock false
             }
             // v5: server may answer "aesgcm" even for the mobile UA -> decrypt via the shared
@@ -1565,7 +1654,7 @@ class PhimNguonCProvider : MainAPI() {
             val directHash = Regex("""[?&]hash=([a-fA-F0-9]{8,})""").find(embedUrl)?.groupValues?.get(1)
             streamcRegisterCaptured(playlist, content, directHash, embedUrl, serverName, callback)
         } catch (e: Exception) {
-            println("[NguonC] [StreamcNew] direct flow error: ${e.message}")
+            nlog("[NguonC] [StreamcNew] direct flow error: ${e.message}")
             false
         }
     }
@@ -1597,11 +1686,11 @@ class PhimNguonCProvider : MainAPI() {
         var dialog: android.app.Dialog? = null
         try {
             val videoHash = Regex("""[?&]hash=([a-fA-F0-9]{8,})""").find(targetUrl)?.groupValues?.get(1)
-            println("[NguonC] [StreamcNew] 0b: WebView fetch-hook flow on ${targetUrl.take(70)}")
+            nlog("[NguonC] [StreamcNew] 0b: WebView fetch-hook flow on ${targetUrl.take(70)}")
 
             val ctx = streamcAppContext()
             if (ctx == null) {
-                println("[NguonC] [StreamcNew] no app context available for WebView")
+                nlog("[NguonC] [StreamcNew] no app context available for WebView")
                 return false
             }
 
@@ -1620,7 +1709,7 @@ class PhimNguonCProvider : MainAPI() {
                 wv.addJavascriptInterface(
                     StreamcCaptureBridge { url, body ->
                         // v3: always log the arrival — proves the JS->Kotlin path works
-                        println("[NguonC] [StreamcNew] bridge capture: url=${url.take(60)} len=${body.length} head=${body.take(12)}")
+                        nlog("[NguonC] [StreamcNew] bridge capture: url=${url.take(60)} len=${body.length} head=${body.take(12)}")
                         val t = body.trim()
                         if (t.startsWith("#EXTM3U")) {
                             captures.trySend(url to body)
@@ -1662,7 +1751,7 @@ class PhimNguonCProvider : MainAPI() {
                         dlg.show()
                         dialog = dlg
                     } catch (e: Exception) {
-                        println("[NguonC] [StreamcNew] dialog unavailable (${e.message}), running headless")
+                        nlog("[NguonC] [StreamcNew] dialog unavailable (${e.message}), running headless")
                     }
                 }
 
@@ -1684,7 +1773,7 @@ class PhimNguonCProvider : MainAPI() {
                 // The issue JSON told us the playlist URL but the in-page fetch
                 // never came through the hook — try one manual GET (may hit CF).
                 issuePlaylistUrl.get()?.let { pUrl ->
-                    println("[NguonC] [StreamcNew] issue gave playlist, fetching manually: ${pUrl.take(70)}")
+                    nlog("[NguonC] [StreamcNew] issue gave playlist, fetching manually: ${pUrl.take(70)}")
                     val manual = streamcGet(pUrl, embedDomain, targetUrl)
                     if (manual != null) {
                         registered = streamcRegisterCaptured(pUrl, manual, videoHash, targetUrl, serverName, callback)
@@ -1698,7 +1787,7 @@ class PhimNguonCProvider : MainAPI() {
             )
             return registered
         } catch (e: Exception) {
-            println("[NguonC] [StreamcNew] WebView flow error: ${e.message}")
+            nlog("[NguonC] [StreamcNew] WebView flow error: ${e.message}")
             return false
         } finally {
             try {
@@ -1851,24 +1940,24 @@ class PhimNguonCProvider : MainAPI() {
         val trimmed = body.trim()
         val base = capturedUrl.substringBeforeLast("/") + "/"
         if (trimmed.startsWith("#EXTM3U") && !trimmed.contains("#ENC-AESGCM")) {
-            println("[NguonC] [StreamcNew] captured PLAIN playlist: ${capturedUrl.take(80)}")
+            nlog("[NguonC] [StreamcNew] captured PLAIN playlist: ${capturedUrl.take(80)}")
             val ok = registerM3U8Link(trimmed, referer, base, serverName, callback)
             if (ok) streamcCachePut(videoHash, capturedUrl, trimmed)
             return ok
         }
         if (trimmed.contains("#ENC-AESGCM")) {
             if (videoHash == null) {
-                println("[NguonC] [StreamcNew] encrypted playlist but no hash param in URL")
+                nlog("[NguonC] [StreamcNew] encrypted playlist but no hash param in URL")
                 return false
             }
             val decrypted = streamcDecryptAesGcm(trimmed, videoHash)
             if (decrypted != null) {
-                println("[NguonC] [StreamcNew] captured ENCRYPTED playlist + decrypted OK: ${capturedUrl.take(80)}")
+                nlog("[NguonC] [StreamcNew] captured ENCRYPTED playlist + decrypted OK: ${capturedUrl.take(80)}")
                 val ok = registerM3U8Link(decrypted, referer, base, serverName, callback)
                 if (ok) streamcCachePut(videoHash, capturedUrl, trimmed)
                 return ok
             }
-            println("[NguonC] [StreamcNew] captured ENCRYPTED playlist but decrypt failed")
+            nlog("[NguonC] [StreamcNew] captured ENCRYPTED playlist but decrypt failed")
         }
         return false
     }
@@ -1889,7 +1978,7 @@ class PhimNguonCProvider : MainAPI() {
         return try {
             val lines = content.trim().lines().map { it.trim() }.filter { it.isNotEmpty() }
             if (lines.isEmpty() || !lines[0].startsWith("#EXTM3U")) {
-                println("[NguonC] [StreamcNew] AESGCM envelope: no #EXTM3U header")
+                nlog("[NguonC] [StreamcNew] AESGCM envelope: no #EXTM3U header")
                 return null
             }
             val ivRegex = Regex("""^#ENC-AESGCM\s*[;:,]\s*iv=([a-fA-F0-9]{24})""")
@@ -1899,13 +1988,13 @@ class PhimNguonCProvider : MainAPI() {
                 if (m != null) { ivHex = m.groupValues[1]; break }
             }
             if (ivHex == null) {
-                println("[NguonC] [StreamcNew] AESGCM envelope: IV line not recognised: ${lines.getOrNull(1)?.take(60)}")
+                nlog("[NguonC] [StreamcNew] AESGCM envelope: IV line not recognised: ${lines.getOrNull(1)?.take(60)}")
                 return null
             }
             val b64 = lines.filter { !it.startsWith("#") }.joinToString("")
                 .replace('-', '+').replace('_', '/').trimEnd('=')
             if (b64.isEmpty()) {
-                println("[NguonC] [StreamcNew] AESGCM envelope: empty ciphertext")
+                nlog("[NguonC] [StreamcNew] AESGCM envelope: empty ciphertext")
                 return null
             }
             val data = Base64.decode(padBase64(b64), Base64.DEFAULT)
@@ -1919,7 +2008,7 @@ class PhimNguonCProvider : MainAPI() {
             val text = String(plain, Charsets.UTF_8)
             if (text.startsWith("#EXTM3U")) text else null
         } catch (e: Exception) {
-            println("[NguonC] [StreamcNew] AESGCM decrypt failed: ${e.message}")
+            nlog("[NguonC] [StreamcNew] AESGCM decrypt failed: ${e.message}")
             null
         }
     }
@@ -1950,6 +2039,10 @@ class PhimNguonCProvider : MainAPI() {
             else null
         }.distinctBy { it.second }  // dedupe by URL — same source shouldn't appear twice
         var linkFound = false
+        nlog("[NguonC] loadLinks: entries=${embedEntries.size} urls=${embedEntries.joinToString(" | ") { it.first + "=" + it.second.take(90) }}")
+        ntoast("NguonC $NG_BUILD: ${embedEntries.size} nguồn, " + embedEntries.joinToString(",") {
+            if (it.second.contains("hash=")) "embed+hash" else if (it.second.contains(".m3u")) "m3u8" else "khác"
+        })
 
         coroutineScope {
             embedEntries.map { (serverName, url) ->
@@ -1976,7 +2069,7 @@ class PhimNguonCProvider : MainAPI() {
                         // Streamc.xyz embed URL processing
                         // ══════════════════════════════════════════════════════════════
                         if (targetUrl.contains("streamc.xyz") || targetUrl.contains("phimmoi.net")) {
-                            println("[NguonC] === Processing: ${targetUrl.take(80)} ===")
+                            nlog("[NguonC] === Processing: ${targetUrl.take(80)} ===")
 
                             // ── STEP 0 (NEW 2026-09): Stream Panel "lite-15-cf-free"/"guard-7".
                             // The embed page no longer carries data-obf; the playlist URL is
@@ -1989,11 +2082,11 @@ class PhimNguonCProvider : MainAPI() {
                                 // skip Turnstile entirely on re-loads.
                                 val cached = streamcCacheGet(urlHash)
                                 if (cached != null) {
-                                    println("[NguonC] [StreamcNew] 0c: playlist cache HIT (${urlHash?.take(12)}...)")
+                                    nlog("[NguonC] [StreamcNew] 0c: playlist cache HIT (${urlHash?.take(12)}...)")
                                     if (streamcRegisterCaptured(cached.first, cached.second, urlHash, targetUrl, serverName, callback)) {
                                         linkFound = true; return@async
                                     }
-                                    println("[NguonC] [StreamcNew] 0c: cached playlist no longer playable — falling through")
+                                    nlog("[NguonC] [StreamcNew] 0c: cached playlist no longer playable — falling through")
                                 }
                             }
                             if (!linkFound) {
@@ -2021,15 +2114,15 @@ class PhimNguonCProvider : MainAPI() {
                                     kX = obfData.third      // kX
                                     // Also use hD as fallback token if sUb is null
                                     if (token == null && obfData.second != null) {
-                                        println("[NguonC] sUb is null, trying hD as token")
+                                        nlog("[NguonC] sUb is null, trying hD as token")
                                     }
-                                    println("[NguonC] From data-obf: token=${token?.take(20)}... kX=${kX?.take(20)}... hD=${obfData.second?.take(20)}...")
+                                    nlog("[NguonC] From data-obf: token=${token?.take(20)}... kX=${kX?.take(20)}... hD=${obfData.second?.take(20)}...")
                                 }
 
                                 // Fallback: find token in HTML source
                                 if (token == null) {
                                     token = findTokenInHTML(html)
-                                    println("[NguonC] Fallback token from HTML: ${token?.take(20)}...")
+                                    nlog("[NguonC] Fallback token from HTML: ${token?.take(20)}...")
                                 }
 
                                 // Fallback: try to find token from full URL in HTML
@@ -2037,7 +2130,7 @@ class PhimNguonCProvider : MainAPI() {
                                     val fullUrlMatch = Regex("""https?://embed\d+\.streamc\.xyz/([A-Za-z0-9_+/=\\-]+)\.(m3u8|m3u9)""").find(html)
                                     if (fullUrlMatch != null) {
                                         token = fullUrlMatch.groupValues[1]
-                                        println("[NguonC] Found token from full URL in HTML: ${token.take(20)}...")
+                                        nlog("[NguonC] Found token from full URL in HTML: ${token.take(20)}...")
                                     }
                                 }
 
@@ -2046,7 +2139,7 @@ class PhimNguonCProvider : MainAPI() {
                                     val pathMatch = Regex("""/([A-Za-z0-9_+/=\\-]{20,})\.(m3u8|m3u9)""").find(html)
                                     if (pathMatch != null) {
                                         token = pathMatch.groupValues[1]
-                                        println("[NguonC] Found token from path in HTML: ${token.take(20)}...")
+                                        nlog("[NguonC] Found token from path in HTML: ${token.take(20)}...")
                                     }
                                 }
 
@@ -2057,16 +2150,16 @@ class PhimNguonCProvider : MainAPI() {
 
                                 // ── STEP 2: Parse JS files for token if not found in HTML ──
                                 if (token == null) {
-                                    println("[NguonC] Token not in HTML, trying JS files...")
+                                    nlog("[NguonC] Token not in HTML, trying JS files...")
                                     val jsResult = extractTokenFromJS(html, embedDomain, targetUrl, urlHash)
                                     if (jsResult != null) {
                                         if (jsResult.first != null) {
                                             token = jsResult.first
-                                            println("[NguonC] Found token in JS: ${token?.take(20)}...")
+                                            nlog("[NguonC] Found token in JS: ${token?.take(20)}...")
                                         }
                                         if (jsResult.second != null && kX == null) {
                                             kX = jsResult.second
-                                            println("[NguonC] Found kX in JS: ${kX?.take(20)}...")
+                                            nlog("[NguonC] Found kX in JS: ${kX?.take(20)}...")
                                         }
                                     }
                                 }
@@ -2074,7 +2167,7 @@ class PhimNguonCProvider : MainAPI() {
                                 // ── STEP 3: Try using hD from data-obf as token if sUb is null ──
                                 if (token == null && obfData != null && obfData.second != null) {
                                     val hD = obfData.second
-                                    println("[NguonC] Trying hD as token: ${hD?.take(20)}...")
+                                    nlog("[NguonC] Trying hD as token: ${hD?.take(20)}...")
                                     token = hD
                                 }
                             }
@@ -2085,7 +2178,7 @@ class PhimNguonCProvider : MainAPI() {
                             // grief because the .m3u9 endpoint returns a PLAIN playlist.
                             // Try this FIRST so the user actually gets a playable link.
                             if (token != null) {
-                                println("[NguonC] Step 3.5: Mobile flow (POST + .m3u9?xat=)")
+                                nlog("[NguonC] Step 3.5: Mobile flow (POST + .m3u9?xat=)")
                                 if (tryMobileM3U8Flow(targetUrl, embedDomain, token, serverName, callback)) {
                                     linkFound = true; return@async
                                 }
@@ -2105,7 +2198,7 @@ class PhimNguonCProvider : MainAPI() {
                             // try. This prevents the "không tìm thấy trang web" toasts that
                             // pop up when WebView tries to load a dead URL.
                             if (html == null && token == null && urlHash == null) {
-                                println("[NguonC] Embed page unreachable + no token + no urlHash — bailing out to avoid 'website not found'")
+                                nlog("[NguonC] Embed page unreachable + no token + no urlHash — bailing out to avoid 'website not found'")
                                 return@async
                             }
                             // If html is null but we DO have urlHash, skip the WebView
@@ -2113,12 +2206,12 @@ class PhimNguonCProvider : MainAPI() {
                             // go straight to Step 7 (which tries DIFFERENT embed domains).
                             val skipWebViewFallbacks = (html == null && token == null && urlHash != null)
                             if (skipWebViewFallbacks) {
-                                println("[NguonC] Embed page unreachable but have urlHash — skipping WebView fallbacks, going to Step 7 (alt domains)")
+                                nlog("[NguonC] Embed page unreachable but have urlHash — skipping WebView fallbacks, going to Step 7 (alt domains)")
                             }
 
                             // ── STEP 5: WebView interception - capture m3u8 directly ──
                             if (!linkFound && !skipWebViewFallbacks) {
-                                println("[NguonC] Step 5: WebView interception for m3u8/m3u9")
+                                nlog("[NguonC] Step 5: WebView interception for m3u8/m3u9")
                                 try {
                                     val resp = app.get(targetUrl, interceptor = m3u8Interceptor, headers = mapOf(
                                         "Referer" to "$mainUrl/", "User-Agent" to USER_AGENT
@@ -2128,7 +2221,7 @@ class PhimNguonCProvider : MainAPI() {
 
                                     // Plain m3u8
                                     if (content.contains("#EXTM3U") && !content.contains("#ENC-AESGCM")) {
-                                        println("[NguonC] WebView captured plain m3u8!")
+                                        nlog("[NguonC] WebView captured plain m3u8!")
                                         val m3u8Base = if (capturedUrl.isNotEmpty()) capturedUrl.substringBeforeLast("/") + "/" else ""
                                         if (registerM3U8Link(content, targetUrl, m3u8Base, serverName, callback)) {
                                             linkFound = true; return@async
@@ -2137,7 +2230,7 @@ class PhimNguonCProvider : MainAPI() {
 
                                     // Encrypted m3u8 captured via WebView
                                     if (content.contains("#ENC-AESGCM")) {
-                                        println("[NguonC] WebView captured encrypted m3u8, trying decrypt...")
+                                        nlog("[NguonC] WebView captured encrypted m3u8, trying decrypt...")
                                         val capToken = Regex("""/([A-Za-z0-9+/=_-]+)\.(m3u8|m3u9)""").find(capturedUrl)?.groupValues?.get(1)
 
                                         val encKX = kX ?: html?.let {
@@ -2147,7 +2240,7 @@ class PhimNguonCProvider : MainAPI() {
                                         if (encKX != null) {
                                             val decrypted = decryptStreamcM3u8(content, encKX, capToken)
                                             if (!decrypted.isNullOrEmpty() && decrypted.contains("#EXTM3U")) {
-                                                println("[NguonC] Decrypted WebView m3u8 OK!")
+                                                nlog("[NguonC] Decrypted WebView m3u8 OK!")
                                                 if (registerM3U8Link(decrypted, targetUrl, "", serverName, callback)) {
                                                     linkFound = true; return@async
                                                 }
@@ -2158,7 +2251,7 @@ class PhimNguonCProvider : MainAPI() {
                                         if (capToken != null && !linkFound) {
                                             val altExt = if (capturedUrl.contains(".m3u8")) ".m3u9" else ".m3u8"
                                             val altUrl = "$embedDomain/$capToken$altExt"
-                                            println("[NguonC] Trying alternative: ${altUrl.take(60)}")
+                                            nlog("[NguonC] Trying alternative: ${altUrl.take(60)}")
                                             val altContent = fetchDirect(altUrl, targetUrl, embedDomain)
                                             if (altContent != null && altContent.contains("#EXTM3U") && !altContent.contains("#ENC-AESGCM")) {
                                                 val m3u8Base = altUrl.substringBeforeLast("/") + "/"
@@ -2169,13 +2262,13 @@ class PhimNguonCProvider : MainAPI() {
                                         }
                                     }
                                 } catch (e: Exception) {
-                                    println("[NguonC] WebView interception failed: ${e.message}")
+                                    nlog("[NguonC] WebView interception failed: ${e.message}")
                                 }
                             }
 
                             // ── STEP 6: Broader WebView interception (any domain) ──
                             if (!linkFound && !skipWebViewFallbacks) {
-                                println("[NguonC] Step 6: Broad WebView interception")
+                                nlog("[NguonC] Step 6: Broad WebView interception")
                                 try {
                                     val resp = app.get(targetUrl, interceptor = broadM3u8Interceptor, headers = mapOf(
                                         "Referer" to "$mainUrl/", "User-Agent" to USER_AGENT
@@ -2184,7 +2277,7 @@ class PhimNguonCProvider : MainAPI() {
                                     val capturedUrl = resp.url ?: ""
 
                                     if (content.contains("#EXTM3U") && !content.contains("#ENC-AESGCM")) {
-                                        println("[NguonC] Broad WebView captured plain m3u8!")
+                                        nlog("[NguonC] Broad WebView captured plain m3u8!")
                                         val m3u8Base = if (capturedUrl.isNotEmpty()) capturedUrl.substringBeforeLast("/") + "/" else ""
                                         if (registerM3U8Link(content, targetUrl, m3u8Base, serverName, callback)) {
                                             linkFound = true; return@async
@@ -2192,7 +2285,7 @@ class PhimNguonCProvider : MainAPI() {
                                     }
 
                                     if (content.contains("#ENC-AESGCM")) {
-                                        println("[NguonC] Broad WebView captured encrypted m3u8")
+                                        nlog("[NguonC] Broad WebView captured encrypted m3u8")
                                         val capToken = Regex("""/([A-Za-z0-9+/=_-]+)\.(m3u8|m3u9)""").find(capturedUrl)?.groupValues?.get(1)
                                         val encKX = kX ?: html?.let {
                                             extractObfData(it)?.third ?: findEncryptionKey(it, embedDomain, targetUrl)
@@ -2207,13 +2300,13 @@ class PhimNguonCProvider : MainAPI() {
                                         }
                                     }
                                 } catch (e: Exception) {
-                                    println("[NguonC] Broad WebView failed: ${e.message}")
+                                    nlog("[NguonC] Broad WebView failed: ${e.message}")
                                 }
                             }
 
                             // ── STEP 7: Try URL hash-based token construction ──
                             if (!linkFound && urlHash != null) {
-                                println("[NguonC] Step 7: Trying URL hash as token: ${urlHash.take(20)}...")
+                                nlog("[NguonC] Step 7: Trying URL hash as token: ${urlHash.take(20)}...")
 
                                 // 7a: Try hash directly as m3u8 URL path
                                 for (ext in listOf(".m3u9", ".m3u8")) {
@@ -2243,7 +2336,7 @@ class PhimNguonCProvider : MainAPI() {
                                         val constructedToken = toUrlSafeBase64(
                                             String(Base64.encode(tokenJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP), Charsets.UTF_8)
                                         )
-                                        println("[NguonC] Constructed token: ${constructedToken.take(20)}...")
+                                        nlog("[NguonC] Constructed token: ${constructedToken.take(20)}...")
                                         if (tryFetchWithToken(constructedToken, embedDomain, targetUrl, kX, serverName, callback)) {
                                             linkFound = true; return@async
                                         }
@@ -2255,7 +2348,7 @@ class PhimNguonCProvider : MainAPI() {
                                 // sequential loop with tryFetchWithToken would hit 401 on
                                 // every domain and take 30+ seconds before giving up.
                                 if (!linkFound) {
-                                    println("[NguonC] Step 7c: Trying alt domains in parallel via mobile flow")
+                                    nlog("[NguonC] Step 7c: Trying alt domains in parallel via mobile flow")
                                     val altResults = listOf(11, 12, 13, 14, 15, 16, 17, 18, 19, 20)
                                         .map { num -> "https://embed${num}.streamc.xyz" }
                                         .filter { it != embedDomain }
@@ -2268,7 +2361,7 @@ class PhimNguonCProvider : MainAPI() {
                                                     val altObfData = extractObfData(altHtml)
                                                     val altToken = altObfData?.first ?: findTokenInHTML(altHtml)
                                                         ?: return@async null
-                                                    println("[NguonC] [7c] Found token on $altDomain, trying mobile flow")
+                                                    nlog("[NguonC] [7c] Found token on $altDomain, trying mobile flow")
                                                     if (tryMobileM3U8Flow(altUrl, altDomain, altToken, serverName, callback)) {
                                                         return@async altDomain  // success — return domain as a truthy signal
                                                     }
@@ -2277,7 +2370,7 @@ class PhimNguonCProvider : MainAPI() {
                                             }
                                         }.awaitAll()
                                     if (altResults.any { it != null }) {
-                                        println("[NguonC] [7c] Alt domain succeeded: $altResults")
+                                        nlog("[NguonC] [7c] Alt domain succeeded: $altResults")
                                         linkFound = true; return@async
                                     }
                                 }
@@ -2285,7 +2378,7 @@ class PhimNguonCProvider : MainAPI() {
 
                             // ── STEP 8: Last resort - broader cfInterceptor ──
                             if (!linkFound && !skipWebViewFallbacks) {
-                                println("[NguonC] Step 8: Last resort cfInterceptor")
+                                nlog("[NguonC] Step 8: Last resort cfInterceptor")
                                 try {
                                     val resp = app.get(targetUrl, interceptor = cfInterceptor, headers = mapOf(
                                         "Referer" to "$mainUrl/", "User-Agent" to USER_AGENT
@@ -2303,7 +2396,7 @@ class PhimNguonCProvider : MainAPI() {
                             }
 
                             if (!linkFound) {
-                                println("[NguonC] FAILED - all approaches exhausted for: $targetUrl")
+                                nlog("[NguonC] FAILED - all approaches exhausted for: $targetUrl")
                             }
                             return@async
                         }
@@ -2312,7 +2405,7 @@ class PhimNguonCProvider : MainAPI() {
                         // Direct m3u8/m3u9 URL (from API m3u8 field)
                         // ══════════════════════════════════════════════════════════════
                         if ((targetUrl.contains(".m3u8") || targetUrl.contains(".m3u9")) && targetUrl.contains("streamc.xyz")) {
-                            println("[NguonC] Processing direct m3u8/m3u9 URL: ${targetUrl.take(80)}")
+                            nlog("[NguonC] Processing direct m3u8/m3u9 URL: ${targetUrl.take(80)}")
 
                             // NEW: Extract the token from the URL and try the mobile flow first.
                             // This handles the case where the API returns a direct /{token}.m3u8
@@ -2323,7 +2416,7 @@ class PhimNguonCProvider : MainAPI() {
                                 // The segment CDN accepts any https://embedXX.streamc.xyz/* referer.
                                 val embedPageUrl = Regex("""(https?://embed\d+\.streamc\.xyz)""").find(targetUrl)?.groupValues?.get(1)?.let { "$it/embed.php" }
                                     ?: "$embedDomain/embed.php"
-                                println("[NguonC] Trying mobile flow on direct URL with token: ${urlToken.take(20)}...")
+                                nlog("[NguonC] Trying mobile flow on direct URL with token: ${urlToken.take(20)}...")
                                 if (tryMobileM3U8Flow(embedPageUrl, embedDomain, urlToken, serverName, callback)) {
                                     linkFound = true; return@async
                                 }
@@ -2378,7 +2471,7 @@ class PhimNguonCProvider : MainAPI() {
                         // ══════════════════════════════════════════════════════════════
                         // Non-streamc embed pages
                         // ══════════════════════════════════════════════════════════════
-                        println("[NguonC] Processing other embed: ${targetUrl.take(80)}")
+                        nlog("[NguonC] Processing other embed: ${targetUrl.take(80)}")
                         val embedRes = app.get(targetUrl, interceptor = cfInterceptor, headers = mapOf(
                             "Referer" to "$mainUrl/", "User-Agent" to USER_AGENT
                         ))
@@ -2436,11 +2529,13 @@ class PhimNguonCProvider : MainAPI() {
                         }
 
                     } catch (e: Exception) {
-                        println("[NguonC] Error processing $targetUrl: ${e.message}")
+                        nlog("[NguonC] Error processing $targetUrl: ${e.message}")
                     }
                 }
             }.awaitAll()
         }
+        nlog("[NguonC] loadLinks: done linkFound=$linkFound")
+        if (!linkFound) ntoast("NguonC $NG_BUILD: loadLinks KHÔNG có link")
         return linkFound
     }
 
