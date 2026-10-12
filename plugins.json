@@ -1,10 +1,10 @@
 [
     {
         "iconUrl": "https://phim.nguonc.com/favicon.ico",
-        "fileHash": "sha256-e131c72dfffb3335dbc7e55919b0e484bf90b15d8f5827af29470e9ed9f945ce",
+        "fileHash": "sha256-74b2384fa1b538b90d028ed4d3caadfa55cb315089a164e8e40ec5eb24e60667",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/Ann-lryi/Aho-RepoStream",
-        "fileSize": 120476,
+        "fileSize": 121531,
         "status": 1,
         "language": "vi",
         "authors": [
@@ -14,7 +14,7 @@
             "Movie",
             "AnimeMovie"
         ],
-        "version": 3,
+        "version": 4,
         "internalName": "NguonC",
         "description": "Vietnamese anime streaming site",
         "url": "https://raw.githubusercontent.com/Ann-lryi/Aho-RepoStream/builds/NguonC.cs3",
