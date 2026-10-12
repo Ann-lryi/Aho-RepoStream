@@ -8,12 +8,10 @@
 // NguonC patch v7 (2026-10-12): real log -> segment hosts answer plain HTTP with Cloudflare 403;
 // segments are now downloaded through the Cloudflare-cleared Chromium WebView (WebSegFetcher)
 // when HttpURLConnection fails.
-// NguonC patch v8 (2026-10-12): site moved to the r25 bootstrap protocol (POST action=bootstrap
-// with frame_origins/request_grant/playlist_format -> preissued playlist URL). Direct flow now
-// speaks the full r25 body; new DETERMINISTIC WebView drive flow (our own fetch chain inside a
-// blank document on the embed origin — no hook race, no Guard, no JWPlayer); embed page loaded in
-// an iframe on a synthetic phim.nguonc.com document so document.referrer/ancestorOrigins match the
-// real site; /seg/ goes straight to the WebView relay when plain HTTP was Cloudflare-blocked.
+// NguonC patch v8 (2026-10-12): v7 log -> HttpURLConnection and WebView fetch both rejected by
+// Cloudflare ("Attention Required!"). Segment download tries CloudStream's OkHttp (app.baseClient)
+// first, Referer = embed origin/ (as the working Stremio addon); extra "[Direct]" link lets
+// ExoPlayer fetch segments with its own data source; WebView failures are classified (no-cors probe).
 package com.phimnguonc
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -39,7 +37,6 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -592,7 +589,7 @@ class PhimNguonCProvider : MainAPI() {
     //  [NguonC] log line is ALSO appended to <externalFilesDir>/nguonc_diag.txt and the
     //  key stages are shown as Toasts.
     // ═══════════════════════════════════════════════════════════════════════════
-    private val NG_BUILD = "v9"
+    private val NG_BUILD = "v8"
     private val diagLock = Any()
     @Volatile private var diagCtx: android.content.Context? = null
     @Volatile private var diagPathShown = false
@@ -623,7 +620,7 @@ class PhimNguonCProvider : MainAPI() {
     private fun nlog(msg: String) {
         println(msg)
         try {
-            if (msg.contains("[Seg]") && segLogCount.incrementAndGet() > 80) return
+            if (msg.contains("[Seg]") && segLogCount.incrementAndGet() > 160) return
             val ctx = diagContext() ?: return
             val dir = ctx.getExternalFilesDir(null) ?: ctx.filesDir
             val f = java.io.File(dir, "nguonc_diag.txt")
@@ -658,100 +655,26 @@ class PhimNguonCProvider : MainAPI() {
 
     private val segWebFetchers = LinkedHashMap<String, WebSegFetcher>()
     private val segHostWeb = ConcurrentHashMap<String, Boolean>()
+    // v8: segment download method that last worked per host (0 OkHttp, 1 HttpURLConnection, 2 WebView)
+    private val segMethodByHost = ConcurrentHashMap<String, Int>()
+    private val segTry = java.util.concurrent.atomic.AtomicIntegerArray(3)
+    private val segWin = java.util.concurrent.atomic.AtomicIntegerArray(3)
+    private val segStatSeq = java.util.concurrent.atomic.AtomicInteger(0)
+    private fun segStat(method: Int, ok: Boolean) {
+        segTry.incrementAndGet(method)
+        if (ok) segWin.incrementAndGet(method)
+        if (segStatSeq.incrementAndGet() % 20 == 0) {
+            nlog("[NguonC] [Seg] stats okhttp=${segWin.get(0)}/${segTry.get(0)} urlconn=${segWin.get(1)}/${segTry.get(1)} web=${segWin.get(2)}/${segTry.get(2)}")
+        }
+    }
     private val segWebSeq = java.util.concurrent.atomic.AtomicLong(0)
     @Volatile private var segWebOkToasted = false
 
     @Synchronized private fun webFetcherFor(ref: String): WebSegFetcher? = segWebFetchers[ref]
 
-    /** v9: exact-key miss rescue — match an existing relay by origin host, else any live relay */
-    @Synchronized private fun webFetcherFuzzy(referer: String): WebSegFetcher? {
-        if (segWebFetchers.isEmpty()) return null
-        segWebFetchers[referer]?.let { return it }
-        val refHost = runCatching { java.net.URL(referer).host }.getOrDefault("")
-        if (refHost.isNotEmpty()) {
-            segWebFetchers.values.firstOrNull { f ->
-                runCatching { java.net.URL(f.origin).host }.getOrDefault("") == refHost
-            }?.let { return it }
-        }
-        return segWebFetchers.values.firstOrNull()
-    }
-
-    private val emergencyRelayInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-
-    /**
-     * v9: last-resort relay — spin up a headless WebView on the link's embed origin
-     * on demand when no relay was registered for it (playlist-cache path, key
-     * mismatch, LRU eviction). Blocks the calling proxy thread up to ~3 s while
-     * the blank relay document loads; concurrent callers for the same key wait
-     * for the first one instead of creating duplicate WebViews.
-     */
-    private fun ensureEmergencyFetcher(referer: String): WebSegFetcher? {
-        webFetcherFor(referer)?.let { return it }
-        if (!emergencyRelayInFlight.add(referer)) {
-            // another thread is already starting one — poll until it appears
-            repeat(20) {
-                try { Thread.sleep(200) } catch (_: InterruptedException) {}
-                webFetcherFor(referer)?.let { return it }
-            }
-            nlog("[NguonC] [Seg] emergency relay: timed out waiting for in-flight start")
-            return null
-        }
-        try {
-            val ctx = streamcAppContext() ?: run {
-                nlog("[NguonC] [Seg] emergency relay: no app context"); return null
-            }
-            val origin = Regex("""^(https?://[^/]+)""").find(referer)?.groupValues?.get(1) ?: run {
-                nlog("[NguonC] [Seg] emergency relay: cannot parse origin from ${referer.take(60)}"); return null
-            }
-            val created = java.util.concurrent.atomic.AtomicReference<WebSegFetcher?>()
-            val done = java.util.concurrent.CountDownLatch(1)
-            android.os.Handler(android.os.Looper.getMainLooper()).post {
-                try {
-                    val wv = WebView(ctx)
-                    wv.settings.javaScriptEnabled = true
-                    wv.settings.domStorageEnabled = true
-                    wv.settings.allowFileAccess = false
-                    wv.settings.allowContentAccess = false
-                    wv.settings.mediaPlaybackRequiresUserGesture = false
-                    wv.settings.userAgentString = (wv.settings.userAgentString ?: "").replace("; wv", "")
-                    val f = WebSegFetcher(wv, origin)
-                    wv.addJavascriptInterface(f, "__ngSeg")
-                    wv.webViewClient = object : WebViewClient() {}
-                    created.set(f)
-                    wv.loadDataWithBaseURL(origin + "/", segFetchBlankHtml, "text/html", "UTF-8", null)
-                } catch (e: Throwable) {
-                    nlog("[NguonC] [Seg] emergency relay WebView failed: ${e.message}")
-                } finally {
-                    done.countDown()
-                }
-            }
-            done.await(3, java.util.concurrent.TimeUnit.SECONDS)
-            val f = created.get()
-            if (f == null) {
-                nlog("[NguonC] [Seg] emergency relay: WebView did not start in 3s")
-                return null
-            }
-            putWebFetcher(referer, f)
-            nlog("[NguonC] [Seg] EMERGENCY relay WebView started origin=$origin")
-            return f
-        } finally {
-            emergencyRelayInFlight.remove(referer)
-        }
-    }
-
-    /** v9: fire-and-forget relay warm-up (playlist-cache path has no WebView of its own) */
-    private fun ensureRelayAsync(referer: String) {
-        Thread {
-            try { ensureEmergencyFetcher(referer) } catch (e: Throwable) {
-                nlog("[NguonC] [Seg] relay warm-up error: ${e.message}")
-            }
-        }.start()
-    }
-
     @Synchronized private fun putWebFetcher(ref: String, f: WebSegFetcher) {
         segWebFetchers.remove(ref)?.let { if (it !== f) it.destroy() }
         segWebFetchers[ref] = f
-        nlog("[NguonC] [Seg] relay WebView registered key=${ref.take(64)} total=${segWebFetchers.size}")
         while (segWebFetchers.size > 4) {
             val k = segWebFetchers.keys.first()
             segWebFetchers.remove(k)?.destroy()
@@ -769,13 +692,16 @@ class PhimNguonCProvider : MainAPI() {
         "for(var i=o;i<e;i+=8192){bin+=String.fromCharCode.apply(null,u8.subarray(i,Math.min(i+8192,e)));}" +
         "__ngSeg.chunk(id,btoa(bin));}" +
         "__ngSeg.end(id);});" +
-        "}).catch(function(x){__ngSeg.fail(id,-1,String(x));});};" +
+        "}).catch(function(x){var m=String(x);" +
+        "fetch(url,{mode:'no-cors',credentials:'omit',cache:'no-store'}).then(function(){" +
+        "__ngSeg.fail(id,-2,m+' | no-cors opaque OK origin='+location.origin+' ref='+document.referrer);" +
+        "}).catch(function(y){__ngSeg.fail(id,-3,m+' | no-cors failed '+String(y)+' origin='+location.origin);});});};" +
         "__ngSeg.ready();</script></body></html>"
 
     private inner class WebSegFetcher(private val wv: WebView, val origin: String) {
         private val jobs = ConcurrentHashMap<String, SegJob>()
         private val readyLatch = java.util.concurrent.CountDownLatch(1)
-        private val gate = java.util.concurrent.Semaphore(6)
+        private val gate = java.util.concurrent.Semaphore(2)
 
         @JavascriptInterface
         fun ready() { readyLatch.countDown() }
@@ -861,6 +787,9 @@ class PhimNguonCProvider : MainAPI() {
 
         fun setM3U8(content: String) { _m3u8 = content }
         private fun getM3U8(): String = _m3u8
+        @Volatile private var _direct: String = ""
+        fun setDirect(content: String) { _direct = content }
+        private fun getDirect(): String = _direct
 
         fun start() {
             serverSocket = java.net.ServerSocket(0)
@@ -892,196 +821,185 @@ class PhimNguonCProvider : MainAPI() {
                         output.write(("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${body.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}").toByteArray())
                         output.write(body)
                     }
+                    path == "/direct.m3u8" -> {
+                        val body = getDirect().toByteArray(Charsets.UTF_8)
+                        nlog("[NguonC] [Proxy] direct.m3u8 served bytes=${body.size} port=$port")
+                        output.write(("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${body.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}").toByteArray())
+                        output.write(body)
+                    }
                     path.startsWith("/seg/") -> {
                         // v4 PERF: stream through, check HTTP status (a Cloudflare page must never
                         // be served as "video"), keep-alive reuse.
-                        // v5: several header profiles per host (remembered), upstream status logged.
-                        // v7: real log (2026-10-12) showed Cloudflare 403 (srv=cloudflare, HTML body)
-                        // for plain-HTTP segment requests on every host (thais.hihihoho3.top,
-                        // indoss15.amass15.top) while the SAME request (profile 0) returned 200
-                        // once -> not a header problem. When HTTP fails, fetch the segment through
-                        // the Chromium WebView that already passed Cloudflare for the embed page
-                        // (WebSegFetcher); once that works for a host it is tried first.
+                        // v8: real logs (2026-10-12) -> HttpURLConnection AND the WebView fetch
+                        // are rejected by Cloudflare ("Attention Required!" block page) on every
+                        // segment host. Methods tried in order (the one that last worked for the
+                        // host goes first): 0 = CloudStream's own OkHttp client (app.baseClient,
+                        // the stack ExoPlayer itself uses), 1 = HttpURLConnection, 2 = Chromium
+                        // WebView. Referer = embed ORIGIN + "/" first: that is what the working
+                        // third-party addon sends (github.com/WallisSkill/streamio-hh, lib/streamc.js).
                         val segUrl = java.net.URLDecoder.decode(path.removePrefix("/seg/"), "UTF-8")
                         val segHost = runCatching { java.net.URL(segUrl).host }.getOrDefault("")
                         val segOrigin = Regex("""^(https?://[^/]+)""").find(segReferer)?.groupValues?.get(1) ?: ""
-                        val profiles: List<Triple<String, String, String?>> = listOf(
-                            Triple(USER_AGENT, segReferer, null),
-                            Triple(streamcMobileUA, segReferer, null),
-                            Triple(USER_AGENT, "$segOrigin/", segOrigin),
-                            Triple(streamcMobileUA, "$segOrigin/", segOrigin)
-                        )
-                        val pref = segProfileByHost[segHost]
-                        val order: List<Int> =
-                            if (pref != null && pref in profiles.indices)
-                                listOf(pref) + profiles.indices.filter { it != pref }
-                            else profiles.indices.toList()
-                        var wf = webFetcherFor(segReferer)
-                        if (wf == null) {
-                            wf = webFetcherFuzzy(segReferer)
-                            if (wf != null) nlog("[NguonC] [Seg] relay key-miss rescue: using origin=${wf.origin} for host=$segHost")
-                        }
+                        val wf = webFetcherFor(segReferer)
 
                         var ok = false
                         var headersSent = false
                         var lastCode = -1
                         var lastInfo = ""
 
-                        fun serveBytes(b: ByteArray) {
-                            val head = "HTTP/1.1 200 OK${crlf}Content-Type: video/mp2t${crlf}" +
-                                "Access-Control-Allow-Origin: *${crlf}Content-Length: ${b.size}${crlf}${crlf}"
-                            output.write(head.toByteArray())
+                        fun cfInfo(ct: String?, srv: String?, cfm: String?, txt: String): String {
+                            val title = Regex("<title>([^<]{0,80})</title>", RegexOption.IGNORE_CASE).find(txt)?.groupValues?.get(1)?.trim()
+                            val ec = Regex("""(?:cf-error-code"?>|[Ee]rror code:?\s*)(\d{3,4})""").find(txt)?.groupValues?.get(1)
+                            val h1 = Regex("<h1[^>]*>([^<]{0,80})</h1>", RegexOption.IGNORE_CASE).find(txt)?.groupValues?.get(1)?.trim()
+                            return " ct=$ct srv=$srv cfm=$cfm title=$title ecode=$ec h1=$h1"
+                        }
+
+                        fun writeHead(len: Long) {
+                            val head = StringBuilder("HTTP/1.1 200 OK").append(crlf)
+                                .append("Content-Type: video/mp2t").append(crlf)
+                                .append("Access-Control-Allow-Origin: *").append(crlf)
+                            if (len > 0) head.append("Content-Length: ").append(len).append(crlf)
+                            else head.append("Connection: close").append(crlf)
+                            head.append(crlf)
+                            output.write(head.toString().toByteArray())
                             headersSent = true
+                        }
+
+                        fun serveBytes(b: ByteArray) {
+                            writeHead(b.size.toLong())
                             output.write(b)
                             output.flush()
                         }
 
-                        fun viaWeb(f: WebSegFetcher?): Boolean {
-                            val ff = f ?: return false
-                            val t0 = System.currentTimeMillis()
-                            val b = ff.fetch(segUrl, 30_000L)
+                        // method 0: CloudStream OkHttp
+                        fun viaOkHttp(variant: Int): Boolean {
+                            val ref = if (variant == 0) "$segOrigin/" else segReferer
+                            val req = okhttp3.Request.Builder().url(segUrl)
+                                .header("User-Agent", USER_AGENT)
+                                .header("Referer", ref)
+                                .header("Accept", "*/*")
+                                .build()
+                            return app.baseClient.newCall(req).execute().use { resp ->
+                                val code = resp.code
+                                lastCode = code
+                                if (code !in 200..299) {
+                                    val txt = try { resp.peekBody(16384).string() } catch (_: Throwable) { "" }
+                                    lastInfo = cfInfo(resp.header("Content-Type"), resp.header("Server"), resp.header("cf-mitigated"), txt)
+                                    nlog("[NguonC] [Seg] OKHTTP $code v=$variant host=$segHost url=...${segUrl.takeLast(40)}$lastInfo")
+                                    return@use false
+                                }
+                                val body = resp.body ?: return@use false
+                                writeHead(body.contentLength())
+                                val buf = ByteArray(65536)
+                                body.byteStream().use { stream ->
+                                    while (true) {
+                                        val n = stream.read(buf)
+                                        if (n < 0) break
+                                        output.write(buf, 0, n)
+                                        output.flush()
+                                    }
+                                }
+                                true
+                            }
+                        }
+
+                        // method 1: HttpURLConnection
+                        fun viaUrlConn(): Boolean {
+                            val profs: List<Pair<String, String>> = listOf(
+                                Pair(USER_AGENT, "$segOrigin/"),
+                                Pair(USER_AGENT, segReferer)
+                            )
+                            for ((idx, p) in profs.withIndex()) {
+                                var conn: java.net.HttpURLConnection? = null
+                                try {
+                                    conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
+                                    conn.connectTimeout = 8000
+                                    conn.readTimeout    = 30000
+                                    conn.setRequestProperty("User-Agent", p.first)
+                                    conn.setRequestProperty("Referer", p.second)
+                                    conn.setRequestProperty("Accept", "*/*")
+                                    val code = conn.responseCode
+                                    lastCode = code
+                                    if (code !in 200..299) {
+                                        var txt = ""
+                                        runCatching {
+                                            val es = conn.errorStream
+                                            if (es != null) {
+                                                val eb = ByteArray(16384)
+                                                val en = es.read(eb)
+                                                if (en > 0) txt = String(eb, 0, en, Charsets.UTF_8)
+                                                runCatching { es.close() }
+                                            }
+                                        }
+                                        lastInfo = cfInfo(conn.contentType, conn.getHeaderField("Server"), conn.getHeaderField("cf-mitigated"), txt)
+                                        nlog("[NguonC] [Seg] URLCONN $code p=$idx host=$segHost url=...${segUrl.takeLast(40)}$lastInfo")
+                                        runCatching { conn.disconnect() }
+                                        continue
+                                    }
+                                    writeHead(conn.contentLength.toLong())
+                                    val buf = ByteArray(65536)
+                                    conn.inputStream.use { stream ->
+                                        while (true) {
+                                            val n = stream.read(buf)
+                                            if (n < 0) break
+                                            output.write(buf, 0, n)
+                                            output.flush()
+                                        }
+                                    }
+                                    return true
+                                } catch (e: Exception) {
+                                    nlog("[NguonC] [Seg] URLCONN error p=$idx host=$segHost: ${e.message}")
+                                    runCatching { conn?.disconnect() }
+                                    // headers already on the wire -> a second response on the same
+                                    // socket would corrupt the stream; give up on this segment
+                                    if (headersSent) return true
+                                }
+                            }
+                            return false
+                        }
+
+                        // method 2: Chromium WebView (kept alive by the WebView flow)
+                        fun viaWeb(): Boolean {
+                            val f = wf ?: return false
+                            val b = f.fetch(segUrl, 30_000L)
                             if (b == null || b.isEmpty()) return false
                             serveBytes(b)
-                            segHostWeb[segHost] = true
-                            if (!segWebOkToasted) {
-                                segWebOkToasted = true
-                                nlog("[NguonC] [Seg] WEB fetch OK host=$segHost bytes=${b.size} ms=${System.currentTimeMillis() - t0}")
-                                ntoast("NguonC $NG_BUILD: segment OK qua WebView $segHost")
-                            }
                             return true
                         }
 
-                        // 1) host already known to need the WebView -> go straight there
-                        if (wf != null && segHostWeb[segHost] == true) {
-                            try { ok = viaWeb(wf) } catch (e: Exception) {
-                                nlog("[NguonC] [Seg] WEB error host=$segHost: ${e.message}")
-                                if (headersSent) ok = true
-                            }
-                        }
-
-                        // v8: plain HTTP was Cloudflare-403'd during extraction -> segment
-                        // requests over HttpURLConnection are near-certain to be blocked too.
-                        // Go straight to the Chromium relay; also avoids the 403-burst that
-                        // makes Cloudflare escalate (observed in the v6 log: profile 0..3 all
-                        // 403 for EVERY segment, ~8 requests per segment).
-                        if (!ok && wf != null && streamcPlainHttpBlocked) {
-                            try { ok = viaWeb(wf) } catch (e: Exception) {
-                                nlog("[NguonC] [Seg] WEB error host=$segHost: ${e.message}")
-                                if (headersSent) ok = true
-                            }
-                        }
-
-                        // 2) plain HTTP, several header profiles
-                        if (!ok) {
-                            for (round in 0..1) {
-                                for (idx in order) {
-                                    val (ua, ref, origin) = profiles[idx]
-                                    var conn: java.net.HttpURLConnection? = null
-                                    try {
-                                        conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
-                                        conn.connectTimeout = 8000
-                                        conn.readTimeout    = 30000
-                                        conn.setRequestProperty("User-Agent", ua)
-                                        conn.setRequestProperty("Referer", ref)
-                                        conn.setRequestProperty("Accept", "*/*")
-                                        if (origin != null) conn.setRequestProperty("Origin", origin)
-                                        val code = conn.responseCode
-                                        lastCode = code
-                                        if (code !in 200..299) {
-                                            val info = StringBuilder()
-                                            runCatching {
-                                                info.append(" ct=").append(conn.contentType)
-                                                info.append(" srv=").append(conn.getHeaderField("Server"))
-                                                info.append(" cfm=").append(conn.getHeaderField("cf-mitigated"))
-                                                val es = conn.errorStream
-                                                if (es != null) {
-                                                    val eb = ByteArray(2048)
-                                                    val en = es.read(eb)
-                                                    if (en > 0) {
-                                                        val txt = String(eb, 0, en, Charsets.UTF_8)
-                                                        val title = Regex("<title>([^<]{0,80})</title>", RegexOption.IGNORE_CASE)
-                                                            .find(txt)?.groupValues?.get(1)?.trim()
-                                                        val ec = Regex("[Ee]rror code:?\\s*(\\d{3,4})").find(txt)?.groupValues?.get(1)
-                                                        info.append(" title=").append(title).append(" ecode=").append(ec)
-                                                    }
-                                                    runCatching { es.close() }
-                                                }
-                                            }
-                                            lastInfo = info.toString()
-                                            nlog("[NguonC] [Seg] HTTP $code profile=$idx host=$segHost url=...${segUrl.takeLast(48)}$lastInfo")
-                                            runCatching { conn.disconnect() }
-                                            continue
-                                        }
-                                        val len = conn.contentLength
-                                        val head = StringBuilder("HTTP/1.1 200 OK").append(crlf)
-                                            .append("Content-Type: video/mp2t").append(crlf)
-                                            .append("Access-Control-Allow-Origin: *").append(crlf)
-                                        if (len > 0) head.append("Content-Length: ").append(len).append(crlf)
-                                        else head.append("Connection: close").append(crlf)
-                                        head.append(crlf)
-                                        output.write(head.toString().toByteArray())
-                                        headersSent = true
-                                        val buf = ByteArray(65536)
-                                        conn.inputStream.use { stream ->
-                                            while (true) {
-                                                val n = stream.read(buf)
-                                                if (n < 0) break
-                                                output.write(buf, 0, n)
-                                                output.flush()
-                                            }
-                                        }
-                                        ok = true
-                                        if (!segOkToasted) {
-                                            segOkToasted = true
-                                            nlog("[NguonC] [Seg] first HTTP segment OK profile=$idx host=$segHost")
-                                        }
-                                        segProfileByHost[segHost] = idx
-                                        // no disconnect() — the pooled TLS connection is reused
-                                        break
-                                    } catch (e: Exception) {
-                                        nlog("[NguonC] [Seg] error profile=$idx host=$segHost: ${e.message}")
-                                        runCatching { conn?.disconnect() }
-                                        // headers already on the wire -> a second response on the
-                                        // same socket would corrupt the stream; give up on this segment
-                                        if (headersSent) { ok = true; break }
-                                    }
+                        val pref = segMethodByHost[segHost]
+                        val order: List<Int> = (if (pref != null) listOf(pref) else emptyList<Int>()) + listOf(0, 1, 2).filter { it != pref }
+                        for (m in order) {
+                            if (ok) break
+                            if (m == 2 && wf == null) continue
+                            try {
+                                ok = when (m) {
+                                    0 -> viaOkHttp(0) || viaOkHttp(1)
+                                    1 -> viaUrlConn()
+                                    else -> viaWeb()
                                 }
-                                if (ok) break
-                                if (lastCode == 429 || lastCode >= 500) {
-                                    try { Thread.sleep(500) } catch (_: InterruptedException) { break }
-                                } else break
-                            }
-                        }
-
-                        // 3) HTTP rejected -> Chromium WebView (passes Cloudflare for this origin)
-                        if (!ok && wf != null && segHostWeb[segHost] != true) {
-                            try { ok = viaWeb(wf) } catch (e: Exception) {
-                                nlog("[NguonC] [Seg] WEB error host=$segHost: ${e.message}")
+                            } catch (e: Exception) {
+                                nlog("[NguonC] [Seg] method $m error host=$segHost: ${e.message}")
                                 if (headersSent) ok = true
                             }
-                        }
-
-                        // 4) v9: still nothing and no relay existed at all -> spin up an
-                        // emergency relay WebView for this link and retry through Chromium.
-                        if (!ok && wf == null) {
-                            nlog("[NguonC] [Seg] no relay for key=${segReferer.take(64)} -> emergency relay")
-                            wf = ensureEmergencyFetcher(segReferer)
-                            if (wf != null) {
-                                try { ok = viaWeb(wf) } catch (e: Exception) {
-                                    nlog("[NguonC] [Seg] WEB error host=$segHost: ${e.message}")
-                                    if (headersSent) ok = true
+                            segStat(m, ok)
+                            if (ok) {
+                                segMethodByHost[segHost] = m
+                                if (!segOkToasted) {
+                                    segOkToasted = true
+                                    val mn = if (m == 0) "OkHttp" else if (m == 1) "HttpURLConnection" else "WebView"
+                                    nlog("[NguonC] [Seg] first segment OK via $mn host=$segHost")
+                                    ntoast("NguonC $NG_BUILD: segment OK qua $mn ($segHost)")
                                 }
                             }
                         }
 
                         if (!ok) {
-                            nlog("[NguonC] [Seg] ALL FAILED host=$segHost code=$lastCode wf=${wf != null} "
-                                + "blocked=$streamcPlainHttpBlocked$lastInfo")
                             if (!segFailToasted) {
                                 segFailToasted = true
-                                val ct = Regex("ct=(\\S+)").find(lastInfo)?.groupValues?.get(1)
-                                val srv = Regex("srv=(\\S+)").find(lastInfo)?.groupValues?.get(1)
-                                ntoast("NguonC $NG_BUILD: segment HTTP $lastCode $segHost srv=$srv web=${wf != null}")
+                                val ec = Regex("ecode=(\\S+)").find(lastInfo)?.groupValues?.get(1)
+                                val h1 = Regex("h1=(.*)$").find(lastInfo)?.groupValues?.get(1)?.take(40)
+                                ntoast("NguonC $NG_BUILD: segment HTTP $lastCode $segHost ecode=$ec $h1")
                             }
                             output.write("HTTP/1.1 502 Bad Gateway${crlf}X-Upstream-Status: $lastCode${crlf}Content-Length: 0${crlf}${crlf}".toByteArray())
                         }
@@ -1103,6 +1021,16 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     /** Rewrite m3u8 segment URLs to go through our local proxy */
+    /** v8: playlist with the segment URLs left absolute (relative ones resolved) so ExoPlayer
+     *  downloads segments itself through CloudStream's data source (OkHttp/Cronet). */
+    private fun directM3U8(m3u8: String, baseUrl: String): String =
+        m3u8.lines().joinToString("\n") { line ->
+            val t = line.trim()
+            if (t.isEmpty() || t.startsWith("#") || t.startsWith("http")) line
+            else if (baseUrl.isNotEmpty()) baseUrl.trimEnd('/') + "/" + t
+            else line
+        }
+
     private fun rewriteM3U8(m3u8: String, proxyBase: String, m3u8BaseUrl: String = ""): String {
         return m3u8.lines().joinToString("\n") { line ->
             val trimmed = line.trim()
@@ -1145,6 +1073,14 @@ class PhimNguonCProvider : MainAPI() {
         server.setM3U8(rewriteM3U8(m3u8Content, proxyBase, m3u8BaseUrl))
         callback(newExtractorLink("NguonC", serverName, "$proxyBase/stream.m3u8", ExtractorLinkType.M3U8) {
             quality = Qualities.P1080.value
+            headers = mapOf("User-Agent" to USER_AGENT)
+        })
+        // v8: second link, segments fetched directly by ExoPlayer with Referer = embed origin
+        val directReferer = Regex("""^(https?://[^/]+)""").find(referer)?.groupValues?.get(1)?.let { "$it/" } ?: referer
+        server.setDirect(directM3U8(m3u8Content, m3u8BaseUrl))
+        callback(newExtractorLink("NguonC", "$serverName [Direct]", "$proxyBase/direct.m3u8", ExtractorLinkType.M3U8) {
+            quality = Qualities.P1080.value
+            this.referer = directReferer
             headers = mapOf("User-Agent" to USER_AGENT)
         })
         return true
@@ -1820,11 +1756,6 @@ class PhimNguonCProvider : MainAPI() {
     private val streamcCfBlockedUntil =
         java.util.concurrent.ConcurrentHashMap<String, Long>()
 
-    // v8: set when the plain-HTTP bootstrap was Cloudflare-403'd — /seg/ then hands
-    // every segment straight to the WebView relay instead of burning 4 header
-    // profiles x 2 rounds (the resulting 403-burst makes Cloudflare escalate).
-    @Volatile private var streamcPlainHttpBlocked = false
-
     private fun streamcCacheGet(hash: String?): Pair<String, String>? {
         if (hash.isNullOrBlank()) return null
         val e = streamcPlaylistCache[hash] ?: return null
@@ -1917,15 +1848,12 @@ class PhimNguonCProvider : MainAPI() {
             nlog("[NguonC] [StreamcNew] 0a: bootstrap POST ${embedUrl.take(70)}")
             val (code1, body1) = streamcPostJson(
                 embedUrl, embedDomain, embedUrl,
-                """{"action":"bootstrap","referrer":"$mainUrl/","frame_origins":["$mainUrl"],
-                   "request_grant":true,"playlist_format":"hls","pretty_url":true,
-                   "path_chunks":true,"bootstrap_format":"json"}"""
+                """{"action":"bootstrap","referrer":"$mainUrl/"}"""
             )
             if (code1 != 200 || body1 == null) {
                 nlog("[NguonC] [StreamcNew] bootstrap HTTP $code1: ${body1?.take(120)}")
                 if (code1 == 403) {
                     streamcCfBlockedUntil[embedDomain] = System.currentTimeMillis() + 10 * 60_000L
-                    streamcPlainHttpBlocked = true   // v8: /seg/ relays via WebView immediately
                 }
                 return@withLock false
             }
@@ -1943,44 +1871,27 @@ class PhimNguonCProvider : MainAPI() {
             nlog("[NguonC] [StreamcNew] bootstrap OK (turnstileEnabled=$turnstile)")
             if (turnstile) return@withLock false  // needs a real browser challenge
 
-            // v8/r25: the bootstrap answer normally carries a preissued playlist URL —
-            // grab it and skip the issue round-trip entirely.
-            val pre = Regex(""""preissued"\s*:\s*\{[^{}]*?"playlist"\s*:\s*"([^"]*)""")
-                .find(body1)?.groupValues?.get(1)?.replace("\\/", "/")
-            var playlist: String? = null
-            var content: String? = null
-            if (!pre.isNullOrBlank()) {
-                nlog("[NguonC] [StreamcNew] preissued playlist: ${pre.take(90)}")
-                content = streamcGet(pre, embedDomain, embedUrl)
-                if (content != null) playlist = pre
-                else nlog("[NguonC] [StreamcNew] preissued fetch failed -> issue fallback")
+            // Turnstile disabled on this video -> request the playlist directly
+            val (code2, body2) = streamcPostJson(
+                embedUrl, embedDomain, embedUrl,
+                """{"action":"issue","bootstrap":"$bootstrapJwt","turnstile_response":"","playlist_format":"hls","pretty_url":true,"path_chunks":true}"""
+            )
+            val playlist = body2?.let { streamcJsonString(it, "playlist") }
+            if (code2 != 200 || playlist.isNullOrBlank()) {
+                nlog("[NguonC] [StreamcNew] issue HTTP $code2: ${body2?.take(120)}")
+                return@withLock false
             }
-            if (content == null) {
-                // no preissued playlist (or it already expired) -> issue one
-                val (code2, body2) = streamcPostJson(
-                    embedUrl, embedDomain, embedUrl,
-                    """{"action":"issue","bootstrap":"$bootstrapJwt","turnstile_response":"","playlist_format":"hls","pretty_url":true,"path_chunks":true,"frame_origins":["$mainUrl"]}"""
-                )
-                val p2 = body2?.let { streamcJsonString(it, "playlist") }
-                if (code2 != 200 || p2.isNullOrBlank()) {
-                    nlog("[NguonC] [StreamcNew] issue HTTP $code2: ${body2?.take(120)}")
-                    return@withLock false
-                }
-                nlog("[NguonC] [StreamcNew] issue OK: ${p2.take(90)}")
-                playlist = p2
-                content = streamcGet(p2, embedDomain, embedUrl) ?: return@withLock false
-            }
-            // both paths above guarantee non-null; local vals so Kotlin smart-casts
-            val pl = playlist ?: return@withLock false
-            val plBody = content ?: return@withLock false
-            if (!plBody.contains("#EXTM3U")) {
-                nlog("[NguonC] [StreamcNew] unexpected playlist content (${plBody.take(60)})")
+            nlog("[NguonC] [StreamcNew] issue OK: ${playlist.take(90)}")
+
+            val content = streamcGet(playlist, embedDomain, embedUrl) ?: return@withLock false
+            if (!content.contains("#EXTM3U")) {
+                nlog("[NguonC] [StreamcNew] unexpected playlist content (${content.take(60)})")
                 return@withLock false
             }
             // v5: server may answer "aesgcm" even for the mobile UA -> decrypt via the shared
             // handler (plain + encrypted) instead of rejecting #ENC-AESGCM.
             val directHash = Regex("""[?&]hash=([a-fA-F0-9]{8,})""").find(embedUrl)?.groupValues?.get(1)
-            streamcRegisterCaptured(pl, plBody, directHash, embedUrl, serverName, callback)
+            streamcRegisterCaptured(playlist, content, directHash, embedUrl, serverName, callback)
         } catch (e: Exception) {
             nlog("[NguonC] [StreamcNew] direct flow error: ${e.message}")
             false
@@ -2006,167 +1917,6 @@ class PhimNguonCProvider : MainAPI() {
      * JSON to the Kotlin bridge, so no second fetch (and no Cloudflare risk)
      * is ever needed.
      */
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  v8: DETERMINISTIC WebView drive flow.
-    //  The site's own player page (r25) must run bootstrap -> guard.js -> jwplayer
-    //  -> issue -> playlist inside the WebView before the old fetch-hook sees
-    //  anything, and the hook can easily install too late (race). Instead we run
-    //  OUR OWN fetch chain inside a blank document whose base URL is the embed
-    //  URL: same origin as the API (so the POSTs are same-origin, exactly like
-    //  the real player), Chromium TLS + real fetch (the only client Cloudflare
-    //  accepts on this network), and the referrer/frame_origins values are the
-    //  genuine ones because the server can only read the JSON body. No real page
-    //  is loaded — no Guard, no JWPlayer, no style barrier, no race.
-    // ═══════════════════════════════════════════════════════════════════════════
-    private class StreamcDriveBridge(
-        private val onDoneFn: (String, String) -> Unit,
-        private val onFailFn: (String) -> Unit
-    ) {
-        @JavascriptInterface
-        fun onDone(url: String?, body: String?) {
-            if (url.isNullOrBlank() || body.isNullOrBlank()) { onFailFn("bridge: empty payload"); return }
-            try { onDoneFn(url, body) } catch (_: Throwable) {}
-        }
-        @JavascriptInterface
-        fun onFail(msg: String?) {
-            try { onFailFn(msg ?: "unknown") } catch (_: Throwable) {}
-        }
-    }
-
-    private val streamcDriveJs = """
-(function(){
-  var API = __API__, REF = __REF__;
-  function fail(m){ try { __ngcDrive.onFail(String(m)); } catch(e){} }
-  function jpost(b){
-    return fetch(API, {method:'POST', credentials:'omit', cache:'no-store',
-      headers:{'Content-Type':'application/json'}, body: JSON.stringify(b)});
-  }
-  function grab(pu){
-    return fetch(String(pu), {credentials:'omit', cache:'no-store'}).then(function(r){
-      if (!r.ok) { fail('playlist http ' + r.status); return; }
-      return r.text().then(function(t){
-        try { __ngcDrive.onDone(String(pu), t); } catch(e) { fail('bridge ' + e); }
-      });
-    }, function(x){ fail('playlist net ' + x); });
-  }
-  jpost({action:'bootstrap', referrer:REF, frame_origins:[REF], request_grant:true,
-         playlist_format:'hls', pretty_url:true, path_chunks:true, bootstrap_format:'json'})
-  .then(function(r){
-    if (!r.ok) { fail('bootstrap http ' + r.status); return; }
-    return r.json();
-  })
-  .then(function(b){
-    if (!b || !b.bootstrap) { fail('no bootstrap'); return; }
-    if (b.turnstileEnabled === true) { fail('turnstile'); return; }
-    var pre = b.preissued && b.preissued.playlist;
-    if (pre && String(pre).indexOf('http') === 0) { grab(pre); return; }
-    jpost({action:'issue', bootstrap:b.bootstrap, turnstile_response:'',
-           playlist_format:'hls', pretty_url:true, path_chunks:true, frame_origins:[REF]})
-    .then(function(r2){
-      if (!r2.ok) { fail('issue http ' + r2.status); return; }
-      return r2.json();
-    })
-    .then(function(i){ if (i && i.playlist) { grab(i.playlist); } else { fail('no playlist'); } },
-         function(x){ fail('issue net ' + x); });
-  }, function(x){ fail('bootstrap net ' + x); });
-})();
-"""
-
-    private suspend fun tryStreamcDriveFlow(
-        targetUrl: String, embedDomain: String,
-        serverName: String, callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        var webView: WebView? = null
-        var fetcher: WebSegFetcher? = null
-        var keep = false
-        try {
-            val videoHash = Regex("""[?&]hash=([a-fA-F0-9]{8,})""").find(targetUrl)?.groupValues?.get(1)
-            nlog("[NguonC] [StreamcNew] 0a2: WebView drive flow on ${targetUrl.take(70)}")
-            val ctx = streamcAppContext() ?: run {
-                nlog("[NguonC] [StreamcNew] drive: no app context")
-                return false
-            }
-            val done = Channel<Pair<String, String>>(Channel.CONFLATED)
-            val jsFired = java.util.concurrent.atomic.AtomicBoolean(false)
-            val refSlash = mainUrl.trimEnd('/') + "/"
-            withContext(Dispatchers.Main) {
-                val wv = WebView(ctx)
-                webView = wv
-                wv.settings.javaScriptEnabled = true
-                wv.settings.domStorageEnabled = true
-                // strip the WebView tell-tale "; wv" UA token — some bot rules flag it
-                wv.settings.userAgentString = (wv.settings.userAgentString ?: "").replace("; wv", "")
-                CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
-                val segF = WebSegFetcher(wv, embedDomain)
-                fetcher = segF
-                wv.addJavascriptInterface(segF, "__ngSeg")
-                wv.addJavascriptInterface(
-                    StreamcDriveBridge(
-                        { url, body -> done.trySend(url to body) },
-                        { msg -> nlog("[NguonC] [StreamcNew] drive fail: $msg") }
-                    ),
-                    "__ngcDrive"
-                )
-                wv.webChromeClient = WebChromeClient()
-                wv.webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(view: WebView?, url: String?) {
-                        if (jsFired.compareAndSet(false, true)) {
-                            val js = streamcDriveJs
-                                .replace("__API__", org.json.JSONObject.quote(targetUrl))
-                                .replace("__REF__", org.json.JSONObject.quote(refSlash))
-                            view?.evaluateJavascript(js, null)
-                        }
-                    }
-                }
-                // document lives ON the embed origin -> same-origin API calls with
-                // the right Origin/Referer, real Chromium TLS
-                wv.loadDataWithBaseURL(
-                    targetUrl,
-                    "<!doctype html><html><head><meta charset='utf-8'></head><body></body></html>",
-                    "text/html", "UTF-8", null
-                )
-            }
-            // safety net: if onPageFinished already fired before we set the client
-            // (blank docs are fast), fire the JS ourselves after a short settle
-            delay(600)
-            if (!jsFired.get()) {
-                withContext(Dispatchers.Main) {
-                    val js = streamcDriveJs
-                        .replace("__API__", org.json.JSONObject.quote(targetUrl))
-                        .replace("__REF__", org.json.JSONObject.quote(refSlash))
-                    webView?.evaluateJavascript(js, null)
-                }
-            }
-            val captured: Pair<String, String>? = withTimeoutOrNull(45_000L) { done.receive() }
-            if (captured == null) {
-                nlog("[NguonC] [StreamcNew] drive: timeout, no playlist captured")
-                return false
-            }
-            val (capUrl, capBody) = captured
-            nlog("[NguonC] [StreamcNew] drive captured: url=${capUrl.take(60)} len=${capBody.length} head=${capBody.take(12)}")
-            val registered = streamcRegisterCaptured(capUrl, capBody, videoHash, targetUrl, serverName, callback)
-            if (registered && fetcher != null) {
-                // keep this Cloudflare-clean WebView alive for segment relaying
-                putWebFetcher(targetUrl, fetcher!!)
-                withContext(Dispatchers.Main) {
-                    webView?.loadDataWithBaseURL(embedDomain + "/", segFetchBlankHtml, "text/html", "UTF-8", null)
-                }
-                keep = true
-                nlog("[NguonC] [StreamcNew] drive: WebView kept alive for segments origin=$embedDomain")
-            }
-            return registered
-        } catch (e: Exception) {
-            nlog("[NguonC] [StreamcNew] drive flow error: ${e.message}")
-            return false
-        } finally {
-            try {
-                withContext(NonCancellable + Dispatchers.Main) {
-                    if (!keep) webView?.destroy()
-                }
-            } catch (_: Exception) {}
-        }
-    }
-
     private suspend fun tryStreamcWebViewFlow(
         targetUrl: String, embedDomain: String,
         serverName: String, callback: (ExtractorLink) -> Unit
@@ -2196,8 +1946,6 @@ class PhimNguonCProvider : MainAPI() {
                 wv.settings.allowFileAccess = false
                 wv.settings.allowContentAccess = false
                 wv.settings.mediaPlaybackRequiresUserGesture = false
-                // v8: strip the WebView tell-tale "; wv" UA token
-                wv.settings.userAgentString = (wv.settings.userAgentString ?: "").replace("; wv", "")
                 CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
                 // v7: JS bridge used later (blank document) to download segments via Chromium
                 val segF = WebSegFetcher(wv, Regex("""^(https?://[^/]+)""").find(targetUrl)?.groupValues?.get(1) ?: embedDomain)
@@ -2223,6 +1971,30 @@ class PhimNguonCProvider : MainAPI() {
                     }
                     override fun onPageFinished(view: WebView?, url: String?) {
                         view?.evaluateJavascript(streamcHookJs, null)
+                    }
+                    override fun onReceivedHttpError(
+                        view: WebView?,
+                        request: android.webkit.WebResourceRequest?,
+                        errorResponse: android.webkit.WebResourceResponse?
+                    ) {
+                        try {
+                            val u = request?.url?.toString() ?: return
+                            if (u.contains("streamaaa")) {
+                                nlog("[NguonC] [Seg] WEBVIEW http ${errorResponse?.statusCode} srv=${errorResponse?.responseHeaders?.get("Server")} url=...${u.takeLast(40)}")
+                            }
+                        } catch (_: Throwable) {}
+                    }
+                    override fun onReceivedError(
+                        view: WebView?,
+                        request: android.webkit.WebResourceRequest?,
+                        error: android.webkit.WebResourceError?
+                    ) {
+                        try {
+                            val u = request?.url?.toString() ?: return
+                            if (u.contains("streamaaa")) {
+                                nlog("[NguonC] [Seg] WEBVIEW net error ${error?.errorCode} ${error?.description} url=...${u.takeLast(40)}")
+                            }
+                        } catch (_: Throwable) {}
                     }
                 }
 
@@ -2252,18 +2024,7 @@ class PhimNguonCProvider : MainAPI() {
                     }
                 }
 
-                // v8: load the embed page inside an iframe of a synthetic document on the
-                // REAL referrer origin (phim.nguonc.com). The r25 bootstrap sends
-                // document.referrer + location.ancestorOrigins; a top-level WebView load
-                // gives empty values and the server can reject it. Inside the iframe both
-                // match the genuine site structure exactly.
-                val wrapper = "<!doctype html><html><head><meta charset='utf-8'>" +
-                    "<meta name='referrer' content='no-referrer-when-downgrade'>" +
-                    "<style>html,body{margin:0;padding:0;height:100%;background:#000;overflow:hidden}" +
-                    "iframe{display:block;border:0;width:100%;height:100%}</style></head><body>" +
-                    "<iframe src='" + targetUrl + "' allow='autoplay; fullscreen' allowfullscreen></iframe>" +
-                    "</body></html>"
-                wv.loadDataWithBaseURL("$mainUrl/", wrapper, "text/html", "UTF-8", null)
+                wv.loadUrl(targetUrl, mapOf("Referer" to "$mainUrl/"))
             }
 
             var registered = withTimeoutOrNull(60_000L) {
@@ -2608,22 +2369,13 @@ class PhimNguonCProvider : MainAPI() {
                                 if (cached != null) {
                                     nlog("[NguonC] [StreamcNew] 0c: playlist cache HIT (${urlHash?.take(12)}...)")
                                     if (streamcRegisterCaptured(cached.first, cached.second, urlHash, targetUrl, serverName, callback)) {
-                                        linkFound = true
-                                        ensureRelayAsync(targetUrl)   // v9: cached link has no WebView — start the segment relay
-                                        return@async
+                                        linkFound = true; return@async
                                     }
                                     nlog("[NguonC] [StreamcNew] 0c: cached playlist no longer playable — falling through")
                                 }
                             }
                             if (!linkFound) {
                                 if (tryStreamcDirectFlow(targetUrl, embedDomain, serverName, callback)) {
-                                    linkFound = true; return@async
-                                }
-                            }
-                            if (!linkFound) {
-                                // v8: deterministic WebView drive flow — our own r25 fetch
-                                // chain inside a blank document on the embed origin.
-                                if (tryStreamcDriveFlow(targetUrl, embedDomain, serverName, callback)) {
                                     linkFound = true; return@async
                                 }
                             }
