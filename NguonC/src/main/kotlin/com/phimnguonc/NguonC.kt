@@ -22,6 +22,8 @@
 // 2.6 s / 9.4 s (sequential probes + 6 variants that all failed), the embed page kept running in the
 // WebView during startup, bootstrap 403 retried per embedNN host. Now: parallel preflight + per-host
 // memo, embed page stopped on capture, bootstrap memo per streamc.xyz, per-segment timing in the log.
+// NguonC patch v11 (2026-10-13): sequential prefetch of the next 3 segments (hides slow/spiky
+// per-segment latency seen on sings2.amass2.top and 1 s TTFB spikes), success toasts silenced.
 package com.phimnguonc
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -599,10 +601,11 @@ class PhimNguonCProvider : MainAPI() {
     //  [NguonC] log line is ALSO appended to <externalFilesDir>/nguonc_diag.txt and the
     //  key stages are shown as Toasts.
     // ═══════════════════════════════════════════════════════════════════════════
-    private val NG_BUILD = "v10"
+    private val NG_BUILD = "v11"
     // v10: WebView segment fetch got 403 in every log (Chromium is blocked like the others) and the
     // kept-alive WebView only costs memory/CPU -> off. Code kept for experiments.
     private val SEG_WEBVIEW_FALLBACK = false
+    private val PREFETCH_AHEAD = 3
     private val diagLock = Any()
     @Volatile private var diagCtx: android.content.Context? = null
     @Volatile private var diagPathShown = false
@@ -615,6 +618,10 @@ class PhimNguonCProvider : MainAPI() {
         diagCtx = c.applicationContext ?: c
         return diagCtx
     }
+
+    // v11: info/success toasts used to show over the video; only failures are shown now.
+    private val NG_TOAST_VERBOSE = false
+    private fun ntoastV(msg: String) { if (NG_TOAST_VERBOSE) ntoast(msg) }
 
     private fun ntoast(msg: String) {
         try {
@@ -644,7 +651,7 @@ class PhimNguonCProvider : MainAPI() {
             }
             if (!diagPathShown) {
                 diagPathShown = true
-                ntoast("NguonC $NG_BUILD log: ${f.absolutePath}")
+                ntoastV("NguonC $NG_BUILD log: ${f.absolutePath}")
             }
         } catch (_: Throwable) {}
     }
@@ -801,8 +808,78 @@ class PhimNguonCProvider : MainAPI() {
         @Volatile private var segOkToasted = false
         private val okLogCount = java.util.concurrent.atomic.AtomicInteger(0)
 
-        fun setM3U8(content: String) { _m3u8 = content }
+        fun setM3U8(content: String) {
+            _m3u8 = content
+            // v11: remember the segment order (decoded from the /seg/ lines) for sequential prefetch
+            val urls = content.lines().map { it.trim() }
+                .filter { !it.startsWith("#") && it.contains("/seg/") }
+                .map { java.net.URLDecoder.decode(it.substringAfter("/seg/"), "UTF-8") }
+            segOrder = urls
+            segIndex = urls.withIndex().associate { it.value to it.index }
+        }
         private fun getM3U8(): String = _m3u8
+
+        // ── v11 sequential prefetch ─────────────────────────────────────────────────────
+        // v10 log: per segment 70-250 ms on fast hosts, but ~1.8 s (v9b, sings2.amass2.top) and
+        // occasional 1 s TTFB spikes elsewhere. ExoPlayer loads one segment at a time, so a slow
+        // request stalls playback. When requests are sequential (idx == previous + 1) the next
+        // PREFETCH_AHEAD segments are fetched in the background and served from memory.
+        // Seekbar-preview requests jump around (0817, 0409, 1225...) and never trigger it.
+        @Volatile private var segOrder: List<String> = emptyList()
+        @Volatile private var segIndex: Map<String, Int> = emptyMap()
+        private val prefetchMap = ConcurrentHashMap<String, java.util.concurrent.FutureTask<ByteArray?>>()
+        private val prefetchPool = java.util.concurrent.Executors.newFixedThreadPool(3) { r ->
+            Thread(r).also { it.isDaemon = true }
+        }
+        private val cursorLock = Any()
+        private val cursors = IntArray(4) { -100 }
+        private var cursorNext = 0
+        private val pfHit = java.util.concurrent.atomic.AtomicInteger(0)
+        private val pfMiss = java.util.concurrent.atomic.AtomicInteger(0)
+
+        /** true when [idx] continues one of the tracked request streams (idx == last + 1). */
+        private fun trackSequential(idx: Int): Boolean {
+            if (idx < 0) return false
+            synchronized(cursorLock) {
+                for (k in cursors.indices) {
+                    if (cursors[k] >= 0 && idx == cursors[k] + 1) { cursors[k] = idx; return true }
+                }
+                cursorNext = (cursorNext + 1) % cursors.size
+                cursors[cursorNext] = idx
+                return false
+            }
+        }
+
+        private fun fetchBytes(url: String): ByteArray? {
+            val origin = Regex("""^(https?://[^/]+)""").find(segReferer)?.groupValues?.get(1) ?: ""
+            for (ref in listOf("$origin/", segReferer)) {
+                try {
+                    val req = okhttp3.Request.Builder().url(url)
+                        .header("User-Agent", USER_AGENT)
+                        .header("Referer", ref)
+                        .header("Accept", "*/*")
+                        .build()
+                    val resp = app.baseClient.newCall(req).execute()
+                    try {
+                        if (resp.code in 200..299) return resp.body?.bytes()
+                    } finally {
+                        try { resp.close() } catch (_: Throwable) {}
+                    }
+                } catch (_: Exception) {}
+            }
+            return null
+        }
+
+        private fun schedulePrefetch(idx: Int) {
+            val order = segOrder
+            if (prefetchMap.size > 8) prefetchMap.clear()
+            for (j in idx + 1..idx + PREFETCH_AHEAD) {
+                val u = order.getOrNull(j) ?: break
+                if (prefetchMap.containsKey(u)) continue
+                val task = java.util.concurrent.FutureTask<ByteArray?> { fetchBytes(u) }
+                if (prefetchMap.putIfAbsent(u, task) == null) prefetchPool.execute(task)
+            }
+        }
         @Volatile private var _direct: String = ""
         fun setDirect(content: String) { _direct = content }
         private fun getDirect(): String = _direct
@@ -1005,6 +1082,31 @@ class PhimNguonCProvider : MainAPI() {
                             return true
                         }
 
+                        // v11: sequential request -> prefetch what comes next; serve from memory if ready
+                        val idxNow = segIndex[segUrl] ?: -1
+                        val sequential = trackSequential(idxNow)
+                        val pf = prefetchMap.remove(segUrl)
+                        if (pf != null) {
+                            val tw = System.currentTimeMillis()
+                            val pb = try { pf.get(25, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) { null }
+                            if (pb != null && pb.isNotEmpty()) {
+                                try {
+                                    serveBytes(pb)
+                                    ok = true
+                                    val hits = pfHit.incrementAndGet()
+                                    if (hits <= 20 || hits % 25 == 0) {
+                                        nlog("[NguonC] [Seg] PREFETCH hit idx=$idxNow bytes=${pb.size} waited=${System.currentTimeMillis() - tw}ms hits=$hits miss=${pfMiss.get()}")
+                                    }
+                                } catch (e: Exception) {
+                                    nlog("[NguonC] [Seg] PREFETCH serve error idx=$idxNow: ${e.message}")
+                                    if (headersSent) ok = true
+                                }
+                            }
+                        } else if (sequential) {
+                            pfMiss.incrementAndGet()
+                        }
+                        if (sequential) schedulePrefetch(idxNow)
+
                         val pref = segMethodByHost[segHost]
                         val order: List<Int> = (if (pref != null) listOf(pref) else emptyList<Int>()) + listOf(0, 1, 2).filter { it != pref }
                         for (m in order) {
@@ -1027,7 +1129,7 @@ class PhimNguonCProvider : MainAPI() {
                                     segOkToasted = true
                                     val mn = if (m == 0) "OkHttp" else if (m == 1) "HttpURLConnection" else "WebView"
                                     nlog("[NguonC] [Seg] first segment OK via $mn host=$segHost")
-                                    ntoast("NguonC $NG_BUILD: segment OK qua $mn ($segHost)")
+                                    ntoastV("NguonC $NG_BUILD: segment OK qua $mn ($segHost)")
                                 }
                             }
                         }
@@ -1254,7 +1356,7 @@ class PhimNguonCProvider : MainAPI() {
             val segs = m3u8Content.lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }
             nlog("[NguonC] registerM3U8Link: segments=${segs.size} first=${segs.firstOrNull()?.take(110)} base=${m3u8BaseUrl.take(60)} referer=${referer.take(70)}")
             val firstHost = segs.firstOrNull()?.let { Regex("^https?://([^/]+)").find(it)?.groupValues?.get(1) } ?: "relative"
-            ntoast("NguonC $NG_BUILD: playlist OK ${segs.size} seg @ $firstHost")
+            ntoastV("NguonC $NG_BUILD: playlist OK ${segs.size} seg @ $firstHost")
         }
         // v9: probe the leading segments, drop the ones Cloudflare blocks (see preflightSegments)
         val segUrlsAbs = m3u8Content.lines().map { it.trim() }
@@ -1265,9 +1367,9 @@ class PhimNguonCProvider : MainAPI() {
             Pair(0, 0)
         }
         if (trimProxy > 0 || trimDirect > 0) {
-            ntoast("NguonC $NG_BUILD: bỏ $trimProxy segment đầu (bị Cloudflare chặn)")
+            ntoastV("NguonC $NG_BUILD: bỏ $trimProxy segment đầu (bị Cloudflare chặn)")
         } else {
-            ntoast("NguonC $NG_BUILD: preflight - segment đầu tải được hoặc không có segment nào tải được")
+            ntoastV("NguonC $NG_BUILD: preflight - segment đầu tải được hoặc không có segment nào tải được")
         }
         val server = NguonCProxyServer(referer)
         server.start(); activeServers.add(server)
@@ -2551,7 +2653,7 @@ class PhimNguonCProvider : MainAPI() {
         }.distinctBy { it.second }  // dedupe by URL — same source shouldn't appear twice
         var linkFound = false
         nlog("[NguonC] loadLinks: entries=${embedEntries.size} urls=${embedEntries.joinToString(" | ") { it.first + "=" + it.second.take(90) }}")
-        ntoast("NguonC $NG_BUILD: ${embedEntries.size} nguồn, " + embedEntries.joinToString(",") {
+        ntoastV("NguonC $NG_BUILD: ${embedEntries.size} nguồn, " + embedEntries.joinToString(",") {
             if (it.second.contains("hash=")) "embed+hash" else if (it.second.contains(".m3u")) "m3u8" else "khác"
         })
 
