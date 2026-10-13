@@ -18,6 +18,10 @@
 // NguonC patch v9b (2026-10-13): the real page's own XHR for streamaaa0000.png is also CORS-blocked
 // (StreamBrowser console, 3 videos, hosts cyin1.sbs / seouls11.amass11.top). Preflight now tries
 // header/URL variants on the blocked first segment and adopts the first that passes.
+// NguonC patch v10 (2026-10-13): v9b plays but starts slowly. Log: preflight blocked the link for
+// 2.6 s / 9.4 s (sequential probes + 6 variants that all failed), the embed page kept running in the
+// WebView during startup, bootstrap 403 retried per embedNN host. Now: parallel preflight + per-host
+// memo, embed page stopped on capture, bootstrap memo per streamc.xyz, per-segment timing in the log.
 package com.phimnguonc
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -595,7 +599,10 @@ class PhimNguonCProvider : MainAPI() {
     //  [NguonC] log line is ALSO appended to <externalFilesDir>/nguonc_diag.txt and the
     //  key stages are shown as Toasts.
     // ═══════════════════════════════════════════════════════════════════════════
-    private val NG_BUILD = "v9b"
+    private val NG_BUILD = "v10"
+    // v10: WebView segment fetch got 403 in every log (Chromium is blocked like the others) and the
+    // kept-alive WebView only costs memory/CPU -> off. Code kept for experiments.
+    private val SEG_WEBVIEW_FALLBACK = false
     private val diagLock = Any()
     @Volatile private var diagCtx: android.content.Context? = null
     @Volatile private var diagPathShown = false
@@ -666,6 +673,7 @@ class PhimNguonCProvider : MainAPI() {
     private val segTry = java.util.concurrent.atomic.AtomicIntegerArray(3)
     private val segWin = java.util.concurrent.atomic.AtomicIntegerArray(3)
     private val segStatSeq = java.util.concurrent.atomic.AtomicInteger(0)
+    private val segInflight = java.util.concurrent.atomic.AtomicInteger(0)
     private val segOkLog = java.util.concurrent.atomic.AtomicInteger(0)
     private fun segStat(method: Int, ok: Boolean) {
         segTry.incrementAndGet(method)
@@ -791,6 +799,7 @@ class PhimNguonCProvider : MainAPI() {
         @Volatile private var _m3u8: String = ""
         @Volatile private var segFailToasted = false
         @Volatile private var segOkToasted = false
+        private val okLogCount = java.util.concurrent.atomic.AtomicInteger(0)
 
         fun setM3U8(content: String) { _m3u8 = content }
         private fun getM3U8(): String = _m3u8
@@ -816,7 +825,15 @@ class PhimNguonCProvider : MainAPI() {
                 val input  = client.getInputStream().bufferedReader()
                 val output = client.getOutputStream()
                 val requestLine = input.readLine() ?: return
-                while (true) { if ((input.readLine() ?: "").isBlank()) break }
+                var reqRange: String? = null
+                var reqUa: String? = null
+                while (true) {
+                    val h = input.readLine() ?: ""
+                    if (h.isBlank()) break
+                    val low = h.lowercase()
+                    if (low.startsWith("range:")) reqRange = h.substringAfter(":").trim()
+                    else if (low.startsWith("user-agent:")) reqUa = h.substringAfter(":").trim()
+                }
 
                 val path = requestLine.split(" ").getOrNull(1) ?: "/"
                 val crlf = "\r\n"
@@ -848,6 +865,9 @@ class PhimNguonCProvider : MainAPI() {
                         val segHost = runCatching { java.net.URL(segUrl).host }.getOrDefault("")
                         val segOrigin = Regex("""^(https?://[^/]+)""").find(segReferer)?.groupValues?.get(1) ?: ""
                         val wf = webFetcherFor(segReferer)
+                        val t0 = System.currentTimeMillis()
+                        val inflightNow = segInflight.incrementAndGet()
+                        var ttfbMs = -1L
 
                         var ok = false
                         var headersSent = false
@@ -892,6 +912,7 @@ class PhimNguonCProvider : MainAPI() {
                                 variantRequest(sp, segUrl, segReferer)
                             } else rb.build()
                             return app.baseClient.newCall(req).execute().use { resp ->
+                                ttfbMs = System.currentTimeMillis() - t0
                                 val code = resp.code
                                 lastCode = code
                                 if (code !in 200..299) {
@@ -913,8 +934,8 @@ class PhimNguonCProvider : MainAPI() {
                                         sent += n
                                     }
                                 }
-                                if (segOkLog.incrementAndGet() <= 30) {
-                                    nlog("[NguonC] [Seg] OKHTTP OK $code v=$variant bytes=$sent url=...${segUrl.takeLast(26)}")
+                                if (okLogCount.incrementAndGet() <= 60) {
+                                    nlog("[NguonC] [Seg] OKHTTP OK $code v=$variant bytes=$sent ttfb=${ttfbMs}ms total=${System.currentTimeMillis() - t0}ms inflight=$inflightNow range=${reqRange ?: "-"} ua=${(reqUa ?: "-").take(24)} url=...${segUrl.takeLast(26)}")
                                 }
                                 true
                             }
@@ -1011,6 +1032,7 @@ class PhimNguonCProvider : MainAPI() {
                             }
                         }
 
+                        segInflight.decrementAndGet()
                         if (!ok) {
                             if (!segFailToasted) {
                                 segFailToasted = true
@@ -1157,51 +1179,45 @@ class PhimNguonCProvider : MainAPI() {
         return probeReq(client, b.build())
     }
 
+    // v10: host -> (segments to drop, timestamp). Segment 0 was blocked on every host/video in
+    // every log, so the verdict is remembered for 30 min and later plays skip the probes.
+    private val segTrimByHost = ConcurrentHashMap<String, Pair<Int, Long>>()
+
     /** Returns Pair(trimForProxy, trimForDirect): number of leading segments to drop. */
     private suspend fun preflightSegments(segUrls: List<String>, referer: String): Pair<Int, Int> {
         val origin = Regex("""^(https?://[^/]+)""").find(referer)?.groupValues?.get(1) ?: return Pair(0, 0)
         if (segUrls.isEmpty()) return Pair(0, 0)
+        val host0 = runCatching { java.net.URL(segUrls[0]).host }.getOrDefault("")
+        val memo = segTrimByHost[host0]
+        if (memo != null && System.currentTimeMillis() - memo.second < 30 * 60_000L) {
+            nlog("[NguonC] [Preflight] memo host=$host0 trim=${memo.first}")
+            return Pair(memo.first, memo.first)
+        }
         val ref = "$origin/"
         return withContext(Dispatchers.IO) {
+            val t0 = System.currentTimeMillis()
             val client = app.baseClient.newBuilder().callTimeout(8, java.util.concurrent.TimeUnit.SECONDS).build()
-            var plainOk = -1     // first index downloadable with a plain GET (what ExoPlayer sends)
-            var anyOk = -1       // first index downloadable with plain GET or Range
-            val n = minOf(6, segUrls.size)
+            val n = minOf(3, segUrls.size)
+            // seg0..seg2 probed in parallel -> one round trip instead of one per probe
+            val results = coroutineScope {
+                (0 until n).map { i -> async { probeSeg(client, segUrls[i], ref, null) } }.awaitAll()
+            }
+            var firstOk = -1
             for (i in 0 until n) {
-                val (c, info) = probeSeg(client, segUrls[i], ref, null)
-                nlog("[NguonC] [Preflight] seg$i plain -> $c$info")
-                if (c in 200..299) { plainOk = i; if (anyOk < 0) anyOk = i; break }
-                if (anyOk < 0) {
-                    val (c2, info2) = probeSeg(client, segUrls[i], ref, "bytes=0-0")
-                    nlog("[NguonC] [Preflight] seg$i range=0-0 -> $c2$info2")
-                    if (c2 in 200..299) anyOk = i
+                nlog("[NguonC] [Preflight] seg$i plain -> ${results[i].first}${results[i].second}")
+                if (firstOk < 0 && results[i].first in 200..299) firstOk = i
+            }
+            if (firstOk < 0) {
+                for (i in n until minOf(6, segUrls.size)) {
+                    val (c, info) = probeSeg(client, segUrls[i], ref, null)
+                    nlog("[NguonC] [Preflight] seg$i plain -> $c$info")
+                    if (c in 200..299) { firstOk = i; break }
                 }
             }
-            // v9b: first segment blocked for plain GET and Range -> try header/URL variants on it
-            if (anyOk != 0) {
-                val host0 = runCatching { java.net.URL(segUrls[0]).host }.getOrDefault("")
-                var adopted: String? = null
-                for (name in segVariantNames) {
-                    val (c, info) = probeReq(client, variantRequest(name, segUrls[0], referer))
-                    nlog("[NguonC] [Preflight] seg0 variant $name -> $c$info")
-                    if (adopted == null && c in 200..299) adopted = name
-                }
-                if (adopted != null) {
-                    segSpecialByHost[host0] = adopted
-                    anyOk = 0
-                    nlog("[NguonC] [Preflight] seg0 passes with variant '$adopted' -> proxy keeps segment 0")
-                }
-            }
-            // calibration: a segment from the middle of the stream
-            if (segUrls.size > 12) {
-                val mid = segUrls.size / 2
-                val (c, info) = probeSeg(client, segUrls[mid], ref, null)
-                nlog("[NguonC] [Preflight] seg$mid (mid) plain -> $c$info")
-            }
-            val forProxy = if (anyOk > 0) anyOk else 0
-            val forDirect = if (plainOk > 0) plainOk else 0
-            nlog("[NguonC] [Preflight] result plainOk=$plainOk anyOk=$anyOk -> trim proxy=$forProxy direct=$forDirect")
-            Pair(forProxy, forDirect)
+            val trim = if (firstOk > 0) firstOk else 0
+            if (firstOk >= 0) segTrimByHost[host0] = Pair(trim, System.currentTimeMillis())
+            nlog("[NguonC] [Preflight] result firstOk=$firstOk trim=$trim ms=${System.currentTimeMillis() - t0}")
+            Pair(trim, trim)
         }
     }
 
@@ -1942,6 +1958,13 @@ class PhimNguonCProvider : MainAPI() {
     private val streamcCfBlockedUntil =
         java.util.concurrent.ConcurrentHashMap<String, Long>()
 
+    /** v10: embed5/embed13/embed18... all answer the same 403, key the memo on streamc.xyz. */
+    private fun cfKey(domain: String): String {
+        val host = domain.removePrefix("https://").removePrefix("http://").substringBefore("/")
+        val parts = host.split(".")
+        return if (parts.size >= 2) parts.takeLast(2).joinToString(".") else host
+    }
+
     private fun streamcCacheGet(hash: String?): Pair<String, String>? {
         if (hash.isNullOrBlank()) return null
         val e = streamcPlaylistCache[hash] ?: return null
@@ -2026,7 +2049,7 @@ class PhimNguonCProvider : MainAPI() {
         try {
             // v4 PERF: if Cloudflare 403'd this domain recently, the plain HTTP
             // handshake is hopeless — skip straight to the WebView flow.
-            val cfBlockedUntil = streamcCfBlockedUntil[embedDomain] ?: 0L
+            val cfBlockedUntil = streamcCfBlockedUntil[cfKey(embedDomain)] ?: 0L
             if (System.currentTimeMillis() < cfBlockedUntil) {
                 nlog("[NguonC] [StreamcNew] 0a skipped (Cloudflare blocked this domain recently)")
                 return@withLock false
@@ -2039,7 +2062,7 @@ class PhimNguonCProvider : MainAPI() {
             if (code1 != 200 || body1 == null) {
                 nlog("[NguonC] [StreamcNew] bootstrap HTTP $code1: ${body1?.take(120)}")
                 if (code1 == 403) {
-                    streamcCfBlockedUntil[embedDomain] = System.currentTimeMillis() + 10 * 60_000L
+                    streamcCfBlockedUntil[cfKey(embedDomain)] = System.currentTimeMillis() + 10 * 60_000L
                 }
                 return@withLock false
             }
@@ -2219,7 +2242,24 @@ class PhimNguonCProvider : MainAPI() {
                 while (!ok && tries < 8) {
                     tries++
                     val (capUrl, capBody) = captures.receive()
+                    // v10: playlist in hand -> stop the embed page. Left running, jwplayer keeps
+                    // downloading the 15 MB pre-roll ad and requests segments (seen as
+                    // "WEBVIEW http 403 ... streamaaa0000.png" during preflight) while we start playback.
+                    try {
+                        withContext(Dispatchers.Main) {
+                            webView?.stopLoading()
+                            webView?.loadUrl("about:blank")
+                        }
+                    } catch (_: Throwable) {}
                     ok = streamcRegisterCaptured(capUrl, capBody, videoHash, targetUrl, serverName, callback)
+                    if (!ok) {
+                        // registration failed -> restart the page so another capture can arrive
+                        try {
+                            withContext(Dispatchers.Main) {
+                                webView?.loadUrl(targetUrl, mapOf("Referer" to "$mainUrl/"))
+                            }
+                        } catch (_: Throwable) {}
+                    }
                 }
                 ok
             } ?: false
@@ -2239,7 +2279,7 @@ class PhimNguonCProvider : MainAPI() {
             // v7: keep the Cloudflare-cleared WebView for segment downloads. Swap the embed
             // page (jwplayer would autoplay) for a blank document with the embed origin.
             val keepF = fetcher
-            if (registered && keepF != null) {
+            if (SEG_WEBVIEW_FALLBACK && registered && keepF != null) {
                 putWebFetcher(targetUrl, keepF)
                 withContext(Dispatchers.Main) {
                     dialog?.dismiss()
