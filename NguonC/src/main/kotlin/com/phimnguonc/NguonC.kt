@@ -12,6 +12,12 @@
 // Cloudflare ("Attention Required!"). Segment download tries CloudStream's OkHttp (app.baseClient)
 // first, Referer = embed origin/ (as the working Stremio addon); extra "[Direct]" link lets
 // ExoPlayer fetch segments with its own data source; WebView failures are classified (no-cors probe).
+// NguonC patch v9 (2026-10-12): v8 log -> only streamaaa0000.png (first segment) is ever blocked;
+// OkHttp downloads other segments (28/32). Preflight probes the leading segments and drops the
+// blocked ones from the playlist; OkHttp gets a Range variant; successful segment URLs are logged.
+// NguonC patch v9b (2026-10-13): the real page's own XHR for streamaaa0000.png is also CORS-blocked
+// (StreamBrowser console, 3 videos, hosts cyin1.sbs / seouls11.amass11.top). Preflight now tries
+// header/URL variants on the blocked first segment and adopts the first that passes.
 package com.phimnguonc
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -589,7 +595,7 @@ class PhimNguonCProvider : MainAPI() {
     //  [NguonC] log line is ALSO appended to <externalFilesDir>/nguonc_diag.txt and the
     //  key stages are shown as Toasts.
     // ═══════════════════════════════════════════════════════════════════════════
-    private val NG_BUILD = "v8"
+    private val NG_BUILD = "v9b"
     private val diagLock = Any()
     @Volatile private var diagCtx: android.content.Context? = null
     @Volatile private var diagPathShown = false
@@ -660,6 +666,7 @@ class PhimNguonCProvider : MainAPI() {
     private val segTry = java.util.concurrent.atomic.AtomicIntegerArray(3)
     private val segWin = java.util.concurrent.atomic.AtomicIntegerArray(3)
     private val segStatSeq = java.util.concurrent.atomic.AtomicInteger(0)
+    private val segOkLog = java.util.concurrent.atomic.AtomicInteger(0)
     private fun segStat(method: Int, ok: Boolean) {
         segTry.incrementAndGet(method)
         if (ok) segWin.incrementAndGet(method)
@@ -873,12 +880,17 @@ class PhimNguonCProvider : MainAPI() {
 
                         // method 0: CloudStream OkHttp
                         fun viaOkHttp(variant: Int): Boolean {
-                            val ref = if (variant == 0) "$segOrigin/" else segReferer
-                            val req = okhttp3.Request.Builder().url(segUrl)
+                            val ref = if (variant == 1) segReferer else "$segOrigin/"
+                            val rb = okhttp3.Request.Builder().url(segUrl)
                                 .header("User-Agent", USER_AGENT)
                                 .header("Referer", ref)
                                 .header("Accept", "*/*")
-                                .build()
+                            // variant 2: "Range: bytes=0-" (the working addon asks segments with Range)
+                            if (variant == 2) rb.header("Range", "bytes=0-")
+                            val req = if (variant == 3) {
+                                val sp = segSpecialByHost[segHost] ?: return false
+                                variantRequest(sp, segUrl, segReferer)
+                            } else rb.build()
                             return app.baseClient.newCall(req).execute().use { resp ->
                                 val code = resp.code
                                 lastCode = code
@@ -891,13 +903,18 @@ class PhimNguonCProvider : MainAPI() {
                                 val body = resp.body ?: return@use false
                                 writeHead(body.contentLength())
                                 val buf = ByteArray(65536)
+                                var sent = 0L
                                 body.byteStream().use { stream ->
                                     while (true) {
                                         val n = stream.read(buf)
                                         if (n < 0) break
                                         output.write(buf, 0, n)
                                         output.flush()
+                                        sent += n
                                     }
+                                }
+                                if (segOkLog.incrementAndGet() <= 30) {
+                                    nlog("[NguonC] [Seg] OKHTTP OK $code v=$variant bytes=$sent url=...${segUrl.takeLast(26)}")
                                 }
                                 true
                             }
@@ -974,7 +991,7 @@ class PhimNguonCProvider : MainAPI() {
                             if (m == 2 && wf == null) continue
                             try {
                                 ok = when (m) {
-                                    0 -> viaOkHttp(0) || viaOkHttp(1)
+                                    0 -> viaOkHttp(0) || viaOkHttp(1) || viaOkHttp(2) || viaOkHttp(3)
                                     1 -> viaUrlConn()
                                     else -> viaWeb()
                                 }
@@ -1055,6 +1072,162 @@ class PhimNguonCProvider : MainAPI() {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  v9 preflight. v8 log (2026-10-12): every failing segment request is for
+    //  streamaaa0000.png (the FIRST segment) while CloudStream's OkHttp downloads other
+    //  segments fine (stats okhttp=28/32; the second request stream is CloudStream's
+    //  M3u8PreviewGenerator, which reads middle segments, never index 0 first). Cloudflare
+    //  answers seg 0000 with the "Sorry, you have been blocked" page for every client tried.
+    //  Before the link is handed out, probe the leading segments; if the first ones are
+    //  blocked but a later one is downloadable, drop the blocked ones from the playlist.
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v9b: header/URL variants tried on a blocked first segment (diagnostic + automatic adoption).
+    private val segVariantNames = listOf("noReferer", "cors", "browser", "img", "cacheBust", "fullRef")
+    private val segSpecialByHost = ConcurrentHashMap<String, String>()
+    private val streamBrowserUA =
+        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+
+    private fun variantRequest(name: String, url: String, embedUrl: String): okhttp3.Request {
+        val origin = Regex("""^(https?://[^/]+)""").find(embedUrl)?.groupValues?.get(1) ?: ""
+        val b = okhttp3.Request.Builder()
+        var u = url
+        when (name) {
+            "noReferer" -> {
+                b.header("User-Agent", USER_AGENT)
+            }
+            "cors" -> {
+                b.header("User-Agent", USER_AGENT).header("Origin", origin)
+                    .header("Referer", "$origin/").header("Accept", "*/*")
+            }
+            "browser" -> {
+                // what the real page's XHR sends (headers seen in the StreamBrowser HAR)
+                b.header("User-Agent", streamBrowserUA).header("Origin", origin)
+                    .header("Referer", "$origin/").header("Accept", "*/*")
+                    .header("Accept-Language", "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7")
+                    .header("sec-ch-ua", "\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"150\", \"Android WebView\";v=\"150\"")
+                    .header("sec-ch-ua-mobile", "?1").header("sec-ch-ua-platform", "\"Android\"")
+                    .header("Sec-Fetch-Site", "cross-site").header("Sec-Fetch-Mode", "cors")
+                    .header("Sec-Fetch-Dest", "empty")
+            }
+            "img" -> {
+                b.header("User-Agent", streamBrowserUA).header("Referer", "$origin/")
+                    .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                    .header("Sec-Fetch-Site", "cross-site").header("Sec-Fetch-Mode", "no-cors")
+                    .header("Sec-Fetch-Dest", "image")
+            }
+            "cacheBust" -> {
+                u = url + "?cb=" + System.nanoTime()
+                b.header("User-Agent", USER_AGENT).header("Referer", "$origin/").header("Accept", "*/*")
+            }
+            else -> { // "fullRef"
+                b.header("User-Agent", USER_AGENT).header("Referer", embedUrl).header("Accept", "*/*")
+            }
+        }
+        return b.url(u).build()
+    }
+
+    private fun probeReq(client: okhttp3.OkHttpClient, req: okhttp3.Request): Pair<Int, String> {
+        try {
+            val r = client.newCall(req).execute()
+            try {
+                val code = r.code
+                var info = ""
+                if (code !in 200..299) {
+                    val txt = try { r.peekBody(16384).string() } catch (_: Throwable) { "" }
+                    val h1 = Regex("<h1[^>]*>([^<]{0,60})</h1>", RegexOption.IGNORE_CASE).find(txt)?.groupValues?.get(1)?.trim()
+                    info = " h1=$h1"
+                } else {
+                    info = " acao=${r.header("Access-Control-Allow-Origin")} ct=${r.header("Content-Type")}"
+                }
+                return Pair(code, info)
+            } finally {
+                try { r.close() } catch (_: Throwable) {}
+            }
+        } catch (e: Exception) {
+            return Pair(-1, " err=${e.message}")
+        }
+    }
+
+    private fun probeSeg(client: okhttp3.OkHttpClient, url: String, ref: String, range: String?): Pair<Int, String> {
+        val b = okhttp3.Request.Builder().url(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Referer", ref)
+            .header("Accept", "*/*")
+        if (range != null) b.header("Range", range)
+        return probeReq(client, b.build())
+    }
+
+    /** Returns Pair(trimForProxy, trimForDirect): number of leading segments to drop. */
+    private suspend fun preflightSegments(segUrls: List<String>, referer: String): Pair<Int, Int> {
+        val origin = Regex("""^(https?://[^/]+)""").find(referer)?.groupValues?.get(1) ?: return Pair(0, 0)
+        if (segUrls.isEmpty()) return Pair(0, 0)
+        val ref = "$origin/"
+        return withContext(Dispatchers.IO) {
+            val client = app.baseClient.newBuilder().callTimeout(8, java.util.concurrent.TimeUnit.SECONDS).build()
+            var plainOk = -1     // first index downloadable with a plain GET (what ExoPlayer sends)
+            var anyOk = -1       // first index downloadable with plain GET or Range
+            val n = minOf(6, segUrls.size)
+            for (i in 0 until n) {
+                val (c, info) = probeSeg(client, segUrls[i], ref, null)
+                nlog("[NguonC] [Preflight] seg$i plain -> $c$info")
+                if (c in 200..299) { plainOk = i; if (anyOk < 0) anyOk = i; break }
+                if (anyOk < 0) {
+                    val (c2, info2) = probeSeg(client, segUrls[i], ref, "bytes=0-0")
+                    nlog("[NguonC] [Preflight] seg$i range=0-0 -> $c2$info2")
+                    if (c2 in 200..299) anyOk = i
+                }
+            }
+            // v9b: first segment blocked for plain GET and Range -> try header/URL variants on it
+            if (anyOk != 0) {
+                val host0 = runCatching { java.net.URL(segUrls[0]).host }.getOrDefault("")
+                var adopted: String? = null
+                for (name in segVariantNames) {
+                    val (c, info) = probeReq(client, variantRequest(name, segUrls[0], referer))
+                    nlog("[NguonC] [Preflight] seg0 variant $name -> $c$info")
+                    if (adopted == null && c in 200..299) adopted = name
+                }
+                if (adopted != null) {
+                    segSpecialByHost[host0] = adopted
+                    anyOk = 0
+                    nlog("[NguonC] [Preflight] seg0 passes with variant '$adopted' -> proxy keeps segment 0")
+                }
+            }
+            // calibration: a segment from the middle of the stream
+            if (segUrls.size > 12) {
+                val mid = segUrls.size / 2
+                val (c, info) = probeSeg(client, segUrls[mid], ref, null)
+                nlog("[NguonC] [Preflight] seg$mid (mid) plain -> $c$info")
+            }
+            val forProxy = if (anyOk > 0) anyOk else 0
+            val forDirect = if (plainOk > 0) plainOk else 0
+            nlog("[NguonC] [Preflight] result plainOk=$plainOk anyOk=$anyOk -> trim proxy=$forProxy direct=$forDirect")
+            Pair(forProxy, forDirect)
+        }
+    }
+
+    /** Drop the first [count] segments (and the tags attached to them) from a media playlist. */
+    private fun trimLeadingSegments(m3u8: String, count: Int): String {
+        if (count <= 0) return m3u8
+        val out = ArrayList<String>()
+        val pending = ArrayList<String>()
+        var idx = 0
+        for (line in m3u8.lines()) {
+            val t = line.trim()
+            if (t.isEmpty()) { out.add(line); continue }
+            if (t.startsWith("#EXTINF") || t.startsWith("#EXT-X-BYTERANGE") ||
+                t.startsWith("#EXT-X-DISCONTINUITY") || t.startsWith("#EXT-X-PROGRAM-DATE-TIME")) {
+                pending.add(line)
+            } else if (t.startsWith("#")) {
+                out.add(line)
+            } else {
+                if (idx >= count) { out.addAll(pending); out.add(line) }
+                pending.clear()
+                idx++
+            }
+        }
+        return out.joinToString("\n")
+    }
+
     /** Create proxy server and register m3u8 link */
     private suspend fun registerM3U8Link(
         m3u8Content: String, referer: String, m3u8BaseUrl: String,
@@ -1067,17 +1240,30 @@ class PhimNguonCProvider : MainAPI() {
             val firstHost = segs.firstOrNull()?.let { Regex("^https?://([^/]+)").find(it)?.groupValues?.get(1) } ?: "relative"
             ntoast("NguonC $NG_BUILD: playlist OK ${segs.size} seg @ $firstHost")
         }
+        // v9: probe the leading segments, drop the ones Cloudflare blocks (see preflightSegments)
+        val segUrlsAbs = m3u8Content.lines().map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("#") }
+            .map { if (it.startsWith("http") || m3u8BaseUrl.isEmpty()) it else m3u8BaseUrl.trimEnd('/') + "/" + it }
+        val (trimProxy, trimDirect) = try { preflightSegments(segUrlsAbs, referer) } catch (e: Exception) {
+            nlog("[NguonC] [Preflight] error: ${e.message}")
+            Pair(0, 0)
+        }
+        if (trimProxy > 0 || trimDirect > 0) {
+            ntoast("NguonC $NG_BUILD: bỏ $trimProxy segment đầu (bị Cloudflare chặn)")
+        } else {
+            ntoast("NguonC $NG_BUILD: preflight - segment đầu tải được hoặc không có segment nào tải được")
+        }
         val server = NguonCProxyServer(referer)
         server.start(); activeServers.add(server)
         val proxyBase = "http://127.0.0.1:${server.port}"
-        server.setM3U8(rewriteM3U8(m3u8Content, proxyBase, m3u8BaseUrl))
+        server.setM3U8(rewriteM3U8(trimLeadingSegments(m3u8Content, trimProxy), proxyBase, m3u8BaseUrl))
         callback(newExtractorLink("NguonC", serverName, "$proxyBase/stream.m3u8", ExtractorLinkType.M3U8) {
             quality = Qualities.P1080.value
             headers = mapOf("User-Agent" to USER_AGENT)
         })
         // v8: second link, segments fetched directly by ExoPlayer with Referer = embed origin
         val directReferer = Regex("""^(https?://[^/]+)""").find(referer)?.groupValues?.get(1)?.let { "$it/" } ?: referer
-        server.setDirect(directM3U8(m3u8Content, m3u8BaseUrl))
+        server.setDirect(directM3U8(trimLeadingSegments(m3u8Content, trimDirect), m3u8BaseUrl))
         callback(newExtractorLink("NguonC", "$serverName [Direct]", "$proxyBase/direct.m3u8", ExtractorLinkType.M3U8) {
             quality = Qualities.P1080.value
             this.referer = directReferer
