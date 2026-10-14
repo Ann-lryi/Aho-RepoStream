@@ -29,6 +29,9 @@
 // NguonC patch v13 (2026-10-14): load time. Bootstrap POST skipped (always 403, 3.3 s once), preflight
 // no longer blocks the link (trim=1 assumed, verified in background), DoH fallback when the system
 // resolver fails for the CDN host (seen in the 17:17 log).
+// NguonC patch v14 (2026-10-14): remaining wait = 1.4-2.3 s WebView capture (network bound). Playlist
+// cache 150 s -> 6 h, headless pre-capture of the next episode 20 s after an episode starts,
+// [WV] pageStarted/pageFinished/capture timings in the log.
 package com.phimnguonc
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -519,6 +522,12 @@ class PhimNguonCProvider : MainAPI() {
             }
         }.sortedBy { it.episode ?: 0 }
 
+        // v14: remember which episode follows which, for background pre-capture of the next playlist
+        if (nextEpisodeRaw.size > 600) nextEpisodeRaw.clear()
+        for (i in 0 until episodes.size - 1) {
+            nextEpisodeRaw[rawEpisodeData(episodes[i].data)] = rawEpisodeData(episodes[i + 1].data)
+        }
+
         val categories = movie.category ?: emptyMap()
         val dinhDang = categories.values.find { it.group?.name == "\u0110\u1ECBnh d\u1EA1ng" }?.list?.map { it.name }?.joinToString(", ") ?: ""
         val theLoai = categories.values.find { it.group?.name == "Th\u1EC3 lo\u1EA1i" }?.list?.map { it.name }?.joinToString(", ") ?: ""
@@ -608,7 +617,7 @@ class PhimNguonCProvider : MainAPI() {
     //  [NguonC] log line is ALSO appended to <externalFilesDir>/nguonc_diag.txt and the
     //  key stages are shown as Toasts.
     // ═══════════════════════════════════════════════════════════════════════════
-    private val NG_BUILD = "v13"
+    private val NG_BUILD = "v14"
     // v10: WebView segment fetch got 403 in every log (Chromium is blocked like the others) and the
     // kept-alive WebView only costs memory/CPU -> off. Code kept for experiments.
     private val SEG_WEBVIEW_FALLBACK = false
@@ -2165,6 +2174,47 @@ class PhimNguonCProvider : MainAPI() {
         return if (parts.size >= 2) parts.takeLast(2).joinToString(".") else host
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  v14 next-episode pre-capture. v13 log: tap -> link is 1.4-2.3 s, all of it the WebView capture
+    //  (network bound, nothing left to trim). While an episode plays, the playlists of the NEXT episode
+    //  are captured headless (no dialog) and cached, so opening it takes the cached path.
+    // ═══════════════════════════════════════════════════════════════════════════
+    private val nextEpisodeRaw = ConcurrentHashMap<String, String>()
+    private val prewarmRunning = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** CloudStream's newEpisode(url) applies fixUrl(); undo it (see loadLinks). */
+    private fun rawEpisodeData(d: String): String =
+        if (d.startsWith("$mainUrl/") && d.contains("::")) d.removePrefix("$mainUrl/") else d
+
+    private fun prewarmNext(rawData: String) {
+        val next = nextEpisodeRaw[rawData] ?: return
+        if (!prewarmRunning.compareAndSet(false, true)) return
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                // not while the current episode is starting (WebView creation hitches the UI thread)
+                kotlinx.coroutines.delay(20_000L)
+                for (entry in next.split("|")) {
+                    val parts = entry.trim().split("::", limit = 2)
+                    if (parts.size != 2) continue
+                    val name = cleanServerName(parts[0])
+                    val url = parts[1]
+                    val hash = Regex("""[?&]hash=([a-fA-F0-9]{8,})""").find(url)?.groupValues?.get(1) ?: continue
+                    if (streamcCacheGet(hash) != null) continue
+                    val domain = Regex("""^(https?://[^/]+)""").find(url)?.groupValues?.get(1) ?: continue
+                    val t0 = System.currentTimeMillis()
+                    val ok = withTimeoutOrNull(25_000L) {
+                        tryStreamcWebViewFlow(url, domain, name, { _ -> }, true)
+                    } ?: false
+                    nlog("[NguonC] [Prewarm] name='$name' hash=${hash.take(8)} ok=$ok ms=${System.currentTimeMillis() - t0}")
+                }
+            } catch (e: Exception) {
+                nlog("[NguonC] [Prewarm] error: ${e.message}")
+            } finally {
+                prewarmRunning.set(false)
+            }
+        }
+    }
+
     private fun streamcCacheGet(hash: String?): Pair<String, String>? {
         if (hash.isNullOrBlank()) return null
         val e = streamcPlaylistCache[hash] ?: return null
@@ -2174,9 +2224,12 @@ class PhimNguonCProvider : MainAPI() {
 
     private fun streamcCachePut(hash: String?, url: String, rawBody: String) {
         if (hash.isNullOrBlank() || !rawBody.contains("#EXTM3U")) return
-        if (streamcPlaylistCache.size >= 8) streamcPlaylistCache.clear()
+        if (streamcPlaylistCache.size >= 16) streamcPlaylistCache.clear()
+        // v14: was 150 s. The playlist response carries "cache-control: public, s-maxage=1884584" and
+        // "x-stream-playlist-reuse: 1884584" (~22 days); segment URLs need no token -> 6 h is safe and
+        // makes a replayed / pre-captured episode start without the 1.4-2.3 s WebView step.
         streamcPlaylistCache[hash] =
-            Triple(System.currentTimeMillis() + 150_000L, url, rawBody)
+            Triple(System.currentTimeMillis() + 6L * 3_600_000L, url, rawBody)
     }
 
     /** Minimal JSON string getter — avoids depending on JSON library signatures */
@@ -2331,8 +2384,11 @@ class PhimNguonCProvider : MainAPI() {
      */
     private suspend fun tryStreamcWebViewFlow(
         targetUrl: String, embedDomain: String,
-        serverName: String, callback: (ExtractorLink) -> Unit
+        serverName: String, callback: (ExtractorLink) -> Unit,
+        captureOnly: Boolean = false   // v14: only fetch + cache the playlist (next-episode pre-capture)
     ): Boolean {
+        val flowT0 = System.currentTimeMillis()
+        var pageStartedLogs = 0
         var webView: WebView? = null
         var dialog: android.app.Dialog? = null
         var fetcher: WebSegFetcher? = null      // v7: keeps this WebView alive for segment fetching
@@ -2366,7 +2422,7 @@ class PhimNguonCProvider : MainAPI() {
                 wv.addJavascriptInterface(
                     StreamcCaptureBridge { url, body ->
                         // v3: always log the arrival — proves the JS->Kotlin path works
-                        nlog("[NguonC] [StreamcNew] bridge capture: url=${url.take(60)} len=${body.length} head=${body.take(12)}")
+                        nlog("[NguonC] [StreamcNew] bridge capture: +${System.currentTimeMillis() - flowT0}ms url=${url.take(60)} len=${body.length} head=${body.take(12)}")
                         val t = body.trim()
                         if (t.startsWith("#EXTM3U")) {
                             captures.trySend(url to body)
@@ -2379,9 +2435,11 @@ class PhimNguonCProvider : MainAPI() {
                 wv.webChromeClient = WebChromeClient()
                 wv.webViewClient = object : WebViewClient() {
                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                        if (pageStartedLogs++ < 2) nlog("[NguonC] [WV] pageStarted +${System.currentTimeMillis() - flowT0}ms ${url?.take(60)}")
                         view?.evaluateJavascript(streamcHookJs, null)
                     }
                     override fun onPageFinished(view: WebView?, url: String?) {
+                        if (url != null && !url.startsWith("about:")) nlog("[NguonC] [WV] pageFinished +${System.currentTimeMillis() - flowT0}ms ${url.take(60)}")
                         view?.evaluateJavascript(streamcHookJs, null)
                     }
                     override fun onReceivedHttpError(
@@ -2413,7 +2471,7 @@ class PhimNguonCProvider : MainAPI() {
                 // Show the page in a real dialog window when an Activity is
                 // reachable: gives Turnstile a genuine window environment and,
                 // in the rare interactive case, lets the user tap the checkbox.
-                if (ctx is android.app.Activity && !ctx.isFinishing) {
+                if (!captureOnly && ctx is android.app.Activity && !ctx.isFinishing) {
                     try {
                         val dlg = android.app.Dialog(ctx)
                         dlg.setContentView(
@@ -2454,14 +2512,19 @@ class PhimNguonCProvider : MainAPI() {
                             webView?.loadUrl("about:blank")
                         }
                     } catch (_: Throwable) {}
-                    ok = streamcRegisterCaptured(capUrl, capBody, videoHash, targetUrl, serverName, callback)
-                    if (!ok) {
-                        // registration failed -> restart the page so another capture can arrive
-                        try {
-                            withContext(Dispatchers.Main) {
-                                webView?.loadUrl(targetUrl, mapOf("Referer" to "$mainUrl/"))
-                            }
-                        } catch (_: Throwable) {}
+                    if (captureOnly) {
+                        streamcCachePut(videoHash, capUrl, capBody)
+                        ok = true
+                    } else {
+                        ok = streamcRegisterCaptured(capUrl, capBody, videoHash, targetUrl, serverName, callback)
+                        if (!ok) {
+                            // registration failed -> restart the page so another capture can arrive
+                            try {
+                                withContext(Dispatchers.Main) {
+                                    webView?.loadUrl(targetUrl, mapOf("Referer" to "$mainUrl/"))
+                                }
+                            } catch (_: Throwable) {}
+                        }
                     }
                 }
                 ok
@@ -3253,6 +3316,7 @@ class PhimNguonCProvider : MainAPI() {
             }.awaitAll()
         }
         nlog("[NguonC] loadLinks: done linkFound=$linkFound")
+        if (linkFound) prewarmNext(rawData)
         if (!linkFound) ntoast("NguonC $NG_BUILD: loadLinks KHÔNG có link")
         return linkFound
     }
