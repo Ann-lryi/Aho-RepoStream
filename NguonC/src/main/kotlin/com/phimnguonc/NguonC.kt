@@ -26,6 +26,9 @@
 // per-segment latency seen on sings2.amass2.top and 1 s TTFB spikes), success toasts silenced.
 // NguonC patch v12 (2026-10-14): server label bug (CloudStream fixUrl prefix), [Direct] link off by
 // default, log no longer stops after 160 [Seg] lines (only success lines are capped), [Link] lines.
+// NguonC patch v13 (2026-10-14): load time. Bootstrap POST skipped (always 403, 3.3 s once), preflight
+// no longer blocks the link (trim=1 assumed, verified in background), DoH fallback when the system
+// resolver fails for the CDN host (seen in the 17:17 log).
 package com.phimnguonc
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -45,12 +48,14 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -603,13 +608,17 @@ class PhimNguonCProvider : MainAPI() {
     //  [NguonC] log line is ALSO appended to <externalFilesDir>/nguonc_diag.txt and the
     //  key stages are shown as Toasts.
     // ═══════════════════════════════════════════════════════════════════════════
-    private val NG_BUILD = "v12"
+    private val NG_BUILD = "v13"
     // v10: WebView segment fetch got 403 in every log (Chromium is blocked like the others) and the
     // kept-alive WebView only costs memory/CPU -> off. Code kept for experiments.
     private val SEG_WEBVIEW_FALLBACK = false
     private val PREFETCH_AHEAD = 3
     // v12: the proxy link works (v9b..v11 logs); the extra "[Direct]" link only cluttered the list.
     private val EMIT_DIRECT_LINK = false
+    private val STREAMC_DIRECT_FLOW = false
+    // v13: segment 0 was blocked and segment 1 downloadable in every preflight of every log -> assume
+    // it, never wait for the probes (they now run in the background and correct the memo).
+    private val ASSUMED_TRIM = 1
     private val diagLock = Any()
     @Volatile private var diagCtx: android.content.Context? = null
     @Volatile private var diagPathShown = false
@@ -866,7 +875,7 @@ class PhimNguonCProvider : MainAPI() {
                         .header("Referer", ref)
                         .header("Accept", "*/*")
                         .build()
-                    val resp = app.baseClient.newCall(req).execute()
+                    val resp = segClient.newCall(req).execute()
                     try {
                         if (resp.code in 200..299) return resp.body?.bytes()
                     } finally {
@@ -996,7 +1005,7 @@ class PhimNguonCProvider : MainAPI() {
                                 val sp = segSpecialByHost[segHost] ?: return false
                                 variantRequest(sp, segUrl, segReferer)
                             } else rb.build()
-                            return app.baseClient.newCall(req).execute().use { resp ->
+                            return segClient.newCall(req).execute().use { resp ->
                                 ttfbMs = System.currentTimeMillis() - t0
                                 val code = resp.code
                                 lastCode = code
@@ -1289,26 +1298,103 @@ class PhimNguonCProvider : MainAPI() {
         return probeReq(client, b.build())
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  v13 DNS fallback. Log 2026-10-14 17:17:05-09: "Unable to resolve host jps14.hihihoho4.top: No
+    //  address associated with hostname" (HttpURLConnection) and UnknownHostException (OkHttp) for the
+    //  CDN host while the playback was running -> segment requests failed for ~8 s. The system
+    //  resolver is tried first (CloudStream's own DNS setting is kept); only on UnknownHostException
+    //  the host is resolved through DNS-over-HTTPS (1.1.1.1 / 8.8.8.8, addressed by IP).
+    // ═══════════════════════════════════════════════════════════════════════════
+    private val dohCache = ConcurrentHashMap<String, Pair<List<java.net.InetAddress>, Long>>()
+    private val dohClient: okhttp3.OkHttpClient by lazy {
+        okhttp3.OkHttpClient.Builder()
+            .connectTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
+            .callTimeout(6, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
+
+    private fun dohLookup(host: String): List<java.net.InetAddress> {
+        val cached = dohCache[host]
+        if (cached != null && System.currentTimeMillis() - cached.second < 5 * 60_000L) return cached.first
+        val endpoints = listOf(
+            "https://1.1.1.1/dns-query?name=$host&type=A",
+            "https://8.8.8.8/resolve?name=$host&type=A"
+        )
+        for (u in endpoints) {
+            try {
+                val req = okhttp3.Request.Builder().url(u).header("accept", "application/dns-json").build()
+                val resp = dohClient.newCall(req).execute()
+                try {
+                    if (resp.code !in 200..299) continue
+                    val txt = resp.body?.string() ?: continue
+                    val arr = org.json.JSONObject(txt).optJSONArray("Answer") ?: continue
+                    val out = ArrayList<java.net.InetAddress>()
+                    for (i in 0 until arr.length()) {
+                        val a = arr.getJSONObject(i)
+                        if (a.optInt("type") == 1) out.add(java.net.InetAddress.getByName(a.getString("data")))
+                    }
+                    if (out.isNotEmpty()) {
+                        dohCache[host] = Pair(out, System.currentTimeMillis())
+                        nlog("[NguonC] [DNS] system resolver failed for $host -> DoH ${out.joinToString { it.hostAddress ?: "?" }}")
+                        return out
+                    }
+                } finally {
+                    try { resp.close() } catch (_: Throwable) {}
+                }
+            } catch (_: Exception) {}
+        }
+        nlog("[NguonC] [DNS] DoH fallback found nothing for $host")
+        return emptyList()
+    }
+
+    private val segDns: okhttp3.Dns by lazy {
+        val base = app.baseClient.dns
+        object : okhttp3.Dns {
+            override fun lookup(hostname: String): List<java.net.InetAddress> {
+                try {
+                    return base.lookup(hostname)
+                } catch (e: java.net.UnknownHostException) {
+                    val ips = dohLookup(hostname)
+                    if (ips.isNotEmpty()) return ips
+                    throw e
+                }
+            }
+        }
+    }
+
+    /** CloudStream's OkHttp client + DoH fallback. Shares pool/dispatcher with app.baseClient. */
+    private val segClient: okhttp3.OkHttpClient by lazy { app.baseClient.newBuilder().dns(segDns).build() }
+
     // v10: host -> (segments to drop, timestamp). Segment 0 was blocked on every host/video in
     // every log, so the verdict is remembered for 30 min and later plays skip the probes.
     private val segTrimByHost = ConcurrentHashMap<String, Pair<Int, Long>>()
 
-    /** Returns Pair(trimForProxy, trimForDirect): number of leading segments to drop. */
+    /** Returns Pair(trimForProxy, trimForDirect): number of leading segments to drop. Never blocks. */
     private suspend fun preflightSegments(segUrls: List<String>, referer: String): Pair<Int, Int> {
-        val origin = Regex("""^(https?://[^/]+)""").find(referer)?.groupValues?.get(1) ?: return Pair(0, 0)
         if (segUrls.isEmpty()) return Pair(0, 0)
         val host0 = runCatching { java.net.URL(segUrls[0]).host }.getOrDefault("")
         val memo = segTrimByHost[host0]
-        if (memo != null && System.currentTimeMillis() - memo.second < 30 * 60_000L) {
-            nlog("[NguonC] [Preflight] memo host=$host0 trim=${memo.first}")
-            return Pair(memo.first, memo.first)
+        val fresh = memo != null && System.currentTimeMillis() - memo.second < 30 * 60_000L
+        val assumed = if (memo != null && fresh) memo.first else ASSUMED_TRIM
+        nlog("[NguonC] [Preflight] host=$host0 trim=$assumed (${if (fresh) "memo" else "assumed, verifying in background"})")
+        if (!fresh) {
+            CoroutineScope(Dispatchers.IO).launch {
+                try { verifySegments(segUrls, referer, host0, assumed) }
+                catch (e: Exception) { nlog("[NguonC] [Preflight] verify error: ${e.message}") }
+            }
         }
+        return Pair(assumed, assumed)
+    }
+
+    /** Probes seg0..2 in parallel (also warms DNS/TLS to the CDN host) and stores the verdict. */
+    private suspend fun verifySegments(segUrls: List<String>, referer: String, host0: String, assumed: Int) {
+        val origin = Regex("""^(https?://[^/]+)""").find(referer)?.groupValues?.get(1) ?: return
         val ref = "$origin/"
-        return withContext(Dispatchers.IO) {
+        withContext(Dispatchers.IO) {
             val t0 = System.currentTimeMillis()
-            val client = app.baseClient.newBuilder().callTimeout(8, java.util.concurrent.TimeUnit.SECONDS).build()
+            val client = segClient.newBuilder().callTimeout(8, java.util.concurrent.TimeUnit.SECONDS).build()
             val n = minOf(3, segUrls.size)
-            // seg0..seg2 probed in parallel -> one round trip instead of one per probe
             val results = coroutineScope {
                 (0 until n).map { i -> async { probeSeg(client, segUrls[i], ref, null) } }.awaitAll()
             }
@@ -1326,8 +1412,8 @@ class PhimNguonCProvider : MainAPI() {
             }
             val trim = if (firstOk > 0) firstOk else 0
             if (firstOk >= 0) segTrimByHost[host0] = Pair(trim, System.currentTimeMillis())
-            nlog("[NguonC] [Preflight] result firstOk=$firstOk trim=$trim ms=${System.currentTimeMillis() - t0}")
-            Pair(trim, trim)
+            nlog("[NguonC] [Preflight] verify firstOk=$firstOk trim=$trim assumed=$assumed ms=${System.currentTimeMillis() - t0}" +
+                if (firstOk >= 0 && trim != assumed) "  MISMATCH (memo updated for the next play)" else "")
         }
     }
 
@@ -2161,6 +2247,9 @@ class PhimNguonCProvider : MainAPI() {
         serverName: String, callback: (ExtractorLink) -> Unit
     ): Boolean = streamcHttpMutex.withLock {
         try {
+            // v13: every bootstrap POST in every log was answered with the Cloudflare 403 page
+            // (17:16:52 -> 17:16:55 = 3.3 s wasted on the first play) -> skip it.
+            if (!STREAMC_DIRECT_FLOW) return@withLock false
             // v4 PERF: if Cloudflare 403'd this domain recently, the plain HTTP
             // handshake is hopeless — skip straight to the WebView flow.
             val cfBlockedUntil = streamcCfBlockedUntil[cfKey(embedDomain)] ?: 0L
