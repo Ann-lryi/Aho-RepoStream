@@ -24,6 +24,8 @@
 // memo, embed page stopped on capture, bootstrap memo per streamc.xyz, per-segment timing in the log.
 // NguonC patch v11 (2026-10-13): sequential prefetch of the next 3 segments (hides slow/spiky
 // per-segment latency seen on sings2.amass2.top and 1 s TTFB spikes), success toasts silenced.
+// NguonC patch v12 (2026-10-14): server label bug (CloudStream fixUrl prefix), [Direct] link off by
+// default, log no longer stops after 160 [Seg] lines (only success lines are capped), [Link] lines.
 package com.phimnguonc
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -601,11 +603,13 @@ class PhimNguonCProvider : MainAPI() {
     //  [NguonC] log line is ALSO appended to <externalFilesDir>/nguonc_diag.txt and the
     //  key stages are shown as Toasts.
     // ═══════════════════════════════════════════════════════════════════════════
-    private val NG_BUILD = "v11"
+    private val NG_BUILD = "v12"
     // v10: WebView segment fetch got 403 in every log (Chromium is blocked like the others) and the
     // kept-alive WebView only costs memory/CPU -> off. Code kept for experiments.
     private val SEG_WEBVIEW_FALLBACK = false
     private val PREFETCH_AHEAD = 3
+    // v12: the proxy link works (v9b..v11 logs); the extra "[Direct]" link only cluttered the list.
+    private val EMIT_DIRECT_LINK = false
     private val diagLock = Any()
     @Volatile private var diagCtx: android.content.Context? = null
     @Volatile private var diagPathShown = false
@@ -640,12 +644,15 @@ class PhimNguonCProvider : MainAPI() {
     private fun nlog(msg: String) {
         println(msg)
         try {
-            if (msg.contains("[Seg]") && segLogCount.incrementAndGet() > 160) return
+            if (msg.contains("OKHTTP OK") || msg.contains("PREFETCH hit") || msg.contains("[Seg] stats")) {
+                val c = segLogCount.incrementAndGet()
+                if (c > 160 && c % 50 != 0) return   // v12: v11 log ended after 160 [Seg] lines and hid everything later
+            }
             val ctx = diagContext() ?: return
             val dir = ctx.getExternalFilesDir(null) ?: ctx.filesDir
             val f = java.io.File(dir, "nguonc_diag.txt")
             synchronized(diagLock) {
-                if (f.exists() && f.length() > 96 * 1024) f.writeText("")
+                if (f.exists() && f.length() > 192 * 1024) f.writeText(f.readText().takeLast(64 * 1024))
                 val ts = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US).format(java.util.Date())
                 f.appendText("$ts $NG_BUILD $msg\n")
             }
@@ -880,6 +887,7 @@ class PhimNguonCProvider : MainAPI() {
                 if (prefetchMap.putIfAbsent(u, task) == null) prefetchPool.execute(task)
             }
         }
+        @Volatile var label: String = ""
         @Volatile private var _direct: String = ""
         fun setDirect(content: String) { _direct = content }
         private fun getDirect(): String = _direct
@@ -918,13 +926,13 @@ class PhimNguonCProvider : MainAPI() {
                 when {
                     path == "/stream.m3u8" -> {
                         val body = getM3U8().toByteArray(Charsets.UTF_8)
-                        nlog("[NguonC] [Proxy] stream.m3u8 served bytes=${body.size} port=$port")
+                        nlog("[NguonC] [Proxy] stream.m3u8 served name='$label' bytes=${body.size} port=$port")
                         output.write(("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${body.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}").toByteArray())
                         output.write(body)
                     }
                     path == "/direct.m3u8" -> {
                         val body = getDirect().toByteArray(Charsets.UTF_8)
-                        nlog("[NguonC] [Proxy] direct.m3u8 served bytes=${body.size} port=$port")
+                        nlog("[NguonC] [Proxy] direct.m3u8 served name='$label' bytes=${body.size} port=$port")
                         output.write(("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${body.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}").toByteArray())
                         output.write(body)
                     }
@@ -1372,6 +1380,7 @@ class PhimNguonCProvider : MainAPI() {
             ntoastV("NguonC $NG_BUILD: preflight - segment đầu tải được hoặc không có segment nào tải được")
         }
         val server = NguonCProxyServer(referer)
+        server.label = serverName
         server.start(); activeServers.add(server)
         val proxyBase = "http://127.0.0.1:${server.port}"
         server.setM3U8(rewriteM3U8(trimLeadingSegments(m3u8Content, trimProxy), proxyBase, m3u8BaseUrl))
@@ -1380,13 +1389,16 @@ class PhimNguonCProvider : MainAPI() {
             headers = mapOf("User-Agent" to USER_AGENT)
         })
         // v8: second link, segments fetched directly by ExoPlayer with Referer = embed origin
-        val directReferer = Regex("""^(https?://[^/]+)""").find(referer)?.groupValues?.get(1)?.let { "$it/" } ?: referer
-        server.setDirect(directM3U8(trimLeadingSegments(m3u8Content, trimDirect), m3u8BaseUrl))
-        callback(newExtractorLink("NguonC", "$serverName [Direct]", "$proxyBase/direct.m3u8", ExtractorLinkType.M3U8) {
-            quality = Qualities.P1080.value
-            this.referer = directReferer
-            headers = mapOf("User-Agent" to USER_AGENT)
-        })
+        if (EMIT_DIRECT_LINK) {
+            val directReferer = Regex("""^(https?://[^/]+)""").find(referer)?.groupValues?.get(1)?.let { "$it/" } ?: referer
+            server.setDirect(directM3U8(trimLeadingSegments(m3u8Content, trimDirect), m3u8BaseUrl))
+            callback(newExtractorLink("NguonC", "$serverName [Direct]", "$proxyBase/direct.m3u8", ExtractorLinkType.M3U8) {
+                quality = Qualities.P1080.value
+                this.referer = directReferer
+                headers = mapOf("User-Agent" to USER_AGENT)
+            })
+        }
+        nlog("[NguonC] [Link] emitted name='$serverName' url=$proxyBase/stream.m3u8 segs=${segUrlsAbs.size} trim=$trimProxy first=${segUrlsAbs.getOrNull(trimProxy)?.takeLast(70)}")
         return true
     }
 
@@ -2645,9 +2657,13 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback:         (ExtractorLink) -> Unit
     ): Boolean {
-        val embedEntries = data.split("|").mapNotNull { entry ->
+        // v12: newEpisode(url) runs fixUrl() in CloudStream (MainAPI.kt:2631), which turns
+        // "Vietsub::https://embed..." into "https://phim.nguonc.com/Vietsub::https://embed..." --
+        // the first server's label became "https://phim.nguonc.com/Vietsub" (seen in every log).
+        val rawData = if (data.startsWith("$mainUrl/") && data.contains("::")) data.removePrefix("$mainUrl/") else data
+        val embedEntries = rawData.split("|").mapNotNull { entry ->
             val parts = entry.trim().split("::", limit = 2)
-            if (parts.size == 2) Pair(parts[0], parts[1])
+            if (parts.size == 2) Pair(cleanServerName(parts[0]), parts[1])
             else if (parts.size == 1 && parts[0].startsWith("http")) Pair("Vietsub", parts[0])
             else null
         }.distinctBy { it.second }  // dedupe by URL — same source shouldn't appear twice
