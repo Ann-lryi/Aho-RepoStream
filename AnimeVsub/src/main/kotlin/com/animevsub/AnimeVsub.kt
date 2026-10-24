@@ -1,4 +1,4 @@
-// AnimeVsub v1 (2026-10-24): CloudStream provider cho https://animevietsub.sale
+// AnimeVsub v2 (2026-10-25): CloudStream provider cho https://animevietsub.sale
 // Kiến trúc battle-hardened kế thừa NguonC (Aho-Repo):
 //  - Lớp fetch Cloudflare-aware: doc cache -> plain HTTP + cookie clearance cache
 //    -> CORS proxy -> WebViewResolver fallback (serialized qua mutex, cookie re-captured).
@@ -11,7 +11,11 @@
 //      STEP 4 WebViewResolver broad capture trên từng embed
 //  - HLS proxy cục bộ: /stream.m3u8 rewrite + /seg/ relay (OkHttp -> HttpURLConnection),
 //    streaming 64KB, kiểm tra HTTP status (không bao giờ serve trang Cloudflare làm video).
-//  - Diagnostics: nlog -> logcat + file <externalFilesDir>/animevsub_diag.txt, ntoastV gated.
+//  - Diagnostics v2 (chuẩn NguonC): nlog/nlogE -> logcat + file
+//    <externalFilesDir>/animevsub_diag.txt; session banner model/OS/app-version;
+//    timestamp .SSS + build tag mỗi dòng; nlogE ghi class+stack cho MỌI catch
+//    (v1 nuốt exception im lặng ở ~15 chỗ); loadLinks kết thúc bằng dòng SUMMARY;
+//    ntoast chạy main looper (v1 toast từ coroutine IO bị rơi im lặng).
 // URL patterns đã xác minh qua search index + Telegram kênh chính thức (24-10-2026):
 //  - Chi tiết phim : /phim/{slug}-a{id}/          (vd /phim/dogulwang-a6014/)
 //  - Trang xem     : /phim/{slug}-a{id}/xem-phim.html
@@ -63,7 +67,7 @@ class AnimeVsubProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════════
     //  FLAGS / HẰNG SỐ
     // ═══════════════════════════════════════════════════════════════════════════
-    private val AVS_BUILD = "v1"
+    private val AVS_BUILD = "v2"
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -95,7 +99,11 @@ class AnimeVsubProvider : MainAPI() {
     )
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  DIAGNOSTICS — logcat + file (kỹ thuật NguonC v6: logcat khó đọc trên một số máy)
+    //  DIAGNOSTICS v2 (chuẩn NguonC): mọi sự kiện ghi logcat + file
+    //  <externalFilesDir>/animevsub_diag.txt. Mỗi dòng: HH:mm:ss.SSS + build tag.
+    //  Mở phiên mới có banner thiết bị (model/Android/app version) để log gửi về
+    //  luôn đủ ngữ cảnh phân tích. nlogE() ghi đầy đủ class + message + 3 khung
+    //  stack của exception — bắt buộc gọi trong MỌI catch thay vì nuốt im lặng.
     // ═══════════════════════════════════════════════════════════════════════════
     private val diagLock = Any()
     @Volatile private var diagCtx: android.content.Context? = null
@@ -109,7 +117,7 @@ class AnimeVsubProvider : MainAPI() {
             val m = at.getDeclaredMethod("currentApplication")
             m.isAccessible = true
             (m.invoke(null) as? android.content.Context)?.let {
-                diagCtx = it; it
+                diagCtx = it.applicationContext ?: it; diagCtx
             }
         } catch (_: Throwable) { null }
     }
@@ -119,7 +127,13 @@ class AnimeVsubProvider : MainAPI() {
     private fun ntoast(msg: String) {
         try {
             val ctx = diagContext() ?: return
-            android.widget.Toast.makeText(ctx, msg, android.widget.Toast.LENGTH_SHORT).show()
+            // Toast phải chạy trên main looper (bài học NguonC v11: gọi thẳng từ
+            // coroutine IO thì toast bị rơi im lặng hoặc crash).
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                try {
+                    android.widget.Toast.makeText(ctx, msg.take(160), android.widget.Toast.LENGTH_LONG).show()
+                } catch (_: Throwable) {}
+            }
         } catch (_: Throwable) {}
     }
 
@@ -128,19 +142,46 @@ class AnimeVsubProvider : MainAPI() {
         try {
             val ctx = diagContext() ?: return
             synchronized(diagLock) {
-                val f = java.io.File(ctx.getExternalFilesDir(null), "animevsub_diag.txt")
+                val dir = ctx.getExternalFilesDir(null) ?: ctx.filesDir
+                val f = java.io.File(dir, "animevsub_diag.txt")
                 if (!diagPathShown) {
                     diagPathShown = true
-                    nlog("diag file: ${f.absolutePath}")
+                    val appVer = try {
+                        ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: "?"
+                    } catch (_: Throwable) { "?" }
+                    val dev = try { android.os.Build.MODEL } catch (_: Throwable) { "?" }
+                    val os  = try { android.os.Build.VERSION.RELEASE } catch (_: Throwable) { "?" }
+                    f.appendText("═══ AnimeVsub $AVS_BUILD session ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())} | $dev | Android $os | app $appVer ═══\n")
+                    f.appendText("log file: ${f.absolutePath}\n")
                 }
-                f.appendText("[${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())}] $msg\n")
-                // Giữ file dưới ~512KB để không phình to.
-                if (f.length() > 512 * 1024) {
-                    val lines = f.readLines()
-                    f.writeText(lines.takeLast(2000).joinToString("\n") + "\n")
+                // Giữ file dưới ~384KB (cắt bớt đầu, giữ 128KB gần nhất).
+                if (f.exists() && f.length() > 384 * 1024) {
+                    f.writeText(f.readText().takeLast(128 * 1024))
                 }
+                val ts = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US).format(java.util.Date())
+                f.appendText("$ts $AVS_BUILD $msg\n")
             }
         } catch (_: Throwable) {}
+    }
+
+    /** Log exception đầy đủ: class + message + 3 khung stack đầu — dùng trong mọi catch. */
+    private fun nlogE(tag: String, e: Throwable?, extra: String = "") {
+        val cls  = e?.javaClass?.simpleName ?: "?"
+        val emsg = (e?.message ?: "").take(200)
+        val frames = try {
+            e?.stackTrace?.take(3)?.joinToString("<-") {
+                "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}"
+            } ?: ""
+        } catch (_: Throwable) { "" }
+        nlog("ERROR $tag $cls: $emsg${if (extra.isNotBlank()) " | $extra" else ""}${if (frames.isNotBlank()) " @ $frames" else ""}")
+    }
+
+    /** <title> đầu tiên của HTML — nhận diện trang gate/challenge trong log. */
+    private fun pageTitleOf(html: String): String {
+        return try {
+            Regex("""<title[^>]*>(.*?)</title>""", RegexOption.IGNORE_CASE or RegexOption.DOT_MATCHES_ALL)
+                .find(html)?.groupValues?.get(1)?.trim()?.take(60) ?: "?"
+        } catch (_: Throwable) { "?" }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -181,7 +222,7 @@ class AnimeVsubProvider : MainAPI() {
                 val idx = it.indexOf('=')
                 if (idx <= 0) null else it.substring(0, idx).trim() to it.substring(idx + 1).trim()
             }.toMap().ifEmpty { null }
-        } catch (_: Throwable) { null }
+        } catch (e: Throwable) { nlogE("[CookieMgr]", e); null }
     }
 
     private fun absolutize(href: String?): String? {
@@ -206,19 +247,30 @@ class AnimeVsubProvider : MainAPI() {
     }
 
     private suspend fun tryPlainDoc(url: String, cookies: Map<String, String>?): Document? {
-        return try {
+        val t0 = System.currentTimeMillis()
+        val tag = if (cookies != null) "ck=${cookies.size}" else "no-ck"
+        try {
             val resp = if (cookies != null) {
                 app.get(url, headers = commonHeaders, cookies = cookies)
             } else {
                 app.get(url, headers = commonHeaders)
             }
             val html = resp.text
-            if (!looksBlocked(html)) {
+            val blocked = looksBlocked(html)
+            if (!blocked) {
                 val doc = resp.document
-                if (doc.body()?.text()?.isNotBlank() == true) return doc
+                if (doc.body()?.text()?.isNotBlank() == true) {
+                    nlog("[Fetch] plain $tag OK ${resp.code} len=${html.length} ms=${System.currentTimeMillis() - t0} $url")
+                    return doc
+                }
+                nlog("[Fetch] plain $tag ${resp.code} EMPTY-BODY len=${html.length} ms=${System.currentTimeMillis() - t0} $url")
+            } else {
+                nlog("[Fetch] plain $tag ${resp.code} BLOCKED title='${pageTitleOf(html)}' len=${html.length} ms=${System.currentTimeMillis() - t0} $url")
             }
-            null
-        } catch (_: Throwable) { null }
+        } catch (e: Throwable) {
+            nlogE("[Fetch] plain $tag", e, url)
+        }
+        return null
     }
 
     /**
@@ -229,7 +281,10 @@ class AnimeVsubProvider : MainAPI() {
     private suspend fun fetchDoc(url: String, useCache: Boolean = true): Document {
         if (useCache) {
             docCache[url]?.let { cached ->
-                if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) return cached.doc
+                if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) {
+                    nlog("[Fetch] cache-hit $url")
+                    return cached.doc
+                }
             }
         }
 
@@ -248,6 +303,7 @@ class AnimeVsubProvider : MainAPI() {
 
         // ── 2. CORS proxy (chậm ~2.5s, đôi khi lách được vì đi từ Cloudflare edge) ──
         for (proxy in corsProxies) {
+            val pt0 = System.currentTimeMillis()
             try {
                 val proxiedUrl = if (proxy.endsWith("?url=")) proxy + URLEncoder.encode(url, "UTF-8") else proxy + url
                 val resp = app.get(proxiedUrl, headers = commonHeaders)
@@ -255,11 +311,15 @@ class AnimeVsubProvider : MainAPI() {
                 if (!looksBlocked(html)) {
                     val doc = resp.document
                     if (doc.body()?.text()?.isNotBlank() == true) {
+                        nlog("[Fetch] proxy ${hostOf(proxy)} OK ${resp.code} len=${html.length} ms=${System.currentTimeMillis() - pt0} $url")
                         if (useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
                         return doc
                     }
                 }
-            } catch (_: Throwable) {}
+                nlog("[Fetch] proxy ${hostOf(proxy)} FAIL ${resp.code} blocked=${looksBlocked(html)} len=${html.length} ms=${System.currentTimeMillis() - pt0} $url")
+            } catch (e: Throwable) {
+                nlogE("[Fetch] proxy ${hostOf(proxy)}", e, url)
+            }
         }
 
         // ── 3. WebView fallback (chậm, serialized) — chính là nơi giải gate/challenge ──
@@ -275,12 +335,18 @@ class AnimeVsubProvider : MainAPI() {
                 tryPlainDoc(url, fresh)?.let { return@withLock it }
             }
 
+            nlog("[Fetch] webview fallback $url")
+            val wt0 = System.currentTimeMillis()
             val interceptor = WebViewResolver(Regex(Regex.escape(url)))
             val resp = app.get(url, headers = commonHeaders, interceptor = interceptor)
             try {
-                if (resp.cookies.isNotEmpty()) cfCookieCache[mainUrl] = resp.cookies
+                if (resp.cookies.isNotEmpty()) {
+                    cfCookieCache[mainUrl] = resp.cookies
+                    nlog("[Fetch] webview cookies+${resp.cookies.size}")
+                }
             } catch (_: Throwable) {}
             val doc = resp.document
+            nlog("[Fetch] webview OK ms=${System.currentTimeMillis() - wt0} $url")
             if (useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
             doc
         }
@@ -289,11 +355,22 @@ class AnimeVsubProvider : MainAPI() {
     /** GET trả về text thô (dùng cho m3u8), có kiểm tra block-page. */
     private suspend fun fetchText(url: String, referer: String?): String? {
         val headers = if (referer != null) commonHeaders + mapOf("Referer" to referer) else commonHeaders
+        val t0 = System.currentTimeMillis()
+        val short = "...${url.takeLast(60)}"
         return try {
             val resp = app.get(url, headers = headers)
             val t = resp.text
-            if (looksBlocked(t)) null else t
-        } catch (_: Throwable) { null }
+            if (looksBlocked(t)) {
+                nlog("[Text] ${resp.code} BLOCKED title='${pageTitleOf(t)}' len=${t.length} ms=${System.currentTimeMillis() - t0} $short")
+                null
+            } else {
+                nlog("[Text] ${resp.code} OK len=${t.length} ms=${System.currentTimeMillis() - t0} $short")
+                t
+            }
+        } catch (e: Throwable) {
+            nlogE("[Text]", e, short)
+            null
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -416,7 +493,9 @@ class AnimeVsubProvider : MainAPI() {
                 out[slugId] = newAnimeSearchResponse(title, detail, TvType.Anime) {
                     this.posterUrl = poster
                 }
-            } catch (_: Throwable) {}
+            } catch (e: Throwable) {
+                nlogE("[Card]", e, a.attr("href").take(60))
+            }
         }
         return out.values.toList()
     }
@@ -468,7 +547,12 @@ class AnimeVsubProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val detail = detailUrl(url) ?: url
-        val doc = fetchDoc(detail)
+        val doc = try {
+            fetchDoc(detail)
+        } catch (e: Throwable) {
+            nlogE("[Load] fetchDoc", e, detail)
+            throw e
+        }
 
         // ── Tiêu đề ──
         var title = doc.selectFirst("h1")?.text()?.trim() ?: ""
@@ -604,6 +688,8 @@ class AnimeVsubProvider : MainAPI() {
         callback:         (ExtractorLink) -> Unit
     ): Boolean {
         var linkFound = false
+        val runT0 = System.currentTimeMillis()
+        val stepNotes = mutableListOf<String>()
 
         // CloudStream chạy fixUrl() trên data của newEpisode — nếu data đã là URL
         // tuyệt đối thì giữ nguyên; nếu là URL chi tiết thì dựng trang xem chuẩn.
@@ -622,6 +708,7 @@ class AnimeVsubProvider : MainAPI() {
                     val html = doc.outerHtml()
 
                     val (m3u8s, mp4s) = harvestMediaUrls(html)
+                    nlog("[Step1] media m3u8=${m3u8s.size} mp4=${mp4s.size}")
                     for (m3u8 in m3u8s) {
                         val content = fetchText(m3u8, referer = detailBaseOf(watchUrl)) ?: continue
                         if (content.contains("#EXTM3U")) {
@@ -633,6 +720,7 @@ class AnimeVsubProvider : MainAPI() {
                     }
                     if (!linkFound) {
                         for (mp4 in mp4s) {
+                            nlog("[Step1] MP4 direct ${mp4.take(90)}")
                             callback(newExtractorLink(name, "MP4", mp4, ExtractorLinkType.VIDEO) {
                                 quality = Qualities.P720.value
                                 headers = mapOf("User-Agent" to USER_AGENT, "Referer" to detailBaseOf(watchUrl))
@@ -651,8 +739,10 @@ class AnimeVsubProvider : MainAPI() {
                         }.awaitAll()
                         linkFound = results.any { it }
                     }
+                    stepNotes.add("S1:${if (linkFound) "HIT" else "0"}")
                 } catch (e: Throwable) {
-                    nlog("[Step1] error: ${e.message}")
+                    nlogE("[Step1]", e)
+                    stepNotes.add("S1:ERR")
                 }
             }
 
@@ -660,25 +750,31 @@ class AnimeVsubProvider : MainAPI() {
             if (!linkFound) {
                 try {
                     if (tryHookFlow(watchUrl, callback)) linkFound = true
+                    stepNotes.add("S2:${if (linkFound) "HIT" else "0"}")
                 } catch (e: Throwable) {
-                    nlog("[Step2] error: ${e.message}")
+                    nlogE("[Step2]", e)
+                    stepNotes.add("S2:ERR")
                 }
             }
 
             // ═══ STEP 3: WebViewResolver broad trên trang xem ═══
             if (!linkFound) {
                 try {
+                    val t3 = System.currentTimeMillis()
                     val resp = app.get(watchUrl, interceptor = WebViewResolver(
                         Regex(""".*\.(m3u8|m3u9|mp4)(\?|$)""")
                     ), headers = commonHeaders)
                     val content = resp.text
                     val capturedUrl = resp.url ?: ""
+                    nlog("[Step3] wvr captured=${capturedUrl.take(90)} len=${content.length} ms=${System.currentTimeMillis() - t3}")
                     if (content.contains("#EXTM3U")) {
                         if (registerM3U8Link(content, capturedUrl.ifBlank { watchUrl }, "", "Vietsub", callback)) {
                             linkFound = true
                         }
+                        if (!linkFound) nlog("[Step3] có EXTM3U nhưng register thất bại")
                     } else {
                         val (m3u8s, mp4s) = harvestMediaUrls(content)
+                        nlog("[Step3] harvest m3u8=${m3u8s.size} mp4=${mp4s.size}")
                         val firstM3u8 = m3u8s.firstOrNull()
                         val firstMp4 = mp4s.firstOrNull()
                         if (firstM3u8 != null) {
@@ -688,6 +784,7 @@ class AnimeVsubProvider : MainAPI() {
                                 linkFound = true
                             }
                         } else if (firstMp4 != null) {
+                            nlog("[Step3] MP4 direct ${firstMp4.take(90)}")
                             callback(newExtractorLink(name, "MP4", firstMp4, ExtractorLinkType.VIDEO) {
                                 quality = Qualities.P720.value
                                 headers = mapOf("User-Agent" to USER_AGENT, "Referer" to watchUrl)
@@ -695,8 +792,10 @@ class AnimeVsubProvider : MainAPI() {
                             linkFound = true
                         }
                     }
+                    stepNotes.add("S3:${if (linkFound) "HIT" else "0"}")
                 } catch (e: Throwable) {
-                    nlog("[Step3] error: ${e.message}")
+                    nlogE("[Step3]", e)
+                    stepNotes.add("S3:ERR")
                 }
             }
 
@@ -704,25 +803,35 @@ class AnimeVsubProvider : MainAPI() {
             if (!linkFound) {
                 try {
                     val embeds = harvestIframes(fetchDoc(watchUrl, useCache = false)).take(MAX_EMBEDS)
+                    nlog("[Step4] embeds=${embeds.size} ${embeds.joinToString(" | ") { it.take(60) }}")
                     for (embed in embeds) {
                         try {
                             val resp = app.get(embed, interceptor = WebViewResolver(
                                 Regex(""".*\.(m3u8|m3u9|mp4)(\?|$)""")
                             ), headers = commonHeaders + mapOf("Referer" to watchUrl))
                             val content = resp.text
+                            nlog("[Step4] ${embed.take(60)} -> ${resp.code} len=${content.length}")
                             if (content.contains("#EXTM3U")) {
                                 if (registerM3U8Link(content, resp.url ?: embed, "", "Vietsub", callback)) {
                                     linkFound = true; break
                                 }
                             }
-                        } catch (_: Throwable) {}
+                        } catch (e: Throwable) {
+                            nlogE("[Step4] embed", e, embed.take(60))
+                        }
                     }
-                } catch (_: Throwable) {}
+                    stepNotes.add("S4:${if (linkFound) "HIT" else "0"}")
+                } catch (e: Throwable) {
+                    nlogE("[Step4]", e)
+                    stepNotes.add("S4:ERR")
+                }
             }
         }
 
-        nlog("[loadLinks] result=$linkFound watch=$watchUrl")
-        if (!linkFound) ntoast("AnimeVsub $AVS_BUILD: không lấy được link — xem animevsub_diag.txt")
+        nlog("[loadLinks] SUMMARY ${stepNotes.joinToString(" | ")} -> result=$linkFound ms=${System.currentTimeMillis() - runT0} watch=$watchUrl")
+        if (!linkFound) {
+            ntoast("AnimeVsub $AVS_BUILD: không lấy được link — xem animevsub_diag.txt")
+        }
         return linkFound
     }
 
@@ -776,7 +885,7 @@ class AnimeVsubProvider : MainAPI() {
                 }
             }
         } catch (e: Throwable) {
-            nlog("[Embed] $embed error: ${e.message}")
+            nlogE("[Embed]", e, embed.take(70))
         }
         return false
     }
@@ -886,6 +995,7 @@ class AnimeVsubProvider : MainAPI() {
             }
 
             val captures = Channel<Pair<String, String>>(Channel.UNLIMITED)
+            val captureCount = java.util.concurrent.atomic.AtomicInteger(0)
 
             withContext(Dispatchers.Main) {
                 val wv = WebView(ctx)
@@ -898,6 +1008,7 @@ class AnimeVsubProvider : MainAPI() {
                 try { CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true) } catch (_: Throwable) {}
                 wv.addJavascriptInterface(
                     AvsCaptureBridge { url, body ->
+                        captureCount.incrementAndGet()
                         nlog("[Hook] bridge +${System.currentTimeMillis() - flowT0}ms url=${url.take(60)} len=${body.length} head=${body.take(12)}")
                         captures.trySend(url to body)
                     },
@@ -906,9 +1017,11 @@ class AnimeVsubProvider : MainAPI() {
                 wv.webChromeClient = WebChromeClient()
                 wv.webViewClient = object : WebViewClient() {
                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                        try { nlog("[Hook] page-start ${url?.take(90)}") } catch (_: Throwable) {}
                         view?.evaluateJavascript(avsHookJs, null)
                     }
                     override fun onPageFinished(view: WebView?, url: String?) {
+                        try { nlog("[Hook] page-finish ${url?.take(90)}") } catch (_: Throwable) {}
                         view?.evaluateJavascript(avsHookJs, null)
                     }
                     override fun onReceivedError(
@@ -938,7 +1051,7 @@ class AnimeVsubProvider : MainAPI() {
                         dlg.show()
                         dialog = dlg
                     } catch (e: Throwable) {
-                        nlog("[Hook] dialog unavailable (${e.message}), chạy headless")
+                        nlogE("[Hook] dialog", e, "chạy headless")
                     }
                 }
 
@@ -946,11 +1059,13 @@ class AnimeVsubProvider : MainAPI() {
             }
 
             var registered = false
-            withTimeoutOrNull(HOOK_TIMEOUT_MS) {
+            val hookResult = withTimeoutOrNull(HOOK_TIMEOUT_MS) {
                 var tries = 0
                 while (!registered && tries < 6) {
                     tries++
-                    val (capUrl, capBody) = captures.receive()
+                    val recv = try { captures.receive() } catch (e: Throwable) { nlogE("[Hook] receive", e); null }
+                    if (recv == null) break
+                    val (capUrl, capBody) = recv
                     // Có playlist -> dừng trang để player không tải tiếp quảng cáo/segment.
                     try {
                         withContext(Dispatchers.Main) {
@@ -998,10 +1113,19 @@ class AnimeVsubProvider : MainAPI() {
                         val idx = it.indexOf('=')
                         if (idx <= 0) null else it.substring(0, idx).trim() to it.substring(idx + 1).trim()
                     }.toMap()
+                    nlog("[Hook] cookie-cache +${cfCookieCache[mainUrl]?.size ?: 0} cookie")
                 }
-            } catch (_: Throwable) {}
+            } catch (e: Throwable) {
+                nlogE("[Hook] cookie-save", e)
+            }
 
-            if (registered) nlog("[Hook] OK trong +${System.currentTimeMillis() - flowT0}ms")
+            if (registered) {
+                nlog("[Hook] OK trong +${System.currentTimeMillis() - flowT0}ms")
+            } else if (hookResult == null) {
+                nlog("[Hook] TIMEOUT ${HOOK_TIMEOUT_MS / 1000}s captures=${captureCount.get()} — có thể gate cần người dùng tick")
+            } else {
+                nlog("[Hook] ${captureCount.get()} capture, không có playlist khả dụng")
+            }
             return registered
         } finally {
             try { withContext(Dispatchers.Main) { dialog?.dismiss() } } catch (_: Throwable) {}
@@ -1088,7 +1212,12 @@ class AnimeVsubProvider : MainAPI() {
 
         val server = AvsProxyServer(referer)
         server.label = serverName
-        server.start()
+        try {
+            server.start()
+        } catch (e: Throwable) {
+            nlogE("[Register] bind", e, "không mở được port cục bộ — bỏ qua server này")
+            return false
+        }
         synchronized(activeServers) { activeServers.add(server) }
 
         val proxyBase = "http://127.0.0.1:${server.port}"
@@ -1139,7 +1268,12 @@ class AnimeVsubProvider : MainAPI() {
         fun setM3U8(v: String) { _m3u8 = v }
 
         fun start() {
-            val ss = java.net.ServerSocket(0, 64, java.net.InetAddress.getByName("127.0.0.1"))
+            val ss = try {
+                java.net.ServerSocket(0, 64, java.net.InetAddress.getByName("127.0.0.1"))
+            } catch (e: Throwable) {
+                nlogE("[Proxy] bind", e)
+                throw e
+            }
             serverSocket = ss
             port = ss.localPort
             threadPool.execute {
@@ -1176,6 +1310,7 @@ class AnimeVsubProvider : MainAPI() {
                 when {
                     path == "/stream.m3u8" -> {
                         val body = getM3U8().toByteArray(Charsets.UTF_8)
+                        if (body.isEmpty()) nlog("[Proxy] stream.m3u8 rỗng khi phát (port=$port label=$label)")
                         output.write(("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${body.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}").toByteArray())
                         output.write(body)
                     }
@@ -1210,7 +1345,8 @@ class AnimeVsubProvider : MainAPI() {
                     }
                 }
                 output.flush()
-            } catch (_: Throwable) {
+            } catch (e: Throwable) {
+                nlogE("[ProxySrv]", e, "port=$port")
             } finally {
                 try { client.close() } catch (_: Throwable) {}
             }
@@ -1272,7 +1408,10 @@ class AnimeVsubProvider : MainAPI() {
             return try {
                 segClient.newCall(req).execute().use { resp ->
                     val ct = resp.header("Content-Type")
-                    if (isBlockedResponse(resp.code, ct)) return false
+                    if (isBlockedResponse(resp.code, ct)) {
+                        nlog("[Seg] OKHTTP-ORIGIN ${resp.code} ct=$ct url=...${segUrl.takeLast(40)}")
+                        return false
+                    }
                     val body = resp.body ?: return false
                     val head = StringBuilder("HTTP/1.1 200 OK").append(crlf)
                         .append("Content-Type: video/mp2t").append(crlf)
@@ -1293,7 +1432,10 @@ class AnimeVsubProvider : MainAPI() {
                     }
                     true
                 }
-            } catch (_: Throwable) { false }
+            } catch (e: Throwable) {
+                nlogE("[Seg] OKHTTP-ORIGIN", e, "...${segUrl.takeLast(40)}")
+                false
+            }
         }
 
         private fun viaUrlConnection(segUrl: String, output: java.io.OutputStream, crlf: String, t0: Long): Boolean {
@@ -1330,7 +1472,7 @@ class AnimeVsubProvider : MainAPI() {
                 }
                 true
             } catch (e: Throwable) {
-                nlog("[Seg] URLCONN err ${e.message}")
+                nlogE("[Seg] URLCONN", e, "...${segUrl.takeLast(40)}")
                 false
             }
         }
