@@ -179,7 +179,9 @@ class AnimeVsubProvider : MainAPI() {
     /** <title> đầu tiên của HTML — nhận diện trang gate/challenge trong log. */
     private fun pageTitleOf(html: String): String {
         return try {
-            Regex("""<title[^>]*>(.*?)</title>""", RegexOption.IGNORE_CASE or RegexOption.DOT_MATCHES_ALL)
+            // (?i)=case-insensitive, (?s)=dot-all — inline flags, tránh RegexOption.or
+            // (stdlib Kotlin không có infix 'or' cho RegexOption -> lỗi CI "Unresolved 'or'").
+            Regex("""(?is)<title[^>]*>(.*?)</title>""")
                 .find(html)?.groupValues?.get(1)?.trim()?.take(60) ?: "?"
         } catch (_: Throwable) { "?" }
     }
