@@ -16,6 +16,18 @@
 //    timestamp .SSS + build tag mỗi dòng; nlogE ghi class+stack cho MỌI catch
 //    (v1 nuốt exception im lặng ở ~15 chỗ); loadLinks kết thúc bằng dòng SUMMARY;
 //    ntoast chạy main looper (v1 toast từ coroutine IO bị rơi im lặng).
+//  v3 (25-10-2026, fix theo animevsub_diag.txt THẬT của user — PPG-AN00, Android 17):
+//    * ROOT CAUSE 0-items: Cloudflare trả 403/520 kèm trang challenge ~888KB
+//      KHÔNG chứa keyword nhận dạng nào -> v2 nhận nhầm là nội dung và CACHE 5 phút.
+//      Fix: tryPlainDoc/fetchText CHỈ nhận HTTP 2xx; looksBlocked thêm marker
+//      challenge-platform / challenges.cloudflare.com / turnstile; kết quả WebView
+//      cũng kiểm tra blocked trước khi cache; rethrow CancellationException (bớt noise).
+//    * Log thật: cả 2 CORS proxy đã chết (cors.sh NXDOMAIN, allorigins timeout)
+//      -> circuit breaker tắt proxy 10 phút sau 4 lần fail liên tục.
+//    * Gate "Xác Minh An Toàn" KHÔNG tự giải được bằng HTTP/cookie -> unlockGate():
+//      Dialog WebView full-screen cho user tick "Verify you are human" MỘT LẦN,
+//      bắt DOM qua JS bridge, lưu clearance cookie cho toàn bộ fetch sau đó
+//      (gateMutex + tối đa 1 lần/10 phút, bỏ qua khi không có Activity foreground).
 // URL patterns đã xác minh qua search index + Telegram kênh chính thức (24-10-2026):
 //  - Chi tiết phim : /phim/{slug}-a{id}/          (vd /phim/dogulwang-a6014/)
 //  - Trang xem     : /phim/{slug}-a{id}/xem-phim.html
@@ -28,6 +40,7 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
@@ -67,7 +80,7 @@ class AnimeVsubProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════════
     //  FLAGS / HẰNG SỐ
     // ═══════════════════════════════════════════════════════════════════════════
-    private val AVS_BUILD = "v2"
+    private val AVS_BUILD = "v3"
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -90,6 +103,12 @@ class AnimeVsubProvider : MainAPI() {
         "https://proxy.cors.sh/",
         "https://api.allorigins.win/raw?url="
     )
+
+    // Log thật 25-10: proxy.cors.sh chết (NXDOMAIN), allorigins timeout 10s/trang.
+    // Circuit breaker: sau 4 lần fail liên tục thì tắt proxy 10 phút cho đỡ treo listing.
+    private val proxyFailCount = java.util.concurrent.atomic.AtomicInteger(0)
+    @Volatile private var proxyDisabledUntilMs = 0L
+    private val PROXY_COOLDOWN_MS = 10 * 60 * 1000L
 
     // Host rác không bao giờ là embed player.
     private val junkHosts = listOf(
@@ -176,6 +195,10 @@ class AnimeVsubProvider : MainAPI() {
         nlog("ERROR $tag $cls: $emsg${if (extra.isNotBlank()) " | $extra" else ""}${if (frames.isNotBlank()) " @ $frames" else ""}")
     }
 
+    /** Job bị huỷ (user rời màn hình) — phải ném lại để giữ cấu trúc coroutine, đừng nuốt. */
+    private fun isCancellation(e: Throwable?): Boolean =
+        e is kotlinx.coroutines.CancellationException
+
     /** <title> đầu tiên của HTML — nhận diện trang gate/challenge trong log. */
     private fun pageTitleOf(html: String): String {
         return try {
@@ -212,6 +235,13 @@ class AnimeVsubProvider : MainAPI() {
                lower.contains("verify you are human") ||
                lower.contains("xác minh an toàn") ||
                lower.contains("xác minh bảo mật") ||
+               // v3: log thật 25-10 — trang challenge ~888KB không nói lời nào,
+               // chỉ nhận ra qua script/markup của Turnstile + challenge platform.
+               lower.contains("cdn-cgi/challenge-platform") ||
+               lower.contains("challenges.cloudflare.com") ||
+               lower.contains("cf_chl_opt") ||
+               lower.contains("_cf_chl") ||
+               lower.contains("turnstile") ||
                (lower.contains("cloudflare") && lower.contains("challenge"))
     }
 
@@ -258,6 +288,12 @@ class AnimeVsubProvider : MainAPI() {
                 app.get(url, headers = commonHeaders)
             }
             val html = resp.text
+            // v3: CHỈ nhận 2xx — log thật: Cloudflare trả 403/520 kèm trang challenge
+            // ~888KB không có keyword nhận dạng -> v2 dùng nhầm làm content + cache.
+            if (resp.code !in 200..299) {
+                nlog("[Fetch] plain $tag ${resp.code} REJECT len=${html.length} ms=${System.currentTimeMillis() - t0} $url")
+                return null
+            }
             val blocked = looksBlocked(html)
             if (!blocked) {
                 val doc = resp.document
@@ -270,6 +306,7 @@ class AnimeVsubProvider : MainAPI() {
                 nlog("[Fetch] plain $tag ${resp.code} BLOCKED title='${pageTitleOf(html)}' len=${html.length} ms=${System.currentTimeMillis() - t0} $url")
             }
         } catch (e: Throwable) {
+            if (isCancellation(e)) throw e
             nlogE("[Fetch] plain $tag", e, url)
         }
         return null
@@ -303,29 +340,40 @@ class AnimeVsubProvider : MainAPI() {
             return it
         }
 
-        // ── 2. CORS proxy (chậm ~2.5s, đôi khi lách được vì đi từ Cloudflare edge) ──
-        for (proxy in corsProxies) {
-            val pt0 = System.currentTimeMillis()
-            try {
-                val proxiedUrl = if (proxy.endsWith("?url=")) proxy + URLEncoder.encode(url, "UTF-8") else proxy + url
-                val resp = app.get(proxiedUrl, headers = commonHeaders)
-                val html = resp.text
-                if (!looksBlocked(html)) {
-                    val doc = resp.document
-                    if (doc.body()?.text()?.isNotBlank() == true) {
-                        nlog("[Fetch] proxy ${hostOf(proxy)} OK ${resp.code} len=${html.length} ms=${System.currentTimeMillis() - pt0} $url")
-                        if (useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
-                        return doc
+        // ── 2. CORS proxy + circuit breaker (log thật 25-10: cors.sh NXDOMAIN,
+        //    allorigins timeout 10s/trang -> tắt 10 phút sau 4 lần fail liên tục) ──
+        if (System.currentTimeMillis() >= proxyDisabledUntilMs) {
+            for (proxy in corsProxies) {
+                val pt0 = System.currentTimeMillis()
+                try {
+                    val proxiedUrl = if (proxy.endsWith("?url=")) proxy + URLEncoder.encode(url, "UTF-8") else proxy + url
+                    val resp = app.get(proxiedUrl, headers = commonHeaders)
+                    val html = resp.text
+                    if (resp.code in 200..299 && !looksBlocked(html)) {
+                        val doc = resp.document
+                        if (doc.body()?.text()?.isNotBlank() == true) {
+                            nlog("[Fetch] proxy ${hostOf(proxy)} OK ${resp.code} len=${html.length} ms=${System.currentTimeMillis() - pt0} $url")
+                            proxyFailCount.set(0)
+                            if (useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
+                            return doc
+                        }
                     }
+                    nlog("[Fetch] proxy ${hostOf(proxy)} FAIL ${resp.code} blocked=${looksBlocked(html)} len=${html.length} ms=${System.currentTimeMillis() - pt0} $url")
+                } catch (e: Throwable) {
+                    if (isCancellation(e)) throw e
+                    nlogE("[Fetch] proxy ${hostOf(proxy)}", e, url)
                 }
-                nlog("[Fetch] proxy ${hostOf(proxy)} FAIL ${resp.code} blocked=${looksBlocked(html)} len=${html.length} ms=${System.currentTimeMillis() - pt0} $url")
-            } catch (e: Throwable) {
-                nlogE("[Fetch] proxy ${hostOf(proxy)}", e, url)
+                if (proxyFailCount.incrementAndGet() >= 4) {
+                    proxyDisabledUntilMs = System.currentTimeMillis() + PROXY_COOLDOWN_MS
+                    proxyFailCount.set(0)
+                    nlog("[Fetch] TẮT CORS proxy ${PROXY_COOLDOWN_MS / 60000} phút (fail liên tục)")
+                    break
+                }
             }
         }
 
-        // ── 3. WebView fallback (chậm, serialized) — chính là nơi giải gate/challenge ──
-        return cfMutex.withLock {
+        // ── 3. WebView im lặng (serialized) — Resolver trả trang thật nếu cookie còn hiệu lực ──
+        val silent = cfMutex.withLock {
             // Ai đó có thể đã giải xong trong lúc ta chờ lock.
             if (useCache) {
                 docCache[url]?.let { cached ->
@@ -334,7 +382,10 @@ class AnimeVsubProvider : MainAPI() {
             }
             val fresh = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
             if (fresh != null && fresh != cachedCookies) {
-                tryPlainDoc(url, fresh)?.let { return@withLock it }
+                tryPlainDoc(url, fresh)?.let {
+                    if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
+                    return@withLock it
+                }
             }
 
             nlog("[Fetch] webview fallback $url")
@@ -348,10 +399,31 @@ class AnimeVsubProvider : MainAPI() {
                 }
             } catch (_: Throwable) {}
             val doc = resp.document
+            val html = doc.outerHtml()
+            // v3: kiểm tra blocked TRƯỚC khi cache — log 25-10: webview trả gate
+            // nhanh (484ms) rồi bị cache gây 0 items cho tới hết TTL.
+            if (looksBlocked(html)) {
+                nlog("[Fetch] webview VẪN BLOCKED title='${pageTitleOf(html)}' ms=${System.currentTimeMillis() - wt0} $url")
+                return@withLock null
+            }
             nlog("[Fetch] webview OK ms=${System.currentTimeMillis() - wt0} $url")
             if (useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
             doc
         }
+        if (silent != null) return silent
+
+        // ── 4. Unlock tương tác: Dialog WebView cho user tick "Verify you are human" ──
+        unlockGate(url)?.let {
+            if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
+            return it
+        }
+        // Nếu một unlock khác vừa chạy xong -> clearance cookie mới có thể đã có.
+        tryPlainDoc(url, cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl))?.let {
+            if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
+            return it
+        }
+
+        throw ErrorLoadingException("AnimeVsub: site đang chặn bởi trang xác minh — hãy thử lại và hoàn tất xác minh trong cửa sổ plugin mở ra (xem animevsub_diag.txt)")
     }
 
     /** GET trả về text thô (dùng cho m3u8), có kiểm tra block-page. */
@@ -362,7 +434,10 @@ class AnimeVsubProvider : MainAPI() {
         return try {
             val resp = app.get(url, headers = headers)
             val t = resp.text
-            if (looksBlocked(t)) {
+            if (resp.code !in 200..299) {
+                nlog("[Text] ${resp.code} REJECT len=${t.length} ms=${System.currentTimeMillis() - t0} $short")
+                null
+            } else if (looksBlocked(t)) {
                 nlog("[Text] ${resp.code} BLOCKED title='${pageTitleOf(t)}' len=${t.length} ms=${System.currentTimeMillis() - t0} $short")
                 null
             } else {
@@ -370,6 +445,7 @@ class AnimeVsubProvider : MainAPI() {
                 t
             }
         } catch (e: Throwable) {
+            if (isCancellation(e)) throw e
             nlogE("[Text]", e, short)
             null
         }
@@ -438,6 +514,7 @@ class AnimeVsubProvider : MainAPI() {
                 items = parseCards(doc)
                 if (items.isNotEmpty()) { usedIdx = idx; break }
             } catch (e: Throwable) {
+                if (isCancellation(e)) throw e
                 nlog("[List] candidate fail $url: ${e.message}")
             }
         }
@@ -524,6 +601,7 @@ class AnimeVsubProvider : MainAPI() {
                     return items
                 }
             } catch (e: Throwable) {
+                if (isCancellation(e)) throw e
                 nlog("[Search] candidate fail $url: ${e.message}")
             }
         }
@@ -743,6 +821,7 @@ class AnimeVsubProvider : MainAPI() {
                     }
                     stepNotes.add("S1:${if (linkFound) "HIT" else "0"}")
                 } catch (e: Throwable) {
+                    if (isCancellation(e)) throw e
                     nlogE("[Step1]", e)
                     stepNotes.add("S1:ERR")
                 }
@@ -754,6 +833,7 @@ class AnimeVsubProvider : MainAPI() {
                     if (tryHookFlow(watchUrl, callback)) linkFound = true
                     stepNotes.add("S2:${if (linkFound) "HIT" else "0"}")
                 } catch (e: Throwable) {
+                    if (isCancellation(e)) throw e
                     nlogE("[Step2]", e)
                     stepNotes.add("S2:ERR")
                 }
@@ -796,6 +876,7 @@ class AnimeVsubProvider : MainAPI() {
                     }
                     stepNotes.add("S3:${if (linkFound) "HIT" else "0"}")
                 } catch (e: Throwable) {
+                    if (isCancellation(e)) throw e
                     nlogE("[Step3]", e)
                     stepNotes.add("S3:ERR")
                 }
@@ -819,11 +900,13 @@ class AnimeVsubProvider : MainAPI() {
                                 }
                             }
                         } catch (e: Throwable) {
+                            if (isCancellation(e)) throw e
                             nlogE("[Step4] embed", e, embed.take(60))
                         }
                     }
                     stepNotes.add("S4:${if (linkFound) "HIT" else "0"}")
                 } catch (e: Throwable) {
+                    if (isCancellation(e)) throw e
                     nlogE("[Step4]", e)
                     stepNotes.add("S4:ERR")
                 }
@@ -887,6 +970,7 @@ class AnimeVsubProvider : MainAPI() {
                 }
             }
         } catch (e: Throwable) {
+            if (isCancellation(e)) throw e
             nlogE("[Embed]", e, embed.take(70))
         }
         return false
@@ -1129,6 +1213,151 @@ class AnimeVsubProvider : MainAPI() {
                 nlog("[Hook] ${captureCount.get()} capture, không có playlist khả dụng")
             }
             return registered
+        } finally {
+            try { withContext(Dispatchers.Main) { dialog?.dismiss() } } catch (_: Throwable) {}
+            try { withContext(Dispatchers.Main) { webView?.destroy() } } catch (_: Throwable) {}
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  GATE UNLOCK TƯƠNG TÁC (v3 — log 25-10: gate "Xác Minh An Toàn" không tự giải
+    //  được bằng HTTP/cookie; cần WebView thật + người dùng tick MỘT lần. Sau đó
+    //  clearance cookie dùng lại cho MỌI fetch plain, đúng quy trình NguonC).
+    //  Dialog full-screen nạp targetUrl; JS bridge gửi DOM về mỗi 4s; khi DOM sạch
+    //  (đã qua gate) -> lưu cookie + trả Document. gateMutex bảo đảm 1 dialog; tối
+    //  đa 1 lần chủ động / 10 phút; caller song song sẽ chờ rồi thử plain lại.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private val gateMutex = Mutex()
+    @Volatile private var lastGateAttemptMs = 0L
+    private val GATE_RETRY_MS = 10 * 60 * 1000L
+    private val GATE_OPEN_TIMEOUT_MS = 90_000L
+
+    private val gateDomJs = """
+(function(){
+  if (window.__avsGateLoop) return; window.__avsGateLoop = true;
+  function send(){
+    try {
+      var h = document.documentElement.outerHTML;
+      if (h && h.length > 64) window.__avsGate.onDom(String(location.href), h);
+    } catch (e) {}
+  }
+  send();
+  setInterval(send, 4000);
+})();
+"""
+
+    /** JS -> Kotlin bridge cho gate unlock. Tên object/method KHÁC hook bridge
+     *  (bài học NguonC v3: trùng tên @JavascriptInterface -> StackOverflowError). */
+    private class AvsGateBridge(private val handler: (String, String) -> Unit) {
+        @JavascriptInterface
+        fun onDom(url: String?, html: String?) {
+            if (url.isNullOrBlank() || html.isNullOrBlank()) return
+            try { handler(url, html) } catch (_: Throwable) {}
+        }
+    }
+
+    private suspend fun unlockGate(targetUrl: String): Document? = gateMutex.withLock {
+        if (System.currentTimeMillis() - lastGateAttemptMs < GATE_RETRY_MS) {
+            // Có unlock khác đang chạy/vừa chạy — trả null để caller thử plain lại với cookie mới.
+            nlog("[Gate] bỏ qua (đã có unlock trong ${GATE_RETRY_MS / 60000} phút gần đây)")
+            return@withLock null
+        }
+        lastGateAttemptMs = System.currentTimeMillis()
+
+        val ctx = appContext()
+        if (ctx !is android.app.Activity || ctx.isFinishing) {
+            nlog("[Gate] không có Activity foreground — không mở dialog xác minh")
+            return@withLock null
+        }
+
+        nlog("[Gate] mở dialog xác minh: $targetUrl")
+        ntoast("AnimeVsub: site yêu cầu xác minh — hãy hoàn tất trong cửa sổ vừa mở")
+
+        val done = kotlinx.coroutines.CompletableDeferred<Document?>()
+        var webView: WebView? = null
+        var dialog: android.app.Dialog? = null
+        try {
+            withContext(Dispatchers.Main) {
+                val wv = WebView(ctx)
+                webView = wv
+                wv.settings.javaScriptEnabled = true
+                wv.settings.domStorageEnabled = true
+                wv.settings.userAgentString = USER_AGENT
+                wv.settings.mediaPlaybackRequiresUserGesture = false
+                try { CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true) } catch (_: Throwable) {}
+
+                var lastSig = ""
+                wv.addJavascriptInterface(AvsGateBridge { url, html ->
+                    val sig = html.length.toString() + ":" + html.take(120).hashCode()
+                    if (sig == lastSig) return@AvsGateBridge   // trùng DOM poll trước
+                    lastSig = sig
+                    val blocked = looksBlocked(html)
+                    nlog("[Gate] dom len=${html.length} blocked=$blocked url=${url.take(70)}")
+                    if (!blocked) {
+                        try {
+                            val ck = CookieManager.getInstance().getCookie(mainUrl)
+                            if (!ck.isNullOrBlank()) {
+                                cfCookieCache[mainUrl] = ck.split(";").mapNotNull {
+                                    val idx = it.indexOf('=')
+                                    if (idx <= 0) null else it.substring(0, idx).trim() to it.substring(idx + 1).trim()
+                                }.toMap()
+                                nlog("[Gate] cookie-cache +${cfCookieCache[mainUrl]?.size ?: 0} cookie")
+                            }
+                        } catch (e: Throwable) { nlogE("[Gate] cookie", e) }
+                        try { wv.stopLoading() } catch (_: Throwable) {}
+                        done.complete(Jsoup.parse(html, url))
+                    }
+                }, "__avsGate")
+
+                wv.webChromeClient = WebChromeClient()
+                wv.webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                        try { nlog("[Gate] page-start ${url?.take(90)}") } catch (_: Throwable) {}
+                        view?.evaluateJavascript(gateDomJs, null)
+                    }
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        try { nlog("[Gate] page-finish ${url?.take(90)}") } catch (_: Throwable) {}
+                        view?.evaluateJavascript(gateDomJs, null)
+                    }
+                }
+
+                val dlg = android.app.Dialog(ctx)
+                dlg.setContentView(
+                    wv,
+                    android.view.ViewGroup.LayoutParams(
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                )
+                dlg.window?.setLayout(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                )
+                dlg.setCanceledOnTouchOutside(false)
+                dlg.setCancelable(true)   // Back = huỷ unlock
+                dlg.setOnDismissListener {
+                    try { if (!done.isCompleted) done.complete(null) } catch (_: Throwable) {}
+                }
+                try {
+                    dlg.show()
+                    dialog = dlg
+                } catch (e: Throwable) {
+                    // Vẫn chạy headless — challenge đôi khi tự giải mà không cần user.
+                    nlogE("[Gate] show dialog", e, "chạy headless")
+                    done.complete(null)
+                }
+                wv.loadUrl(targetUrl, mapOf("Referer" to "$mainUrl/"))
+            }
+
+            val t0 = System.currentTimeMillis()
+            val doc = withTimeoutOrNull(GATE_OPEN_TIMEOUT_MS) { done.await() }
+            if (doc != null) {
+                nlog("[Gate] OK trong +${System.currentTimeMillis() - t0}ms")
+            } else {
+                nlog("[Gate] TIMEOUT/HỦY sau ${GATE_OPEN_TIMEOUT_MS / 1000}s")
+            }
+            doc
         } finally {
             try { withContext(Dispatchers.Main) { dialog?.dismiss() } } catch (_: Throwable) {}
             try { withContext(Dispatchers.Main) { webView?.destroy() } } catch (_: Throwable) {}

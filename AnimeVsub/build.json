@@ -1,7 +1,7 @@
 {
   "name": "AnimeVsub",
   "pluginClassName": "com.animevsub.AnimeVsubPlugin",
-  "version": 2,
+  "version": 3,
   "requiresResources": false,
   "description": "Anime vietsub - lồng tiếng từ animevietsub.sale",
   "authors": ["Aho-Repo"],
