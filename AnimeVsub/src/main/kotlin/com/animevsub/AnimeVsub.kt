@@ -1,0 +1,1338 @@
+// AnimeVsub v1 (2026-10-24): CloudStream provider cho https://animevietsub.sale
+// Kiến trúc battle-hardened kế thừa NguonC (Aho-Repo):
+//  - Lớp fetch Cloudflare-aware: doc cache -> plain HTTP + cookie clearance cache
+//    -> CORS proxy -> WebViewResolver fallback (serialized qua mutex, cookie re-captured).
+//    Site chặn TOÀN BỘ request bằng trang gate "Xác Minh An Toàn" (Turnstile) +
+//    cf-mitigated: challenge (curl -> 403, ~895KB challenge page), không có API mở.
+//  - loadLinks đa đường (heuristic vì player nằm sau gate, chưa verify runtime):
+//      STEP 1 plain HTML harvest (m3u8/mp4/iframe) + 1 cấp iframe lồng
+//      STEP 2 WebView + JS hook (patch fetch/XHR) — port từ NguonC streamcHookJs
+//      STEP 3 WebViewResolver broad capture trên trang xem
+//      STEP 4 WebViewResolver broad capture trên từng embed
+//  - HLS proxy cục bộ: /stream.m3u8 rewrite + /seg/ relay (OkHttp -> HttpURLConnection),
+//    streaming 64KB, kiểm tra HTTP status (không bao giờ serve trang Cloudflare làm video).
+//  - Diagnostics: nlog -> logcat + file <externalFilesDir>/animevsub_diag.txt, ntoastV gated.
+// URL patterns đã xác minh qua search index + Telegram kênh chính thức (24-10-2026):
+//  - Chi tiết phim : /phim/{slug}-a{id}/          (vd /phim/dogulwang-a6014/)
+//  - Trang xem     : /phim/{slug}-a{id}/xem-phim.html
+//  - Thể loại      : /the-loai/{slug}/trang-{N}.html  (vd /the-loai/hanh-dong/trang-4.html)
+//  - Nhân vật      : /nhan-vat/{slug}.html        Random: /random-anime
+package com.animevsub
+
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
+import com.lagradost.cloudstream3.plugins.Plugin
+import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.network.WebViewResolver
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+import java.net.URLEncoder
+import android.graphics.Bitmap
+import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.ConcurrentHashMap
+
+@CloudstreamPlugin
+class AnimeVsubPlugin : Plugin() {
+    override fun load() { registerMainAPI(AnimeVsubProvider()) }
+}
+
+class AnimeVsubProvider : MainAPI() {
+    override var mainUrl = "https://animevietsub.sale"
+    override var name = "AnimeVsub"
+    override val hasMainPage = true
+    override var lang = "vi"
+    // Người dùng không chọn tính năng tải xuống cho v1 — bật lại bằng 1 dòng nếu muốn.
+    override val hasDownloadSupport = false
+    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
+
+    private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  FLAGS / HẰNG SỐ
+    // ═══════════════════════════════════════════════════════════════════════════
+    private val AVS_BUILD = "v1"
+
+    // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
+    // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
+    // Khi bật: probe 3 segment đầu, nếu 0 OK và >0 OK từ segment sau -> trim.
+    private val PREFLIGHT_TRIM = false
+
+    // Số embed iframe tối đa được đào mỗi lần loadLinks (chống nổ request).
+    private val MAX_EMBEDS = 3
+
+    // Timeout cho WebView hook flow — trang gate Turnstile có thể cần user tương tác.
+    private val HOOK_TIMEOUT_MS = 60_000L
+
+    private val commonHeaders = mapOf(
+        "User-Agent"      to USER_AGENT,
+        "Accept"          to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language" to "vi-VN,vi;q=0.9"
+    )
+
+    private val corsProxies = listOf(
+        "https://proxy.cors.sh/",
+        "https://api.allorigins.win/raw?url="
+    )
+
+    // Host rác không bao giờ là embed player.
+    private val junkHosts = listOf(
+        "googleads", "doubleclick", "googlesyndication", "google-analytics",
+        "facebook.com", "t.me", "telegram", "twitter.com", "x.com", "disqus",
+        "gravatar", "recaptcha", "cloudflareinsights", "hotjar", "pushnami"
+    )
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  DIAGNOSTICS — logcat + file (kỹ thuật NguonC v6: logcat khó đọc trên một số máy)
+    // ═══════════════════════════════════════════════════════════════════════════
+    private val diagLock = Any()
+    @Volatile private var diagCtx: android.content.Context? = null
+    @Volatile private var diagPathShown = false
+    private val AVS_TOAST_VERBOSE = false
+
+    private fun diagContext(): android.content.Context? {
+        diagCtx?.let { return it }
+        return try {
+            val at = Class.forName("android.app.ActivityThread")
+            val m = at.getDeclaredMethod("currentApplication")
+            m.isAccessible = true
+            (m.invoke(null) as? android.content.Context)?.let {
+                diagCtx = it; it
+            }
+        } catch (_: Throwable) { null }
+    }
+
+    private fun ntoastV(msg: String) { if (AVS_TOAST_VERBOSE) ntoast(msg) }
+
+    private fun ntoast(msg: String) {
+        try {
+            val ctx = diagContext() ?: return
+            android.widget.Toast.makeText(ctx, msg, android.widget.Toast.LENGTH_SHORT).show()
+        } catch (_: Throwable) {}
+    }
+
+    private fun nlog(msg: String) {
+        try { android.util.Log.d("AnimeVsub", msg) } catch (_: Throwable) {}
+        try {
+            val ctx = diagContext() ?: return
+            synchronized(diagLock) {
+                val f = java.io.File(ctx.getExternalFilesDir(null), "animevsub_diag.txt")
+                if (!diagPathShown) {
+                    diagPathShown = true
+                    nlog("diag file: ${f.absolutePath}")
+                }
+                f.appendText("[${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())}] $msg\n")
+                // Giữ file dưới ~512KB để không phình to.
+                if (f.length() > 512 * 1024) {
+                    val lines = f.readLines()
+                    f.writeText(lines.takeLast(2000).joinToString("\n") + "\n")
+                }
+            }
+        } catch (_: Throwable) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  LỚP FETCH CLOUDFLARE-AWARE (port từ NguonC fetchListingDoc + cfCookieCache)
+    //  Thứ tự: cache -> plain HTTP + cookie clearance -> plain không cookie
+    //          -> CORS proxy -> WebViewResolver (serialized, re-capture cookie).
+    //  Site dùng gate "Xác Minh An Toàn" riêng TRƯỚC challenge Cloudflare chuẩn,
+    //  nên looksBlocked() nhận thêm các cụm tiếng Việt của trang gate.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private data class CachedDoc(val doc: Document, val time: Long)
+
+    private val docCache = ConcurrentHashMap<String, CachedDoc>()
+    private val DOC_CACHE_TTL_MS = 5 * 60 * 1000L // 5 phút
+
+    private val cfCookieCache = ConcurrentHashMap<String, Map<String, String>>()
+    private val cfMutex = Mutex()
+
+    private fun looksBlocked(html: String): Boolean {
+        if (html.isBlank()) return true
+        val lower = html.lowercase()
+        return lower.contains("just a moment") ||
+               lower.contains("checking your browser") ||
+               lower.contains("cf-browser-verification") ||
+               lower.contains("attention required") ||
+               lower.contains("verify you are human") ||
+               lower.contains("xác minh an toàn") ||
+               lower.contains("xác minh bảo mật") ||
+               (lower.contains("cloudflare") && lower.contains("challenge"))
+    }
+
+    /** Lấy cookie cf_clearance... mà bất kỳ WebView nào trong app đã thu được. */
+    private fun cookiesFromCookieManager(url: String): Map<String, String>? {
+        return try {
+            val raw = CookieManager.getInstance().getCookie(url) ?: return null
+            if (raw.isBlank()) null
+            else raw.split(";").mapNotNull {
+                val idx = it.indexOf('=')
+                if (idx <= 0) null else it.substring(0, idx).trim() to it.substring(idx + 1).trim()
+            }.toMap().ifEmpty { null }
+        } catch (_: Throwable) { null }
+    }
+
+    private fun absolutize(href: String?): String? {
+        if (href.isNullOrBlank()) return null
+        val h = href.trim().replace("\\/", "/")
+        return when {
+            h.startsWith("http://") || h.startsWith("https://") -> h
+            h.startsWith("//") -> "https:$h"
+            h.startsWith("/")  -> mainUrl + h
+            h.startsWith("about:") || h.startsWith("javascript:") || h.startsWith("data:") -> null
+            else -> "$mainUrl/$h"
+        }
+    }
+
+    private fun hostOf(url: String): String =
+        Regex("""^https?://([^/?#]+)""").find(url)?.groupValues?.get(1)?.lowercase() ?: ""
+
+    private fun isJunkUrl(url: String): Boolean {
+        val h = hostOf(url)
+        if (h.isBlank()) return true
+        return junkHosts.any { h.contains(it) }
+    }
+
+    private suspend fun tryPlainDoc(url: String, cookies: Map<String, String>?): Document? {
+        return try {
+            val resp = if (cookies != null) {
+                app.get(url, headers = commonHeaders, cookies = cookies)
+            } else {
+                app.get(url, headers = commonHeaders)
+            }
+            val html = resp.text
+            if (!looksBlocked(html)) {
+                val doc = resp.document
+                if (doc.body()?.text()?.isNotBlank() == true) return doc
+            }
+            null
+        } catch (_: Throwable) { null }
+    }
+
+    /**
+     * Fetch một trang HTML bất kỳ của site, nhanh nhất có thể.
+     * Sau mỗi lần WebViewResolver thành công, cookies (cf_clearance...) được
+     * cache để các lần gọi plain HTTP sau không phải chạy WebView nữa.
+     */
+    private suspend fun fetchDoc(url: String, useCache: Boolean = true): Document {
+        if (useCache) {
+            docCache[url]?.let { cached ->
+                if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) return cached.doc
+            }
+        }
+
+        // ── 1. Plain HTTP với cookie clearance đã có (nhanh nhất) ──
+        val cachedCookies = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
+        if (cachedCookies != null) {
+            tryPlainDoc(url, cachedCookies)?.let {
+                if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
+                return it
+            }
+        }
+        tryPlainDoc(url, null)?.let {
+            if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
+            return it
+        }
+
+        // ── 2. CORS proxy (chậm ~2.5s, đôi khi lách được vì đi từ Cloudflare edge) ──
+        for (proxy in corsProxies) {
+            try {
+                val proxiedUrl = if (proxy.endsWith("?url=")) proxy + URLEncoder.encode(url, "UTF-8") else proxy + url
+                val resp = app.get(proxiedUrl, headers = commonHeaders)
+                val html = resp.text
+                if (!looksBlocked(html)) {
+                    val doc = resp.document
+                    if (doc.body()?.text()?.isNotBlank() == true) {
+                        if (useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
+                        return doc
+                    }
+                }
+            } catch (_: Throwable) {}
+        }
+
+        // ── 3. WebView fallback (chậm, serialized) — chính là nơi giải gate/challenge ──
+        return cfMutex.withLock {
+            // Ai đó có thể đã giải xong trong lúc ta chờ lock.
+            if (useCache) {
+                docCache[url]?.let { cached ->
+                    if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) return@withLock cached.doc
+                }
+            }
+            val fresh = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
+            if (fresh != null && fresh != cachedCookies) {
+                tryPlainDoc(url, fresh)?.let { return@withLock it }
+            }
+
+            val interceptor = WebViewResolver(Regex(Regex.escape(url)))
+            val resp = app.get(url, headers = commonHeaders, interceptor = interceptor)
+            try {
+                if (resp.cookies.isNotEmpty()) cfCookieCache[mainUrl] = resp.cookies
+            } catch (_: Throwable) {}
+            val doc = resp.document
+            if (useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
+            doc
+        }
+    }
+
+    /** GET trả về text thô (dùng cho m3u8), có kiểm tra block-page. */
+    private suspend fun fetchText(url: String, referer: String?): String? {
+        val headers = if (referer != null) commonHeaders + mapOf("Referer" to referer) else commonHeaders
+        return try {
+            val resp = app.get(url, headers = headers)
+            val t = resp.text
+            if (looksBlocked(t)) null else t
+        } catch (_: Throwable) { null }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  TRANG CHỦ ĐA MỤC + LỌC THỂ LOẠI
+    //  Pattern phân trang thể loại đã xác minh: /the-loai/{slug}/trang-{N}.html
+    //  Phân trang trang chủ chưa xác minh -> thử 2 kiểu, nhớ kiểu thắng cuộc.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    @Volatile private var homePageStyle = 0   // 0: /trang-N.html, 1: ?page=N
+    @Volatile private var genrePageStyle = 0  // 0: trang-N.html, 1: ?page=N
+
+    override val mainPage = mainPageOf(
+        "HOME" to "Mới Cập Nhật",
+        "GENRE::hanh-dong"  to "Hành Động",
+        "GENRE::phieu-luu"  to "Phiêu Lưu",
+        "GENRE::hai-huoc"   to "Hài Hước",
+        "GENRE::ky-ao"      to "Huyền Ảo",
+        "GENRE::sieu-nhien" to "Siêu Nhiên",
+        "GENRE::bi-an"      to "Bí Ẩn",
+        "GENRE::tinh-cam"   to "Tình Cảm",
+        "GENRE::hoc-duong"  to "Học Đường",
+        "GENRE::kinh-di"    to "Kinh Dị",
+        "GENRE::the-thao"   to "Thể Thao",
+        "GENRE::am-nhac"    to "Âm Nhạc"
+    )
+
+    /** Danh sách URL ứng viên cho 1 trang listing — cái nào parse ra card thì dùng. */
+    private fun listingCandidates(data: String, page: Int): List<String> {
+        return if (data == "HOME") {
+            if (page == 1) listOf("$mainUrl/")
+            else when (homePageStyle) {
+                0 -> listOf("$mainUrl/trang-$page.html", "$mainUrl/?page=$page")
+                else -> listOf("$mainUrl/?page=$page", "$mainUrl/trang-$page.html")
+            }
+        } else {
+            val slug = data.removePrefix("GENRE::")
+            if (page == 1) {
+                listOf("$mainUrl/the-loai/$slug/", "$mainUrl/the-loai/$slug/trang-1.html")
+            } else when (genrePageStyle) {
+                0 -> listOf("$mainUrl/the-loai/$slug/trang-$page.html", "$mainUrl/the-loai/$slug/?page=$page")
+                else -> listOf("$mainUrl/the-loai/$slug/?page=$page", "$mainUrl/the-loai/$slug/trang-$page.html")
+            }
+        }
+    }
+
+    private fun rememberPaginationStyle(data: String, page: Int, idx: Int) {
+        if (page == 1) return
+        if (data == "HOME") {
+            if (idx != homePageStyle) homePageStyle = idx
+        } else {
+            if (idx != genrePageStyle) genrePageStyle = idx
+        }
+        nlog("[List] pagination style ${data.take(12)} p$page -> idx=$idx")
+    }
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val candidates = listingCandidates(request.data, page)
+        var items: List<SearchResponse> = emptyList()
+        var usedIdx = -1
+        for ((idx, url) in candidates.withIndex()) {
+            try {
+                val doc = fetchDoc(url)
+                items = parseCards(doc)
+                if (items.isNotEmpty()) { usedIdx = idx; break }
+            } catch (e: Throwable) {
+                nlog("[List] candidate fail $url: ${e.message}")
+            }
+        }
+        if (usedIdx >= 0) rememberPaginationStyle(request.data, page, usedIdx)
+        nlog("[List] ${request.name} p$page -> ${items.size} items")
+        ntoastV("AnimeVsub $AVS_BUILD: ${request.name} p$page — ${items.size} phim")
+        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  PARSE CARD — "anchor harvest" chịu lỗi với markup chưa biết chính xác:
+    //  mọi <a href="/phim/{slug}-a{id}..."> có kèm ảnh/tiêu đề đều là một card.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private val slugIdRegex = Regex("""/phim/([^/?#]+-a\d+)""")
+
+    /** Chuẩn hoá về URL chi tiết dạng /phim/{slug}-a{id}/ (có dấu / cuối). */
+    private fun detailUrl(href: String): String? {
+        val m = slugIdRegex.find(href) ?: return null
+        return "$mainUrl/phim/${m.groupValues[1]}/"
+    }
+
+    private fun pickImgUrl(img: Element): String? {
+        for (attr in listOf("data-src", "data-original", "data-lazy-src", "src")) {
+            val v = img.attr(attr).trim()
+            if (v.isNotBlank() && !v.startsWith("data:")) return v
+        }
+        // srcset: lấy URL đầu tiên.
+        val srcset = img.attr("srcset").trim()
+        if (srcset.isNotBlank()) return srcset.split(",").firstOrNull()?.trim()?.split(" ")?.firstOrNull()
+        return null
+    }
+
+    private fun parseCards(doc: Document): List<SearchResponse> {
+        val out = LinkedHashMap<String, SearchResponse>()
+        for (a in doc.select("a[href*=\"/phim/\"]")) {
+            try {
+                val href = absolutize(a.attr("href")) ?: continue
+                val detail = detailUrl(href) ?: continue
+                val slugId = slugIdRegex.find(detail)!!.groupValues[1]
+                if (out.containsKey(slugId)) continue
+
+                var title = a.attr("title").trim()
+                if (title.isBlank()) title = a.selectFirst("h3, h2, .title, .name, .film-title")?.text()?.trim() ?: ""
+                if (title.isBlank()) title = a.text().trim()
+                if (title.isBlank()) continue
+                // Tiêu đề rác kiểu "Xem phim ..." quá dài thường là link nội dung, bỏ.
+                if (title.length > 120) continue
+
+                val img = a.selectFirst("img")
+                    ?: a.closest("li, .item, .card, .movie-item, .film-item, article, div")
+                        ?.selectFirst("img")
+                val poster = img?.let { absolutize(pickImgUrl(it)) }
+
+                out[slugId] = newAnimeSearchResponse(title, detail, TvType.Anime) {
+                    this.posterUrl = poster
+                }
+            } catch (_: Throwable) {}
+        }
+        return out.values.toList()
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  TÌM KIẾM — site không có JSON API mở (mọi đường đều 403), dùng trang
+    //  /tim-kiem với nhiều biến thể URL; biến thể nào parse ra card thì thắng.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    override suspend fun search(query: String): List<SearchResponse> {
+        val keyword = URLEncoder.encode(query.trim(), "UTF-8")
+        val candidates = listOf(
+            "$mainUrl/tim-kiem?keyword=$keyword",
+            "$mainUrl/tim-kiem/$keyword",
+            "$mainUrl/tim-kiem.html?keyword=$keyword",
+            "$mainUrl/?s=$keyword"
+        )
+        for (url in candidates) {
+            try {
+                val doc = fetchDoc(url)
+                val items = parseCards(doc)
+                if (items.isNotEmpty()) {
+                    nlog("[Search] '$query' -> ${items.size} @ $url")
+                    return items
+                }
+            } catch (e: Throwable) {
+                nlog("[Search] candidate fail $url: ${e.message}")
+            }
+        }
+        nlog("[Search] '$query' -> 0 kết quả sau ${candidates.size} biến thể")
+        return emptyList()
+    }
+
+    /** "Tập 1" / "Ep 1" / "Episode 1" / "1" / "01" -> "1"; "OVA" giữ nguyên. */
+    private fun normalizeEpName(raw: String?): String {
+        if (raw.isNullOrBlank()) return "0"
+        val s = raw.trim()
+        val numMatch = Regex("""(\d+)""").find(s)
+        if (numMatch != null) return numMatch.groupValues[1].trimStart('0').ifBlank { "0" }
+        return s
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  LOAD — chi tiết phim
+    //  Tập phim: gom mọi <a href="...xem-phim..."> trên trang chi tiết, gộp theo
+    //  số tập (multi-server sẽ hiện ở mức link — loadLinks trả nhiều link/tập).
+    //  Nếu trang chi tiết không có link tập, fallback dựng từ "Số tập" info.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    override suspend fun load(url: String): LoadResponse {
+        val detail = detailUrl(url) ?: url
+        val doc = fetchDoc(detail)
+
+        // ── Tiêu đề ──
+        var title = doc.selectFirst("h1")?.text()?.trim() ?: ""
+        if (title.isBlank()) title = doc.selectFirst("meta[property=\"og:title\"]")?.attr("content")?.trim() ?: ""
+        if (title.isBlank()) title = doc.title().trim().substringBefore("|").trim()
+        if (title.isBlank()) throw ErrorLoadingException("Không đọc được tên phim")
+
+        // ── Poster ──
+        var poster = doc.selectFirst("meta[property=\"og:image\"]")?.attr("content")?.trim() ?: ""
+        if (poster.isBlank()) {
+            poster = doc.selectFirst(".poster img, .image img, .thumb img, .film-poster img, img[src*=\"upload\"], img[data-src*=\"upload\"]")
+                ?.let { pickImgUrl(it) } ?: ""
+        }
+
+        // ── Nội dung ──
+        var plot = doc.selectFirst("meta[name=\"description\"]")?.attr("content")?.trim() ?: ""
+        for (sel in listOf(".description", ".film-description", "#bio", ".story", "[class*=descript]", ".content-detail")) {
+            if (plot.isNotBlank()) break
+            plot = doc.selectFirst(sel)?.text()?.trim() ?: ""
+        }
+        if (plot.isBlank()) plot = doc.selectFirst("meta[property=\"og:description\"]")?.attr("content")?.trim() ?: ""
+
+        // ── Tags: mọi link /the-loai/ trên trang đều là thể loại (chịu lỗi layout) ──
+        val tags = doc.select("a[href*=\"/the-loai/\"]")
+            .map { it.text().trim() }
+            .filter { it.isNotBlank() && it.length < 40 }
+            .distinct()
+            .take(12)
+
+        // ── Năm phát hành: ưu tiên vùng info, fallback og:title / text trang ──
+        val infoText = doc.select("li, dt, dd, .info, [class*=meta], p")
+            .joinToString(" ") { it.text() }
+        val year = Regex("""(?:Năm|Phát hành|Năm phát hành)\D{0,12}((?:19|20)\d{2})""", RegexOption.IGNORE_CASE)
+            .find(infoText)?.groupValues?.get(1)?.toIntOrNull()
+            ?: Regex("""\b((?:19|20)\d{2})\b""").find(title)?.groupValues?.get(1)?.toIntOrNull()
+
+        // ── Số tập khai báo (dùng cho fallback) ──
+        val totalEps = Regex("""(\d+)\s*(?:tập|episodes?)""", RegexOption.IGNORE_CASE)
+            .find(infoText + " " + title)?.groupValues?.get(1)?.toIntOrNull()
+
+        // ── Trích xuất tập: mọi anchor dẫn tới trang xem ──
+        val epOrder = LinkedHashMap<String, String>()   // epName(normalized) -> watchUrl đầu tiên gặp
+        val seenUrls = HashSet<String>()
+
+        for (a in doc.select("a[href]")) {
+            val href = absolutize(a.attr("href")) ?: continue
+            if (!href.contains("xem-phim")) continue
+            if (seenUrls.contains(href)) continue
+
+            // Tên tập: text anchor, hoặc từ href (tap-3.html / ep=3 / tap-3)
+            var rawName = a.text().trim()
+            if (rawName.isBlank() || rawName.length > 40) {
+                rawName = Regex("""(?:tap|ep|tap-phim)[=\-/]?(\d+)""", RegexOption.IGNORE_CASE)
+                    .find(href)?.groupValues?.get(1) ?: ""
+            }
+            val epName = normalizeEpName(rawName)
+            seenUrls.add(href)
+            if (!epOrder.containsKey(epName)) epOrder[epName] = href
+        }
+
+        nlog("[Load] $detail title='$title' tags=${tags.size} eps=${epOrder.size} totalEps=$totalEps")
+        ntoastV("AnimeVsub $AVS_BUILD: $title — ${epOrder.size} tập")
+
+        // ── Fallback: không có anchor tập -> dựng URL xem dạng chuẩn CMS ──
+        if (epOrder.isEmpty()) {
+            val n = totalEps ?: throw ErrorLoadingException("Không tìm thấy tập phim nào")
+            if (n in 1..2000) {
+                val base = detail.trimEnd('/')
+                for (i in 1..n) epOrder[i.toString()] = "$base/xem-phim.html?ep=$i"
+                nlog("[Load] fallback dựng $n tập từ info")
+            }
+        }
+
+        if (epOrder.isEmpty()) throw ErrorLoadingException("Không tìm thấy tập phim nào")
+
+        val episodes = epOrder.map { (epName, watchUrl) ->
+            newEpisode(watchUrl) {
+                this.name    = "Tập $epName"
+                this.episode = epName.toIntOrNull()
+            }
+        }.sortedBy { it.episode ?: Int.MAX_VALUE }
+
+        return newTvSeriesLoadResponse(title, detail, TvType.Anime, episodes) {
+            this.posterUrl = poster.takeIf { it.isNotBlank() }
+            this.plot      = plot.takeIf { it.isNotBlank() }
+            this.tags      = tags
+            this.year      = year
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  LOADLINKS — chuỗi chiến lược đa đường (player nằm sau gate, v1 dùng heuristic)
+    //   STEP 1: HTML trang xem -> harvest m3u8/mp4 + iframe embed (1 cấp lồng)
+    //   STEP 2: WebView + JS hook (fetch/XHR) — bắt playlist ngay khi player nạp
+    //   STEP 3: WebViewResolver broad trên trang xem
+    //   STEP 4: WebViewResolver broad trên từng embed
+    //  Mỗi đường đăng ký qua registerM3U8Link (proxy cục bộ) hoặc link VIDEO thẳng.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private val m3u8UrlRegex =
+        Regex("""https?://[^"'\s<>\\]+?\.m3u[89](?:\?[^"'\s<>\\]*)?""", RegexOption.IGNORE_CASE)
+    private val mp4UrlRegex =
+        Regex("""https?://[^"'\s<>\\]+?\.(?:mp4|m4v)(?:\?[^"'\s<>\\]*)?""", RegexOption.IGNORE_CASE)
+
+    /** Unescape "\/" từ JSON-embedded URL rồi harvest m3u8/mp4. */
+    private fun harvestMediaUrls(html: String): Pair<List<String>, List<String>> {
+        val unescaped = html.replace("\\/", "/")
+        val m3u8 = m3u8UrlRegex.findAll(unescaped)
+            .map { it.value }.distinct().toList()
+        val mp4 = mp4UrlRegex.findAll(unescaped)
+            .map { it.value }.distinct().toList()
+        return m3u8 to mp4
+    }
+
+    private fun harvestIframes(doc: Document): List<String> {
+        return doc.select("iframe, source, embed").mapNotNull { el ->
+            val raw = el.attr("src").ifBlank { el.attr("data-src") }
+            val src = absolutize(raw)
+            src?.takeIf { !isJunkUrl(it) && !it.startsWith("data:") }
+        }.distinct()
+    }
+
+    /** Bỏ đuôi xem-phim để lấy base chi tiết, dùng làm Referer hợp lệ. */
+    private fun detailBaseOf(watchUrl: String): String {
+        val base = watchUrl.substringBefore("xem-phim").trimEnd('/')
+        return if (base.contains("/phim/")) base else mainUrl
+    }
+
+    override suspend fun loadLinks(
+        data:             String,
+        isCasting:        Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback:         (ExtractorLink) -> Unit
+    ): Boolean {
+        var linkFound = false
+
+        // CloudStream chạy fixUrl() trên data của newEpisode — nếu data đã là URL
+        // tuyệt đối thì giữ nguyên; nếu là URL chi tiết thì dựng trang xem chuẩn.
+        var watchUrl = data.trim()
+        if (!watchUrl.contains("xem-phim") && watchUrl.contains("/phim/")) {
+            watchUrl = watchUrl.trimEnd('/') + "/xem-phim.html"
+        }
+        nlog("[loadLinks] watch=$watchUrl")
+        ntoastV("AnimeVsub $AVS_BUILD: đang lấy link…")
+
+        coroutineScope {
+            // ═══ STEP 1: HTML trang xem (plain HTTP + cookie clearance) ═══
+            if (!linkFound) {
+                try {
+                    val doc = fetchDoc(watchUrl, useCache = false)
+                    val html = doc.outerHtml()
+
+                    val (m3u8s, mp4s) = harvestMediaUrls(html)
+                    for (m3u8 in m3u8s) {
+                        val content = fetchText(m3u8, referer = detailBaseOf(watchUrl)) ?: continue
+                        if (content.contains("#EXTM3U")) {
+                            if (registerM3U8Link(content, m3u8, detailBaseOf(watchUrl), "Vietsub", callback)) {
+                                linkFound = true
+                            }
+                        }
+                        if (linkFound) break
+                    }
+                    if (!linkFound) {
+                        for (mp4 in mp4s) {
+                            callback(newExtractorLink(name, "MP4", mp4, ExtractorLinkType.VIDEO) {
+                                quality = Qualities.P720.value
+                                headers = mapOf("User-Agent" to USER_AGENT, "Referer" to detailBaseOf(watchUrl))
+                            })
+                            linkFound = true
+                            break
+                        }
+                    }
+
+                    // ── Nếu chưa có: đào iframe embed (tối đa MAX_EMBEDS, song song) ──
+                    if (!linkFound) {
+                        val embeds = harvestIframes(doc).take(MAX_EMBEDS)
+                        nlog("[Step1] iframes=${embeds.size} ${embeds.joinToString(" | ") { it.take(70) }}")
+                        val results = embeds.map { embed ->
+                            async { extractFromEmbed(embed, watchUrl, callback) }
+                        }.awaitAll()
+                        linkFound = results.any { it }
+                    }
+                } catch (e: Throwable) {
+                    nlog("[Step1] error: ${e.message}")
+                }
+            }
+
+            // ═══ STEP 2: WebView + JS hook (giải gate Turnstile + bắt playlist) ═══
+            if (!linkFound) {
+                try {
+                    if (tryHookFlow(watchUrl, callback)) linkFound = true
+                } catch (e: Throwable) {
+                    nlog("[Step2] error: ${e.message}")
+                }
+            }
+
+            // ═══ STEP 3: WebViewResolver broad trên trang xem ═══
+            if (!linkFound) {
+                try {
+                    val resp = app.get(watchUrl, interceptor = WebViewResolver(
+                        Regex(""".*\.(m3u8|m3u9|mp4)(\?|$)""")
+                    ), headers = commonHeaders)
+                    val content = resp.text
+                    val capturedUrl = resp.url ?: ""
+                    if (content.contains("#EXTM3U")) {
+                        if (registerM3U8Link(content, capturedUrl.ifBlank { watchUrl }, "", "Vietsub", callback)) {
+                            linkFound = true
+                        }
+                    } else {
+                        val (m3u8s, mp4s) = harvestMediaUrls(content)
+                        val firstM3u8 = m3u8s.firstOrNull()
+                        val firstMp4 = mp4s.firstOrNull()
+                        if (firstM3u8 != null) {
+                            val c = fetchText(firstM3u8, referer = watchUrl)
+                            if (c != null && c.contains("#EXTM3U") &&
+                                registerM3U8Link(c, firstM3u8, detailBaseOf(watchUrl), "Vietsub", callback)) {
+                                linkFound = true
+                            }
+                        } else if (firstMp4 != null) {
+                            callback(newExtractorLink(name, "MP4", firstMp4, ExtractorLinkType.VIDEO) {
+                                quality = Qualities.P720.value
+                                headers = mapOf("User-Agent" to USER_AGENT, "Referer" to watchUrl)
+                            })
+                            linkFound = true
+                        }
+                    }
+                } catch (e: Throwable) {
+                    nlog("[Step3] error: ${e.message}")
+                }
+            }
+
+            // ═══ STEP 4: WebViewResolver broad trên từng embed (nếu còn đường) ═══
+            if (!linkFound) {
+                try {
+                    val embeds = harvestIframes(fetchDoc(watchUrl, useCache = false)).take(MAX_EMBEDS)
+                    for (embed in embeds) {
+                        try {
+                            val resp = app.get(embed, interceptor = WebViewResolver(
+                                Regex(""".*\.(m3u8|m3u9|mp4)(\?|$)""")
+                            ), headers = commonHeaders + mapOf("Referer" to watchUrl))
+                            val content = resp.text
+                            if (content.contains("#EXTM3U")) {
+                                if (registerM3U8Link(content, resp.url ?: embed, "", "Vietsub", callback)) {
+                                    linkFound = true; break
+                                }
+                            }
+                        } catch (_: Throwable) {}
+                    }
+                } catch (_: Throwable) {}
+            }
+        }
+
+        nlog("[loadLinks] result=$linkFound watch=$watchUrl")
+        if (!linkFound) ntoast("AnimeVsub $AVS_BUILD: không lấy được link — xem animevsub_diag.txt")
+        return linkFound
+    }
+
+    /** Đào 1 embed: HTML -> m3u8/mp4; nếu không thấy, đào iframe lồng thêm 1 cấp. */
+    private suspend fun extractFromEmbed(
+        embed: String, watchUrl: String, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        try {
+            val doc = fetchDoc(embed, useCache = false)
+            val html = doc.outerHtml()
+            val embedOrigin = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: mainUrl
+
+            val (m3u8s, mp4s) = harvestMediaUrls(html)
+            nlog("[Embed] $embed -> m3u8=${m3u8s.size} mp4=${mp4s.size}")
+
+            for (m3u8 in m3u8s) {
+                val content = fetchText(m3u8, referer = embedOrigin) ?: continue
+                if (content.contains("#EXTM3U") &&
+                    registerM3U8Link(content, m3u8, embedOrigin, "Vietsub", callback)) {
+                    return true
+                }
+            }
+            mp4s.firstOrNull()?.let {
+                callback(newExtractorLink(name, "MP4", it, ExtractorLinkType.VIDEO) {
+                    quality = Qualities.P720.value
+                    headers = mapOf("User-Agent" to USER_AGENT, "Referer" to embedOrigin)
+                })
+                return true
+            }
+
+            // 1 cấp lồng: embed lại chứa iframe con.
+            val nested = harvestIframes(doc).filter { it != embed }.firstOrNull()
+            if (nested != null) {
+                val nestedDoc = fetchDoc(nested, useCache = false)
+                val nestedHtml = nestedDoc.outerHtml()
+                val nestedOrigin = Regex("""^(https?://[^/]+)""").find(nested)?.groupValues?.get(1) ?: embedOrigin
+                val (nm3u8, nmp4) = harvestMediaUrls(nestedHtml)
+                for (m3u8 in nm3u8) {
+                    val content = fetchText(m3u8, referer = nestedOrigin) ?: continue
+                    if (content.contains("#EXTM3U") &&
+                        registerM3U8Link(content, m3u8, nestedOrigin, "Vietsub", callback)) {
+                        return true
+                    }
+                }
+                nmp4.firstOrNull()?.let {
+                    callback(newExtractorLink(name, "MP4", it, ExtractorLinkType.VIDEO) {
+                        quality = Qualities.P720.value
+                        headers = mapOf("User-Agent" to USER_AGENT, "Referer" to nestedOrigin)
+                    })
+                    return true
+                }
+            }
+        } catch (e: Throwable) {
+            nlog("[Embed] $embed error: ${e.message}")
+        }
+        return false
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  WEBVIEW + JS HOOK FLOW (port từ NguonC tryStreamcWebViewFlow v5/v14)
+    //  WebView nạp trang xem; hook JS monkey-patch window.fetch + XMLHttpRequest
+    //  để bắt mọi response chứa playlist (#EXTM3U hoặc URL .m3u8). Trang gate
+    //  "Xác Minh An Toàn"/Turnstile tự giải trong WebView thật của thiết bị; khi
+    //  có Activity, WebView được đặt trong Dialog full-screen để người dùng có
+    //  thể tick "Verify you are human" nếu cần.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private val avsHookJs = """
+(function(){
+  if (window.__avsHooked) return; window.__avsHooked = true;
+  function abs(u){
+    var s = String(u);
+    if (s.indexOf('http') === 0) return s;
+    if (s.charAt(0) === '/') return location.origin + s;
+    return location.origin + '/' + s;
+  }
+  function pass(u, b){
+    try {
+      if (!b || b.length < 8) return;
+      var sig = (String(u).length + ':' + b.length + ':' + b.substring(0, 24));
+      window.__avsSeen = window.__avsSeen || {};
+      if (window.__avsSeen[sig]) return;
+      if (Object.keys(window.__avsSeen).length > 64) window.__avsSeen = {};
+      window.__avsSeen[sig] = 1;
+      var s = String(u);
+      var isPlaylist = b.indexOf('#EXTM3U') >= 0;
+      var isMediaUrl = s.indexOf('.m3u8') >= 0 || s.indexOf('.m3u9') >= 0 || s.indexOf('.mp4') >= 0;
+      if (isPlaylist || (isMediaUrl && s.indexOf('http') === 0)) {
+        window.__avsBridge.onCapture(abs(u), b);
+      }
+    } catch (e) {}
+  }
+  function xhrText(x){
+    try { return x.responseText; } catch (e) {}
+    try { return new TextDecoder('utf-8').decode(x.response); } catch (e) {}
+    return null;
+  }
+  try {
+    var of = window.fetch;
+    if (of) {
+      window.fetch = function(){
+        var args = arguments;
+        var u = (args[0] && args[0].url) ? String(args[0].url) : String(args[0]);
+        return of.apply(this, args).then(function(res){
+          try { res.clone().text().then(function(t){ pass(u, t); }, function(){}); } catch (e) {}
+          return res;
+        });
+      };
+    }
+  } catch (e) {}
+  try {
+    var oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(m, u){ this.__avsU = u; return oo.apply(this, arguments); };
+    XMLHttpRequest.prototype.send = function(){
+      var self = this;
+      this.addEventListener('load', function(){
+        try { var t = xhrText(self); if (t) { pass(self.__avsU, t); } } catch (e) {}
+      });
+      return os.apply(this, arguments);
+    };
+  } catch (e) {}
+})();
+"""
+
+    /** JS -> Kotlin bridge. Kotlin handler không được trùng tên @JavascriptInterface
+     *  (bài học NguonC v3: trùng tên -> StackOverflowError giết cả data path). */
+    private class AvsCaptureBridge(
+        private val handler: (String, String) -> Unit
+    ) {
+        @JavascriptInterface
+        fun onCapture(url: String?, body: String?) {
+            if (url.isNullOrBlank() || body.isNullOrBlank()) return
+            try { handler(url, body) } catch (_: Throwable) {}
+        }
+    }
+
+    /** Context cho WebView: Activity foreground của CloudStream -> Application. */
+    private fun appContext(): android.content.Context? {
+        try {
+            val cls = Class.forName("com.lagradost.cloudstream3.CommonActivity")
+            for (name in listOf("activity", "currentActivity")) {
+                try {
+                    val f = cls.getDeclaredField(name)
+                    f.isAccessible = true
+                    (f.get(null) as? android.content.Context)?.let { return it }
+                } catch (_: Throwable) {}
+            }
+        } catch (_: Throwable) {}
+        return diagContext()
+    }
+
+    private suspend fun tryHookFlow(targetUrl: String, callback: (ExtractorLink) -> Unit): Boolean {
+        val flowT0 = System.currentTimeMillis()
+        var webView: WebView? = null
+        var dialog: android.app.Dialog? = null
+        try {
+            val ctx = appContext()
+            if (ctx == null) {
+                nlog("[Hook] không có app context cho WebView")
+                return false
+            }
+
+            val captures = Channel<Pair<String, String>>(Channel.UNLIMITED)
+
+            withContext(Dispatchers.Main) {
+                val wv = WebView(ctx)
+                webView = wv
+                wv.settings.javaScriptEnabled = true
+                wv.settings.domStorageEnabled = true
+                wv.settings.allowFileAccess = false
+                wv.settings.allowContentAccess = false
+                wv.settings.mediaPlaybackRequiresUserGesture = false
+                try { CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true) } catch (_: Throwable) {}
+                wv.addJavascriptInterface(
+                    AvsCaptureBridge { url, body ->
+                        nlog("[Hook] bridge +${System.currentTimeMillis() - flowT0}ms url=${url.take(60)} len=${body.length} head=${body.take(12)}")
+                        captures.trySend(url to body)
+                    },
+                    "__avsBridge"
+                )
+                wv.webChromeClient = WebChromeClient()
+                wv.webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                        view?.evaluateJavascript(avsHookJs, null)
+                    }
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        view?.evaluateJavascript(avsHookJs, null)
+                    }
+                    override fun onReceivedError(
+                        view: WebView?, request: android.webkit.WebResourceRequest?, error: android.webkit.WebResourceError?
+                    ) {
+                        try { nlog("[Hook] WV error ${error?.errorCode} ${error?.description} ${request?.url}") } catch (_: Throwable) {}
+                    }
+                }
+
+                // Dialog full-screen khi có Activity: gate Turnstile có người dùng hỗ trợ tick.
+                if (ctx is android.app.Activity && !ctx.isFinishing) {
+                    try {
+                        val dlg = android.app.Dialog(ctx)
+                        dlg.setContentView(
+                            wv,
+                            android.view.ViewGroup.LayoutParams(
+                                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                                android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                            )
+                        )
+                        dlg.window?.setLayout(
+                            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                            android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                        dlg.setCanceledOnTouchOutside(false)
+                        dlg.setOnDismissListener { captures.close() }
+                        dlg.show()
+                        dialog = dlg
+                    } catch (e: Throwable) {
+                        nlog("[Hook] dialog unavailable (${e.message}), chạy headless")
+                    }
+                }
+
+                wv.loadUrl(targetUrl, mapOf("Referer" to "$mainUrl/"))
+            }
+
+            var registered = false
+            withTimeoutOrNull(HOOK_TIMEOUT_MS) {
+                var tries = 0
+                while (!registered && tries < 6) {
+                    tries++
+                    val (capUrl, capBody) = captures.receive()
+                    // Có playlist -> dừng trang để player không tải tiếp quảng cáo/segment.
+                    try {
+                        withContext(Dispatchers.Main) {
+                            webView?.stopLoading()
+                            webView?.loadUrl("about:blank")
+                        }
+                    } catch (_: Throwable) {}
+
+                    val body = capBody.trim()
+                    if (body.startsWith("#EXTM3U")) {
+                        val base = Regex("""^(https?://[^/]+/.*/)""").find(capUrl)?.groupValues?.get(1) ?: ""
+                        if (registerM3U8Link(body, capUrl, base, "Vietsub", callback)) {
+                            registered = true
+                        }
+                    } else {
+                        val (m3u8s, mp4s) = harvestMediaUrls(body)
+                        val m3u8 = m3u8s.firstOrNull()
+                        when {
+                            m3u8 != null -> {
+                                val origin = Regex("""^(https?://[^/]+)""").find(m3u8)?.groupValues?.get(1) ?: ""
+                                val content = fetchText(m3u8, referer = origin.ifBlank { targetUrl })
+                                if (content != null && content.contains("#EXTM3U") &&
+                                    registerM3U8Link(content, m3u8, origin, "Vietsub", callback)) {
+                                    registered = true
+                                }
+                            }
+                            mp4s.firstOrNull() != null -> {
+                                callback(newExtractorLink(name, "MP4", mp4s.first(), ExtractorLinkType.VIDEO) {
+                                    quality = Qualities.P720.value
+                                    headers = mapOf("User-Agent" to USER_AGENT, "Referer" to targetUrl)
+                                })
+                                registered = true
+                            }
+                        }
+                    }
+                }
+                registered
+            }
+
+            // Cookie clearance từ WebView dùng lại cho plain HTTP các lần sau.
+            try {
+                val cookies = CookieManager.getInstance().getCookie(mainUrl)
+                if (!cookies.isNullOrBlank()) {
+                    cfCookieCache[mainUrl] = cookies.split(";").mapNotNull {
+                        val idx = it.indexOf('=')
+                        if (idx <= 0) null else it.substring(0, idx).trim() to it.substring(idx + 1).trim()
+                    }.toMap()
+                }
+            } catch (_: Throwable) {}
+
+            if (registered) nlog("[Hook] OK trong +${System.currentTimeMillis() - flowT0}ms")
+            return registered
+        } finally {
+            try { withContext(Dispatchers.Main) { dialog?.dismiss() } } catch (_: Throwable) {}
+            try { withContext(Dispatchers.Main) { webView?.destroy() } } catch (_: Throwable) {}
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  HLS PROXY CỤC BỘ (port gọn từ NguonCProxyServer)
+    //  Serve /stream.m3u8 (playlist đã rewrite) + /seg/{url-encoded} (relay segment).
+    //  Mỗi segment thử OkHttp (app.baseClient) rồi HttpURLConnection; stream 64KB;
+    //  KHÔNG BAO GIỜ serve trang Cloudflare/HTML làm video (check status + content-type).
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private val activeServers = mutableListOf<AvsProxyServer>()
+
+    private fun rewriteM3U8(m3u8: String, proxyBase: String, m3u8BaseUrl: String = ""): String {
+        return m3u8.lines().joinToString("\n") { line ->
+            val trimmed = line.trim()
+            if (trimmed.startsWith("#") || trimmed.isBlank()) {
+                line
+            } else if (trimmed.startsWith("http")) {
+                "$proxyBase/seg/${URLEncoder.encode(trimmed, "UTF-8")}"
+            } else if (trimmed.isNotEmpty()) {
+                val resolvedUrl = if (m3u8BaseUrl.isNotEmpty()) {
+                    "${m3u8BaseUrl.trimEnd('/')}/$trimmed"
+                } else {
+                    trimmed
+                }
+                if (resolvedUrl.startsWith("http")) {
+                    "$proxyBase/seg/${URLEncoder.encode(resolvedUrl, "UTF-8")}"
+                } else {
+                    line
+                }
+            } else {
+                line
+            }
+        }
+    }
+
+    /** Probe 3 segment đầu; trả về số segment đầu cần cắt (0 nếu không cần). */
+    private suspend fun preflightTrimCount(segUrls: List<String>, referer: String): Int {
+        if (!PREFLIGHT_TRIM || segUrls.isEmpty()) return 0
+        val probe = segUrls.take(3)
+        var firstOk = -1
+        probe.forEachIndexed { idx, segUrl ->
+            val ok = try {
+                val req = okhttp3.Request.Builder().url(segUrl)
+                    .header("User-Agent", USER_AGENT)
+                    .header("Referer", referer)
+                    .header("Range", "bytes=0-1024")
+                    .build()
+                segClient.newCall(req).execute().use { resp ->
+                    resp.code in 200..299 &&
+                        !(resp.header("Content-Type") ?: "").contains("text/html", ignoreCase = true)
+                }
+            } catch (_: Throwable) { false }
+            if (ok && firstOk < 0) firstOk = idx
+        }
+        return if (firstOk > 0) firstOk else 0
+    }
+
+    /** Tạo proxy server cho 1 playlist và phát link ExtractorLink về CloudStream. */
+    private suspend fun registerM3U8Link(
+        m3u8Content: String, referer: String, m3u8BaseUrl: String,
+        serverName: String, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        if (!m3u8Content.contains("#EXTM3U")) return false
+
+        val segUrls = m3u8Content.lines().map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("#") }
+            .map { if (it.startsWith("http") || m3u8BaseUrl.isEmpty()) it else m3u8BaseUrl.trimEnd('/') + "/" + it }
+        nlog("[Register] '$serverName' segments=${segUrls.size} first=${segUrls.firstOrNull()?.take(100)} referer=${referer.take(60)}")
+
+        val trim = preflightTrimCount(segUrls, referer)
+        if (trim > 0) nlog("[Register] trim $trim segment đầu (probe chặn)")
+
+        // Giới hạn số proxy server sống đồng thời (tránh cạn port trong session dài).
+        synchronized(activeServers) {
+            while (activeServers.size >= 8) {
+                try { activeServers.removeAt(0).stop() } catch (_: Throwable) {}
+            }
+        }
+
+        val server = AvsProxyServer(referer)
+        server.label = serverName
+        server.start()
+        synchronized(activeServers) { activeServers.add(server) }
+
+        val proxyBase = "http://127.0.0.1:${server.port}"
+        server.setM3U8(rewriteM3U8(trimLeadingSegments(m3u8Content, trim), proxyBase, m3u8BaseUrl))
+        callback(newExtractorLink(name, serverName, "$proxyBase/stream.m3u8", ExtractorLinkType.M3U8) {
+            quality = Qualities.P1080.value
+            headers = mapOf("User-Agent" to USER_AGENT)
+        })
+        nlog("[Register] emitted $proxyBase/stream.m3u8 segs=${segUrls.size}")
+        return true
+    }
+
+    private fun trimLeadingSegments(m3u8: String, count: Int): String {
+        if (count <= 0) return m3u8
+        val out = ArrayList<String>()
+        val pending = ArrayList<String>()
+        var idx = 0
+        for (line in m3u8.lines()) {
+            val t = line.trim()
+            if (t.isEmpty()) { out.add(line); continue }
+            if (t.startsWith("#EXTINF") || t.startsWith("#EXT-X-BYTERANGE") ||
+                t.startsWith("#EXT-X-DISCONTINUITY") || t.startsWith("#EXT-X-PROGRAM-DATE-TIME")) {
+                pending.add(line)
+            } else if (t.startsWith("#")) {
+                out.add(line)
+            } else {
+                if (idx >= count) { out.addAll(pending); out.add(line) }
+                pending.clear()
+                idx++
+            }
+        }
+        return out.joinToString("\n")
+    }
+
+    private val segClient: okhttp3.OkHttpClient by lazy { app.baseClient }
+
+    private inner class AvsProxyServer(private val referer: String) {
+        @Volatile var label: String = ""
+        @Volatile var port: Int = -1
+            private set
+
+        private var serverSocket: java.net.ServerSocket? = null
+        private val threadPool = java.util.concurrent.Executors.newCachedThreadPool()
+        @Volatile private var _m3u8: String = ""
+        private val okLogCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+        fun getM3U8(): String = _m3u8
+        fun setM3U8(v: String) { _m3u8 = v }
+
+        fun start() {
+            val ss = java.net.ServerSocket(0, 64, java.net.InetAddress.getByName("127.0.0.1"))
+            serverSocket = ss
+            port = ss.localPort
+            threadPool.execute {
+                try {
+                    while (!ss.isClosed) {
+                        val client = ss.accept()
+                        threadPool.execute { handleClient(client) }
+                    }
+                } catch (_: Throwable) {}
+            }
+            nlog("[Proxy] started port=$port label=$label referer=${referer.take(50)}")
+        }
+
+        fun stop() {
+            try { serverSocket?.close() } catch (_: Throwable) {}
+            try { threadPool.shutdownNow() } catch (_: Throwable) {}
+            nlog("[Proxy] stopped port=$port")
+        }
+
+        private fun handleClient(client: java.net.Socket) {
+            try {
+                client.soTimeout = 15_000
+                val input  = client.getInputStream().bufferedReader()
+                val output = client.getOutputStream()
+                val requestLine = input.readLine() ?: return
+                while (true) {
+                    val h = input.readLine() ?: ""
+                    if (h.isBlank()) break
+                }
+
+                val path = requestLine.split(" ").getOrNull(1) ?: "/"
+                val crlf = "\r\n"
+
+                when {
+                    path == "/stream.m3u8" -> {
+                        val body = getM3U8().toByteArray(Charsets.UTF_8)
+                        output.write(("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${body.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}").toByteArray())
+                        output.write(body)
+                    }
+                    path.startsWith("/seg/") -> {
+                        val segUrl = try {
+                            java.net.URLDecoder.decode(path.removePrefix("/seg/"), "UTF-8")
+                        } catch (_: Throwable) { return }
+                        val t0 = System.currentTimeMillis()
+                        var ok = false
+
+                        // ── Method 0: OkHttp (CloudStream baseClient) ──
+                        if (!ok) ok = viaOkHttp(segUrl, output, crlf, t0)
+                        // ── Method 1: OkHttp với Referer = origin/ ──
+                        if (!ok) {
+                            val origin = Regex("""^(https?://[^/]+)""").find(referer)?.groupValues?.get(1) ?: ""
+                            if (origin.isNotEmpty()) ok = viaOkHttpOrigin(segUrl, "$origin/", output, crlf, t0)
+                        }
+                        // ── Method 2: HttpURLConnection (không chunked, UA riêng) ──
+                        if (!ok) ok = viaUrlConnection(segUrl, output, crlf, t0)
+
+                        if (!ok) {
+                            val body = "502 upstream blocked".toByteArray(Charsets.UTF_8)
+                            output.write(("HTTP/1.1 502 Bad Gateway${crlf}Content-Length: ${body.size}${crlf}$crlf").toByteArray())
+                            output.write(body)
+                            nlog("[Seg] ALL-METHODS-FAILED url=...${segUrl.takeLast(40)}")
+                        }
+                    }
+                    else -> {
+                        val body = "404".toByteArray()
+                        output.write(("HTTP/1.1 404 Not Found${crlf}Content-Length: ${body.size}${crlf}$crlf").toByteArray())
+                        output.write(body)
+                    }
+                }
+                output.flush()
+            } catch (_: Throwable) {
+            } finally {
+                try { client.close() } catch (_: Throwable) {}
+            }
+        }
+
+        private fun isBlockedResponse(code: Int, ct: String?): Boolean =
+            code !in 200..299 || (ct ?: "").contains("text/html", ignoreCase = true)
+
+        private fun viaOkHttp(segUrl: String, output: java.io.OutputStream, crlf: String, t0: Long): Boolean {
+            val req = okhttp3.Request.Builder().url(segUrl)
+                .header("User-Agent", USER_AGENT)
+                .header("Referer", referer)
+                .header("Accept", "*/*")
+                .build()
+            return try {
+                segClient.newCall(req).execute().use { resp ->
+                    val ct = resp.header("Content-Type")
+                    if (isBlockedResponse(resp.code, ct)) {
+                        nlog("[Seg] OKHTTP ${resp.code} ct=$ct url=...${segUrl.takeLast(40)}")
+                        return false
+                    }
+                    val body = resp.body ?: return false
+                    val head = StringBuilder("HTTP/1.1 200 OK").append(crlf)
+                        .append("Content-Type: video/mp2t").append(crlf)
+                        .append("Access-Control-Allow-Origin: *").append(crlf)
+                    val len = body.contentLength()
+                    if (len > 0) head.append("Content-Length: ").append(len).append(crlf)
+                    else head.append("Connection: close").append(crlf)
+                    head.append(crlf)
+                    output.write(head.toString().toByteArray())
+                    val buf = ByteArray(65536)
+                    var sent = 0L
+                    body.byteStream().use { stream ->
+                        while (true) {
+                            val n = stream.read(buf)
+                            if (n < 0) break
+                            output.write(buf, 0, n)
+                            output.flush()
+                            sent += n
+                        }
+                    }
+                    if (okLogCount.incrementAndGet() <= 40) {
+                        nlog("[Seg] OKHTTP OK bytes=$sent ttfb=${System.currentTimeMillis() - t0}ms url=...${segUrl.takeLast(26)}")
+                    }
+                    true
+                }
+            } catch (e: Throwable) {
+                nlog("[Seg] OKHTTP err ${e.message} url=...${segUrl.takeLast(40)}")
+                false
+            }
+        }
+
+        private fun viaOkHttpOrigin(segUrl: String, originRef: String, output: java.io.OutputStream, crlf: String, t0: Long): Boolean {
+            val req = okhttp3.Request.Builder().url(segUrl)
+                .header("User-Agent", USER_AGENT)
+                .header("Referer", originRef)
+                .header("Accept", "*/*")
+                .build()
+            return try {
+                segClient.newCall(req).execute().use { resp ->
+                    val ct = resp.header("Content-Type")
+                    if (isBlockedResponse(resp.code, ct)) return false
+                    val body = resp.body ?: return false
+                    val head = StringBuilder("HTTP/1.1 200 OK").append(crlf)
+                        .append("Content-Type: video/mp2t").append(crlf)
+                        .append("Access-Control-Allow-Origin: *").append(crlf)
+                    val len = body.contentLength()
+                    if (len > 0) head.append("Content-Length: ").append(len).append(crlf)
+                    else head.append("Connection: close").append(crlf)
+                    head.append(crlf)
+                    output.write(head.toString().toByteArray())
+                    val buf = ByteArray(65536)
+                    body.byteStream().use { stream ->
+                        while (true) {
+                            val n = stream.read(buf)
+                            if (n < 0) break
+                            output.write(buf, 0, n)
+                            output.flush()
+                        }
+                    }
+                    true
+                }
+            } catch (_: Throwable) { false }
+        }
+
+        private fun viaUrlConnection(segUrl: String, output: java.io.OutputStream, crlf: String, t0: Long): Boolean {
+            return try {
+                val conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
+                conn.connectTimeout = 10_000
+                conn.readTimeout = 15_000
+                conn.setRequestProperty("User-Agent", USER_AGENT)
+                conn.setRequestProperty("Referer", referer)
+                conn.setRequestProperty("Accept", "*/*")
+                val code = conn.responseCode
+                val ct = conn.contentType
+                if (isBlockedResponse(code, ct)) {
+                    nlog("[Seg] URLCONN $code ct=$ct url=...${segUrl.takeLast(40)}")
+                    try { conn.disconnect() } catch (_: Throwable) {}
+                    return false
+                }
+                val head = StringBuilder("HTTP/1.1 200 OK").append(crlf)
+                    .append("Content-Type: video/mp2t").append(crlf)
+                    .append("Access-Control-Allow-Origin: *").append(crlf)
+                val len = conn.contentLengthLong
+                if (len > 0) head.append("Content-Length: ").append(len).append(crlf)
+                else head.append("Connection: close").append(crlf)
+                head.append(crlf)
+                output.write(head.toString().toByteArray())
+                conn.inputStream.use { stream ->
+                    val buf = ByteArray(65536)
+                    while (true) {
+                        val n = stream.read(buf)
+                        if (n < 0) break
+                        output.write(buf, 0, n)
+                        output.flush()
+                    }
+                }
+                true
+            } catch (e: Throwable) {
+                nlog("[Seg] URLCONN err ${e.message}")
+                false
+            }
+        }
+    }
+}
