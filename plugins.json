@@ -1,10 +1,10 @@
 [
     {
         "iconUrl": "https://animevietsub.sale/favicon.ico",
-        "fileHash": "sha256-83a8296bc66a5c156a9c3bb4d4dd8486e3bbee7b6fd91e30e20fa7760795394b",
+        "fileHash": "sha256-e77c2a2cb839c25d8778ab3898face7d74920ce30a7562d730d2367c19e3b94b",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/Ann-lryi/Aho-RepoStream",
-        "fileSize": 67491,
+        "fileSize": 74948,
         "status": 3,
         "language": "vi",
         "authors": [
@@ -14,7 +14,7 @@
             "Anime",
             "AnimeMovie"
         ],
-        "version": 2,
+        "version": 3,
         "internalName": "AnimeVsub",
         "description": "Anime vietsub - l\u1ed3ng ti\u1ebfng t\u1eeb animevietsub.sale",
         "url": "https://raw.githubusercontent.com/Ann-lryi/Aho-RepoStream/builds/AnimeVsub.cs3",
