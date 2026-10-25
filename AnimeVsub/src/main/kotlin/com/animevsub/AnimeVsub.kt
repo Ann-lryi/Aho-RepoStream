@@ -142,7 +142,7 @@ class AnimeVsubProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════════
     //  FLAGS / HẰNG SỐ
     // ═══════════════════════════════════════════════════════════════════════════
-    private val AVS_BUILD = "v7b"
+    private val AVS_BUILD = "v8"
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -501,9 +501,10 @@ class AnimeVsubProvider : MainAPI() {
      * cache để các lần gọi plain HTTP sau có cơ hội không phải chạy WebView nữa.
      */
     private suspend fun fetchDoc(url: String, useCache: Boolean = true, mode: Int = MODE_LISTING): Document {
-        // v5: breaker đang bật -> fail TỨC THÌ, không đánh vào server đang chết.
-        if (siteDown()) throw siteDownError()
-
+        // v8: KHÔNG fail tức thì theo breaker nữa — log 25-10 17:59-18:27: site
+        // flappy (plain 403-gate xen 520-storm) trong khi WebView VẪN VÀO ĐƯỢC
+        // (screenshot user 18:21 render đầy đủ). Breaker chỉ còn ý nghĩa với tầng
+        // plain/proxy; tầng WebView tự bảo vệ bằng bail nhanh khi thấy DOM 5xx.
         if (useCache) {
             docCache[url]?.let { cached ->
                 if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) {
@@ -531,11 +532,66 @@ class AnimeVsubProvider : MainAPI() {
             if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
             return it
         }
-        // v5: plain vừa đếm đủ 3 lỗi 5xx -> breaker bật -> đừng kéo thêm proxy/webview.
-        if (siteDown()) throw siteDownError()
+        // ── 2. WebView-first (v8): plain đã chết (403-gate/520-storm) — vào WebView
+        //    NGAY. Log 25-10: CORS proxy 100% timeout (đốt 10-20s/URL vô ích) nên
+        //    bị HẠ xuống cuối chuỗi; breaker không còn quyền chặn tầng WebView. ──
+        nlog("[Fetch] plain dead (403/520) -> webview-first mode=$mode $url")
 
-        // ── 2. CORS proxy + circuit breaker (log thật 25-10: cors.sh NXDOMAIN,
-        //    allorigins timeout 10s/trang -> tắt 10 phút sau 4 lần fail liên tục) ──
+        // ── 3. WebView DOM capture im lặng (serialized qua cfMutex) ──
+        //    v4: WebViewResolver cũ trả RAW HTML TRƯỚC KHI JS render — log 25-10
+        //    11:09: webview "OK" nhưng 0 link /phim/ -> 0 items mọi danh mục.
+        //    Giờ: WebView tự quản, poll DOM mỗi 0.8s, chỉ nhận khi có dữ liệu phim.
+        val silent = cfMutex.withLock {
+            // Ai đó có thể đã fetch xong trong lúc ta chờ lock.
+            if (useCache) {
+                docCache[url]?.let { cached ->
+                    if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) {
+                        // v5: validate cache trong lock nữa (doc mới có thể vừa ghi lỗi).
+                        if (docLooksServerError(cached.doc)) {
+                            docCache.remove(url)
+                            nlog("[Fetch] cache-drop (trang lỗi 5xx) $url")
+                        } else {
+                            return@withLock cached.doc
+                        }
+                    }
+                }
+            }
+            // v8: không check breaker trong lock — nếu site thật sự chết,
+            // webviewDocCapture tự bail ~2s khi poll thấy DOM 5xx.
+            val fresh = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
+            if (fresh != null && fresh != cachedCookies) {
+                tryPlainDoc(url, fresh)?.let {
+                    if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
+                    return@withLock it
+                }
+            }
+
+            nlog("[Fetch] webview-dom fallback mode=$mode $url")
+            val doc = webviewDocCapture(url, mode, WV_SILENT_TIMEOUT_MS, interactive = false)
+            if (doc != null && useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
+            doc
+        }
+        if (silent != null) return silent
+
+        // ── 4. Unlock tương tác: Dialog WebView cho user tick "Xác Minh An Toàn" ──
+        unlockGate(url, mode)?.let {
+            if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
+            return it
+        }
+        // Nếu một unlock khác vừa chạy xong -> clearance cookie mới có thể đã có.
+        tryPlainDoc(url, cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl))?.let {
+            if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
+            return it
+        }
+        // Lần chót: silent webview với clearance mới (unlock khác vừa mở gate).
+        webviewDocCapture(url, mode, WV_SILENT_TIMEOUT_MS, interactive = false)?.let {
+            if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
+            return it
+        }
+
+        // ── 5. CORS proxy — HẠ CUỐI (v8): log 25-10 18h: allorigins/codetabs 100%
+        //    timeout 10-20s/URL, lần "200" duy nhất cũng là trang gate bị chặn
+        //    (blocked=true). Chỉ còn là phương sách cuối; giữ circuit breaker. ──
         if (System.currentTimeMillis() >= proxyDisabledUntilMs) {
             for (proxy in corsProxies) {
                 val pt0 = System.currentTimeMillis()
@@ -572,63 +628,7 @@ class AnimeVsubProvider : MainAPI() {
             }
         }
 
-        // ── 3. WebView DOM capture im lặng (serialized qua cfMutex) ──
-        //    v4: WebViewResolver cũ trả RAW HTML TRƯỚC KHI JS render — log 25-10
-        //    11:09: webview "OK" nhưng 0 link /phim/ -> 0 items mọi danh mục.
-        //    Giờ: WebView tự quản, poll DOM mỗi 0.8s, chỉ nhận khi có dữ liệu phim.
-        val silent = cfMutex.withLock {
-            // Ai đó có thể đã fetch xong trong lúc ta chờ lock.
-            if (useCache) {
-                docCache[url]?.let { cached ->
-                    if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) {
-                        // v5: validate cache trong lock nữa (doc mới có thể vừa ghi lỗi).
-                        if (docLooksServerError(cached.doc)) {
-                            docCache.remove(url)
-                            nlog("[Fetch] cache-drop (trang lỗi 5xx) $url")
-                        } else {
-                            return@withLock cached.doc
-                        }
-                    }
-                }
-            }
-            // v5: breaker có thể bật trong lúc chờ lock.
-            if (siteDown()) throw siteDownError()
-            val fresh = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
-            if (fresh != null && fresh != cachedCookies) {
-                tryPlainDoc(url, fresh)?.let {
-                    if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
-                    return@withLock it
-                }
-            }
-
-            nlog("[Fetch] webview-dom fallback mode=$mode $url")
-            val doc = webviewDocCapture(url, mode, WV_SILENT_TIMEOUT_MS, interactive = false)
-            if (doc != null && useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
-            doc
-        }
-        if (silent != null) return silent
-        // v5: WVDom vừa thấy trang lỗi -> breaker có thể đã bật -> bỏ gate dialog.
-        if (siteDown()) throw siteDownError()
-
-        // ── 4. Unlock tương tác: Dialog WebView cho user tick "Xác Minh An Toàn" ──
-        unlockGate(url, mode)?.let {
-            if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
-            return it
-        }
-        // v5: gate vừa thấy trang lỗi 5xx -> breaker có thể đã bật.
-        if (siteDown()) throw siteDownError()
-        // Nếu một unlock khác vừa chạy xong -> clearance cookie mới có thể đã có.
-        tryPlainDoc(url, cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl))?.let {
-            if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
-            return it
-        }
-        // Lần chót: silent webview với clearance mới (unlock khác vừa mở gate).
-        webviewDocCapture(url, mode, WV_SILENT_TIMEOUT_MS, interactive = false)?.let {
-            if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
-            return it
-        }
-
-        throw ErrorLoadingException("AnimeVsub: site vẫn chặn sau khi thử mọi đường — hãy thử lại và hoàn tất xác minh trong cửa sổ plugin mở ra (xem animevsub_diag.txt)")
+        throw ErrorLoadingException("AnimeVsub: site vẫn chặn sau mọi đường (plain 403/520 + WebView + gate + proxy) — thử lại sau vài phút; nếu dialog xác minh hiện ra hãy tick để mở gate (xem animevsub_diag.txt)")
     }
 
     /** GET trả về text thô (dùng cho m3u8), có kiểm tra block-page. */
