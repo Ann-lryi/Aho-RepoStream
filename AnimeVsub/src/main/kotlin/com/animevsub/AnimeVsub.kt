@@ -162,7 +162,14 @@ class AnimeVsubProvider : MainAPI() {
     override val hasDownloadSupport = false
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
-    private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    // Đổi hằng số:
+private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+
+// Trong webviewDocCapture() và ajaxPlayerViaWebView(): XOÁ dòng này —
+// wv.settings.userAgentString = USER_AGENT
+// Để WebView dùng UA thật (Linux; Android 17; Chrome/13x) — đây là fingerprint
+// "sạch" nhất có thể có. UA Windows chạy trên Android WebView là dấu hiệu
+// giả mạo dễ bị origin phạt.
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  FLAGS / HẰNG SỐ
@@ -821,19 +828,14 @@ class AnimeVsubProvider : MainAPI() {
     @Volatile private var genrePageStyle = 0  // 0: trang-N.html, 1: ?page=N
 
     override val mainPage = mainPageOf(
-        "HOME" to "Mới Cập Nhật",
-        "GENRE::hanh-dong"  to "Hành Động",
-        "GENRE::phieu-luu"  to "Phiêu Lưu",
-        "GENRE::hai-huoc"   to "Hài Hước",
-        "GENRE::ky-ao"      to "Huyền Ảo",
-        "GENRE::sieu-nhien" to "Siêu Nhiên",
-        "GENRE::bi-an"      to "Bí Ẩn",
-        "GENRE::tinh-cam"   to "Tình Cảm",
-        "GENRE::hoc-duong"  to "Học Đường",
-        "GENRE::kinh-di"    to "Kinh Dị",
-        "GENRE::the-thao"   to "Thể Thao",
-        "GENRE::am-nhac"    to "Âm Nhạc"
-    )
+    "HOME" to "Mới Cập Nhật",
+    "GENRE::hanh-dong"  to "Hành Động",
+    "GENRE::hai-huoc"   to "Hài Hước",
+    "GENRE::tinh-cam"   to "Tình Cảm",
+    "GENRE::kinh-di"    to "Kinh Dị",
+    "GENRE::hoc-duong"  to "Học Đường"
+)
+// + delay(150, 450) thay vì (80, 280)
 
     /** Danh sách URL ứng viên cho 1 trang listing — cái nào parse ra card thì dùng. */
     private fun listingCandidates(data: String, page: Int): List<String> {
@@ -1908,18 +1910,27 @@ class AnimeVsubProvider : MainAPI() {
 
     /** Context cho WebView: Activity foreground của CloudStream -> Application. */
     private fun appContext(): android.content.Context? {
-        try {
-            val cls = Class.forName("com.lagradost.cloudstream3.CommonActivity")
-            for (name in listOf("activity", "currentActivity")) {
-                try {
-                    val f = cls.getDeclaredField(name)
-                    f.isAccessible = true
-                    (f.get(null) as? android.content.Context)?.let { return it }
-                } catch (_: Throwable) {}
-            }
-        } catch (_: Throwable) {}
-        return diagContext()
-    }
+    currentActivity()?.let { return it }
+    return diagContext()
+}
+
+private fun currentActivity(): android.app.Activity? {
+    try {
+        val cls = Class.forName("com.lagradost.cloudstream3.CommonActivity")
+        fun fromObj(o: Any?): android.app.Activity? = when (o) {
+            is android.app.Activity -> o
+            is java.lang.ref.WeakReference<*> -> o.get() as? android.app.Activity
+            else -> null
+        }
+        for (f in cls.declaredFields) {
+            try {
+                f.isAccessible = true
+                fromObj(f.get(null))?.let { if (!it.isFinishing) return it }
+            } catch (_: Throwable) {}
+        }
+    } catch (_: Throwable) {}
+    return null
+}
 
     private suspend fun tryHookFlow(targetUrl: String, callback: (ExtractorLink) -> Unit): Boolean {
         val flowT0 = System.currentTimeMillis()
