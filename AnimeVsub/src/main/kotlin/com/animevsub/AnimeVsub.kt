@@ -39,6 +39,21 @@
 //    * UA đồng bộ WebView == plain HTTP (cf_clearance gắn với UA — lệch UA là 403).
 //    * parseCards: fallback title từ img[alt] + chặn title rác; log [Parse] 0-cards.
 //    * search: dừng sau 2 biến thể sạch 0 kết quả (tránh đốt 4 biến thể full-chain).
+//  v5 (25-10-2026, fix lần 3 theo log thật — site trả 520 + trang "Lỗi Server 5xx" 888KB):
+//    * ROOT CAUSE MỚI: origin server animevietsub.sale TỰ LỖI theo đợt (HTTP 520,
+//      trang lỗi ~888KB title "Lỗi Server 5xx - AnimeVietsub", textLen chỉ ~1.2KB)
+//      — không phải chỉ CF gate. v4 nhận nhầm trang lỗi là DOM "sạch" (blocked=false)
+//      -> CACHE 5 phút -> site hồi phục vẫn 0 items; loadLinks đốt 4 step ~120s
+//      -> player báo "Timed out waiting for 120000 ms" (screenshot 25-10 11:34).
+//    * looksServerError(): nhận diện trang lỗi qua <title> (lỗi server/5xx/bad
+//      gateway/...). Mọi lớp fetch REJECT trang lỗi + KHÔNG BAO GIỜ cache;
+//      cache-hit cũng kiểm tra lại trước khi dùng (cache-drop).
+//    * SITE-DOWN breaker: 3 lỗi 5xx liên tục -> nghỉ 90s, mọi fetchDoc/loadLinks
+//      fail TỨC THÌ + toast rõ ràng — hết cảnh treo 2 phút và đỡ đánh thêm request
+//      vào server đang chết. Thành công bất kỳ (plain OK / WVDom có phim) -> gỡ ngay.
+//    * WVDom: poll thấy trang lỗi -> dừng capture NGAY (~1s thay vì chờ 22s),
+//      không trả DOM lỗi làm "DOM sạch cuối".
+//    * Bỏ proxy.cors.sh (NXDOMAIN — domain đã chết), thêm api.codetabs.com.
 // URL patterns đã xác minh qua search index + Telegram kênh chính thức (24-10-2026):
 //  - Chi tiết phim : /phim/{slug}-a{id}/          (vd /phim/dogulwang-a6014/)
 //  - Trang xem     : /phim/{slug}-a{id}/xem-phim.html
@@ -91,7 +106,7 @@ class AnimeVsubProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════════
     //  FLAGS / HẰNG SỐ
     // ═══════════════════════════════════════════════════════════════════════════
-    private val AVS_BUILD = "v4"
+    private val AVS_BUILD = "v5"
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -121,9 +136,10 @@ class AnimeVsubProvider : MainAPI() {
         "Accept-Language" to "vi-VN,vi;q=0.9"
     )
 
+    // v5: bỏ proxy.cors.sh (log 25-10: NXDOMAIN — domain đã chết); thêm codetabs.
     private val corsProxies = listOf(
-        "https://proxy.cors.sh/",
-        "https://api.allorigins.win/raw?url="
+        "https://api.allorigins.win/raw?url=",
+        "https://api.codetabs.com/v1/proxy?quest="
     )
 
     // Log thật 25-10: proxy.cors.sh chết (NXDOMAIN), allorigins timeout 10s/trang.
@@ -268,6 +284,57 @@ class AnimeVsubProvider : MainAPI() {
                (lower.contains("cloudflare") && lower.contains("challenge"))
     }
 
+    // ═══ v5: NHẬN DIỆN TRANG LỖI 5xx CỦA SITE + SITE-DOWN BREAKER ═══
+    //  Log thật 25-10 11:32: site trả HTTP 520 kèm trang lỗi ~888KB, title
+    //  "Lỗi Server 5xx - AnimeVietsub", textLen chỉ ~1.2KB — v4 coi là DOM sạch
+    //  (blocked=false) rồi CACHE -> 0 items dai dẳng kể cả khi site hồi phục.
+    private fun titleIsServerError(title: String): Boolean {
+        val t = title.lowercase()
+        return t.contains("lỗi server") || t.contains("server error") ||
+               t.contains("lỗi 5") || t.contains("5xx") ||
+               t.contains("bad gateway") || t.contains("service unavailable") ||
+               t.contains("internal server") || t.contains("gateway time")
+    }
+
+    private fun looksServerError(html: String): Boolean =
+        titleIsServerError(pageTitleOf(html))
+
+    private fun docLooksServerError(doc: Document): Boolean =
+        try { titleIsServerError(doc.title()) } catch (_: Throwable) { false }
+
+    // Breaker toàn cục: server 5xx liên tục -> NGHỈ 90s (mọi fetchDoc/loadLinks
+    // fail tức thì với thông báo rõ) — hết cảnh treo 2 phút, đỡ đánh thêm request
+    // vào server đang chết. Mọi thành công (plain OK / WVDom có dữ liệu) gỡ ngay.
+    private val srvErrCount = java.util.concurrent.atomic.AtomicInteger(0)
+    @Volatile private var siteDownUntilMs = 0L
+    private val SITE_DOWN_THRESHOLD = 3
+    private val SITE_DOWN_COOLDOWN_MS = 90_000L
+
+    private fun siteDown(): Boolean = System.currentTimeMillis() < siteDownUntilMs
+
+    private fun siteDownError() = ErrorLoadingException(
+        "SITE-DOWN: animevietsub.sale đang trả lỗi 5xx — đợi ${SITE_DOWN_COOLDOWN_MS / 1000}s rồi thử lại"
+    )
+
+    private fun noteServerError(where: String, url: String) {
+        val n = srvErrCount.incrementAndGet()
+        nlog("[Site] lỗi 5xx #$n ($where) ${url.take(70)}")
+        if (n >= SITE_DOWN_THRESHOLD && !siteDown()) {
+            siteDownUntilMs = System.currentTimeMillis() + SITE_DOWN_COOLDOWN_MS
+            srvErrCount.set(0)
+            nlog("[Site] SITE-DOWN breaker: nghỉ ${SITE_DOWN_COOLDOWN_MS / 1000}s (server 5xx liên tục)")
+            ntoast("AnimeVsub: animevietsub.sale đang lỗi 5xx — thử lại sau ~1-2 phút")
+        }
+    }
+
+    private fun noteSiteOk() {
+        srvErrCount.set(0)
+        if (siteDown()) {
+            siteDownUntilMs = 0L
+            nlog("[Site] site hồi phục — gỡ breaker")
+        }
+    }
+
     /** Lấy cookie cf_clearance... mà bất kỳ WebView nào trong app đã thu được. */
     private fun cookiesFromCookieManager(url: String): Map<String, String>? {
         return try {
@@ -346,13 +413,23 @@ class AnimeVsubProvider : MainAPI() {
             // v3: CHỈ nhận 2xx — log thật: Cloudflare trả 403/520 kèm trang challenge
             // ~888KB không có keyword nhận dạng -> v2 dùng nhầm làm content + cache.
             if (resp.code !in 200..299) {
+                // v5: 520/5xx từ origin (storm 11:32 trong log) — đếm vào breaker.
+                if (resp.code in 500..599) noteServerError("plain-http", url)
                 nlog("[Fetch] plain $tag ${resp.code} REJECT len=${html.length} ms=${System.currentTimeMillis() - t0} $url")
                 return null
             }
             val blocked = looksBlocked(html)
             if (!blocked) {
+                // v5: trang lỗi 5xx có thể đến kèm HTTP 200 (qua proxy/CDN cache)
+                // — chặn ở đây để KHÔNG BAO GIỜ trả/cache trang lỗi.
+                if (looksServerError(html)) {
+                    noteServerError("plain", url)
+                    nlog("[Fetch] plain $tag ${resp.code} SRV-ERR title='${pageTitleOf(html)}' len=${html.length} ms=${System.currentTimeMillis() - t0} $url")
+                    return null
+                }
                 val doc = resp.document
                 if (doc.body()?.text()?.isNotBlank() == true) {
+                    noteSiteOk()
                     nlog("[Fetch] plain $tag OK ${resp.code} len=${html.length} ms=${System.currentTimeMillis() - t0} $url")
                     return doc
                 }
@@ -375,11 +452,20 @@ class AnimeVsubProvider : MainAPI() {
      * cache để các lần gọi plain HTTP sau có cơ hội không phải chạy WebView nữa.
      */
     private suspend fun fetchDoc(url: String, useCache: Boolean = true, mode: Int = MODE_LISTING): Document {
+        // v5: breaker đang bật -> fail TỨC THÌ, không đánh vào server đang chết.
+        if (siteDown()) throw siteDownError()
+
         if (useCache) {
             docCache[url]?.let { cached ->
                 if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) {
-                    nlog("[Fetch] cache-hit $url")
-                    return cached.doc
+                    // v5: cache có thể chứa trang lỗi (session trước để lại) — kiểm tra lại.
+                    if (docLooksServerError(cached.doc)) {
+                        docCache.remove(url)
+                        nlog("[Fetch] cache-drop (trang lỗi 5xx) $url")
+                    } else {
+                        nlog("[Fetch] cache-hit $url")
+                        return cached.doc
+                    }
                 }
             }
         }
@@ -396,6 +482,8 @@ class AnimeVsubProvider : MainAPI() {
             if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
             return it
         }
+        // v5: plain vừa đếm đủ 3 lỗi 5xx -> breaker bật -> đừng kéo thêm proxy/webview.
+        if (siteDown()) throw siteDownError()
 
         // ── 2. CORS proxy + circuit breaker (log thật 25-10: cors.sh NXDOMAIN,
         //    allorigins timeout 10s/trang -> tắt 10 phút sau 4 lần fail liên tục) ──
@@ -403,19 +491,25 @@ class AnimeVsubProvider : MainAPI() {
             for (proxy in corsProxies) {
                 val pt0 = System.currentTimeMillis()
                 try {
-                    val proxiedUrl = if (proxy.endsWith("?url=")) proxy + URLEncoder.encode(url, "UTF-8") else proxy + url
+                    // v5: cả "?url=" (allorigins) lẫn "?quest=" (codetabs) cần encode URL.
+                    val proxiedUrl = if (proxy.endsWith("?url=") || proxy.endsWith("?quest=")) {
+                        proxy + URLEncoder.encode(url, "UTF-8")
+                    } else proxy + url
                     val resp = app.get(proxiedUrl, headers = commonHeaders)
                     val html = resp.text
-                    if (resp.code in 200..299 && !looksBlocked(html)) {
+                    // v5: trang lỗi 5xx của site đi qua proxy cũng phải chặn + đếm breaker.
+                    if (resp.code in 200..299 && !looksBlocked(html) && !looksServerError(html)) {
                         val doc = resp.document
                         if (doc.body()?.text()?.isNotBlank() == true) {
                             nlog("[Fetch] proxy ${hostOf(proxy)} OK ${resp.code} len=${html.length} ms=${System.currentTimeMillis() - pt0} $url")
                             proxyFailCount.set(0)
+                            noteSiteOk()
                             if (useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
                             return doc
                         }
                     }
-                    nlog("[Fetch] proxy ${hostOf(proxy)} FAIL ${resp.code} blocked=${looksBlocked(html)} len=${html.length} ms=${System.currentTimeMillis() - pt0} $url")
+                    if (looksServerError(html)) noteServerError("proxy", url)
+                    nlog("[Fetch] proxy ${hostOf(proxy)} FAIL ${resp.code} blocked=${looksBlocked(html)} srvErr=${looksServerError(html)} len=${html.length} ms=${System.currentTimeMillis() - pt0} $url")
                 } catch (e: Throwable) {
                     if (isCancellation(e)) throw e
                     nlogE("[Fetch] proxy ${hostOf(proxy)}", e, url)
@@ -437,9 +531,19 @@ class AnimeVsubProvider : MainAPI() {
             // Ai đó có thể đã fetch xong trong lúc ta chờ lock.
             if (useCache) {
                 docCache[url]?.let { cached ->
-                    if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) return@withLock cached.doc
+                    if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) {
+                        // v5: validate cache trong lock nữa (doc mới có thể vừa ghi lỗi).
+                        if (docLooksServerError(cached.doc)) {
+                            docCache.remove(url)
+                            nlog("[Fetch] cache-drop (trang lỗi 5xx) $url")
+                        } else {
+                            return@withLock cached.doc
+                        }
+                    }
                 }
             }
+            // v5: breaker có thể bật trong lúc chờ lock.
+            if (siteDown()) throw siteDownError()
             val fresh = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
             if (fresh != null && fresh != cachedCookies) {
                 tryPlainDoc(url, fresh)?.let {
@@ -454,12 +558,16 @@ class AnimeVsubProvider : MainAPI() {
             doc
         }
         if (silent != null) return silent
+        // v5: WVDom vừa thấy trang lỗi -> breaker có thể đã bật -> bỏ gate dialog.
+        if (siteDown()) throw siteDownError()
 
         // ── 4. Unlock tương tác: Dialog WebView cho user tick "Xác Minh An Toàn" ──
         unlockGate(url, mode)?.let {
             if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
             return it
         }
+        // v5: gate vừa thấy trang lỗi 5xx -> breaker có thể đã bật.
+        if (siteDown()) throw siteDownError()
         // Nếu một unlock khác vừa chạy xong -> clearance cookie mới có thể đã có.
         tryPlainDoc(url, cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl))?.let {
             if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
@@ -564,6 +672,8 @@ class AnimeVsubProvider : MainAPI() {
             } catch (e: Throwable) {
                 if (isCancellation(e)) throw e
                 nlog("[List] candidate fail $url: ${e.message}")
+                // v5: site-down -> các candidate kế cũng vậy, đừng lặp vô ích.
+                if (siteDown()) break
             }
         }
         if (usedIdx >= 0) rememberPaginationStyle(request.data, page, usedIdx)
@@ -848,6 +958,14 @@ class AnimeVsubProvider : MainAPI() {
         nlog("[loadLinks] watch=$watchUrl")
         ntoastV("AnimeVsub $AVS_BUILD: đang lấy link…")
 
+        // v5: site đang chết (breaker bật) — đừng đốt 4 step ~120s khiến player
+        // báo "Timed out waiting for 120000 ms"; báo rõ và thoát ngay.
+        if (siteDown()) {
+            nlog("[loadLinks] ABORT site-down watch=$watchUrl")
+            ntoast("AnimeVsub: animevietsub.sale đang lỗi 5xx — thử lại sau ~1-2 phút")
+            return false
+        }
+
         coroutineScope {
             // ═══ STEP 1: HTML trang xem (plain HTTP + cookie clearance) ═══
             if (!linkFound) {
@@ -896,7 +1014,7 @@ class AnimeVsubProvider : MainAPI() {
             }
 
             // ═══ STEP 2: WebView + JS hook (giải gate Turnstile + bắt playlist) ═══
-            if (!linkFound) {
+            if (!linkFound && !siteDown()) {   // v5: site chết -> bỏ step nặng WebView
                 try {
                     if (tryHookFlow(watchUrl, callback)) linkFound = true
                     stepNotes.add("S2:${if (linkFound) "HIT" else "0"}")
@@ -908,7 +1026,7 @@ class AnimeVsubProvider : MainAPI() {
             }
 
             // ═══ STEP 3: WebViewResolver broad trên trang xem ═══
-            if (!linkFound) {
+            if (!linkFound && !siteDown()) {   // v5
                 try {
                     val t3 = System.currentTimeMillis()
                     val resp = app.get(watchUrl, interceptor = WebViewResolver(
@@ -951,7 +1069,7 @@ class AnimeVsubProvider : MainAPI() {
             }
 
             // ═══ STEP 4: WebViewResolver broad trên từng embed (nếu còn đường) ═══
-            if (!linkFound) {
+            if (!linkFound && !siteDown()) {   // v5
                 try {
                     val embeds = harvestIframes(fetchDoc(watchUrl, useCache = false, mode = MODE_DETAIL)).take(MAX_EMBEDS)
                     nlog("[Step4] embeds=${embeds.size} ${embeds.joinToString(" | ") { it.take(60) }}")
@@ -1352,6 +1470,7 @@ class AnimeVsubProvider : MainAPI() {
         var dialog: android.app.Dialog? = null
         var lastHtml: String? = null
         var lastBlocked = true
+        var sawSrvErr = false
         try {
             withContext(Dispatchers.Main) {
                 val wv = WebView(ctx)
@@ -1374,9 +1493,20 @@ class AnimeVsubProvider : MainAPI() {
                     if (sig == lastSig) return@AvsGateBridge   // DOM không đổi — bỏ qua poll
                     lastSig = sig
                     val blocked = looksBlocked(html)
+                    val srvErr = looksServerError(html)
                     val cards = countPhimAnchors(html)
                     val xem = countXemPhim(html)
-                    nlog("[WVDom] poll#$pollIdx len=${html.length} blocked=$blocked cards=$cards xem=$xem ${u.take(70)}")
+                    nlog("[WVDom] poll#$pollIdx len=${html.length} blocked=$blocked srvErr=$srvErr cards=$cards xem=$xem ${u.take(70)}")
+                    // v5: trang lỗi 5xx — dừng capture NGAY, không bao giờ trả/cache
+                    // DOM lỗi (trước đây: TIMEOUT "DOM sạch" len=888812 = trang lỗi -> cache).
+                    if (srvErr) {
+                        noteServerError("WVDom", u)
+                        sawSrvErr = true
+                        try { wv.stopLoading() } catch (_: Throwable) {}
+                        if (!done.isCompleted) done.complete(null)
+                        return@AvsGateBridge
+                    }
+                    if (cards > 0 || xem > 0) noteSiteOk()
                     lastHtml = html
                     lastBlocked = blocked
                     val ready = !blocked && when (mode) {
@@ -1440,12 +1570,16 @@ class AnimeVsubProvider : MainAPI() {
             } else {
                 // Timeout/huỷ: nếu đã có DOM sạch (chưa "ready" vì thiếu cards/xem)
                 // thì vẫn trả — caller tự quyết (getMainPage sẽ thử candidate kế).
-                val lh = lastHtml
-                if (lh != null && !lastBlocked) {
-                    nlog("[WVDom] TIMEOUT nhưng DOM sạch (len=${lh.length}) — trả DOM cuối $url")
-                    doc = Jsoup.parse(lh, url)
+                if (sawSrvErr) {
+                    nlog("[WVDom] DỪNG: trang lỗi 5xx (site-down) interactive=$interactive $url")
                 } else {
-                    nlog("[WVDom] TIMEOUT/BỊ CHẶN ${timeoutMs / 1000}s interactive=$interactive $url")
+                    val lh = lastHtml
+                    if (lh != null && !lastBlocked) {
+                        nlog("[WVDom] TIMEOUT nhưng DOM sạch (len=${lh.length}) — trả DOM cuối $url")
+                        doc = Jsoup.parse(lh, url)
+                    } else {
+                        nlog("[WVDom] TIMEOUT/BỊ CHẶN ${timeoutMs / 1000}s interactive=$interactive $url")
+                    }
                 }
             }
             return doc
