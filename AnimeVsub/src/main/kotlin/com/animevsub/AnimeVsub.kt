@@ -89,6 +89,31 @@
 //      dự phòng; proxy thử chuỗi referer [site, playlist, origin].
 //    * Thứ tự step mới: S0 -> S0f -> S0w -> S1 -> S3 -> S4 -> S2 (hook tương tác
 //      DỜI XUỐNG CUỐI — hết cảnh chờ 60s trước khi có link).
+//  v8 (25-10-2026, WebView-first — theo log 17:59-18:27: plain HTTP chết hẳn 403
+//  len≈660, proxy 100% timeout, trong khi WebView app fork render OK 18:21):
+//    * Xoá 5 điểm siteDown-throw trong fetchDoc — WebView LUÔN được phép chạy
+//      (breaker cũ giết nhầm tầng duy nhất còn sống); CORS proxy HẠ CUỐI chuỗi.
+//  v9 (25-10-2026, fix theo log 19:11-19:13 — 139 lỗi 5xx LIÊN TỤC/2 phút, trang
+//  "Lỗi Server 5xx - AnimeVietsub" ~888KB do ORIGIN SITE tự sinh, cả WebView thật
+//  cũng nhận; Telegram kênh chính thức vẫn đăng bài bình thường 22-25/10 -> site
+//  lỗi theo đợt / rate-limit client dội quá nhiều request song song):
+//    * STORM-GATE: chính WebView (WVDom) nhận >=2 trang 5xx trong 90s -> chặn
+//      MỌI fetch mới 30s, fail tức thì kèm thông báo rõ ("server site lỗi 5xx —
+//      đợi ~30s; mở site trong Chrome để kiểm tra"). Khác breaker cũ: chỉ đếm
+//      lỗi nhìn thấy TỪ WEBVIEW — trường hợp plain 403 nhưng WebView vẫn vào
+//      được thì KHÔNG BAO GIỜ trip (giữ nguyên tắc v8 "WebView luôn được phép").
+//    * GATE TOÀN CỤC: tối đa 3 chuỗi plain song song + jitter 80-280ms — trước
+//      đây CloudStream nạp 12 mục danh mục CÙNG LÚC ≈ 24 request/2s (log
+//      19:11:06: 12 request trong 1 giây) — thứ rất có thể kích rate-limit origin.
+//    * DEDUP in-flight: các fetch TRÙNG URL chạy song song được GỘP (log 19:11:
+//      cùng 1 URL chạy lặp 4 lần full-chain).
+//    * CORS proxy: chạy SONG SONG (race 2 proxy) + timeout cứng 9s/proxy (trước
+//      đây tuần tự — server chết = 10-20s/proxy x 2 = đốt 20-40s/URL vô ích).
+//    * Gate-fix: cooldown 10 phút chỉ tính khi dialog THẬT SỰ mở được (trước
+//      đây lần attempt bị chặn vì "không có Activity" cũng consume cooldown ->
+//      các lần sau bị "bỏ qua" oan — log 19:11:25 -> 19:13 toàn "bỏ qua").
+//    * Thông báo phân biệt rõ SITE-5xx (server chết, đợi + kiểm tra Chrome) vs
+//      bị chặn (cần tick gate); getMainPage/search break sớm khi storm bật.
 // URL patterns đã xác minh qua search index + Telegram kênh chính thức (24-10-2026):
 //  - Chi tiết phim : /phim/{slug}-a{id}/          (vd /phim/dogulwang-a6014/)
 //  - Trang xem     : /phim/{slug}-a{id}/xem-phim.html
@@ -142,7 +167,7 @@ class AnimeVsubProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════════
     //  FLAGS / HẰNG SỐ
     // ═══════════════════════════════════════════════════════════════════════════
-    private val AVS_BUILD = "v8"
+    private val AVS_BUILD = "v9"
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -187,6 +212,13 @@ class AnimeVsubProvider : MainAPI() {
     private val proxyFailCount = java.util.concurrent.atomic.AtomicInteger(0)
     @Volatile private var proxyDisabledUntilMs = 0L
     private val PROXY_COOLDOWN_MS = 10 * 60 * 1000L
+
+    // v9: GATE TOÀN CỤC (tối đa 3 chuỗi plain song song + jitter) + DEDUP
+    // in-flight + STORM-GATE (khai báo ở khối breaker dưới) — chống dội request.
+    private val fetchGate = java.util.concurrent.Semaphore(3)
+    private val fetchRand = kotlin.random.Random
+    private val inflightLock = Any()
+    private val inflightDocs = HashMap<String, kotlinx.coroutines.CompletableDeferred<Document>>()
 
     // Host rác không bao giờ là embed player.
     private val junkHosts = listOf(
@@ -353,6 +385,19 @@ class AnimeVsubProvider : MainAPI() {
     private val SITE_DOWN_THRESHOLD = 3
     private val SITE_DOWN_COOLDOWN_MS = 90_000L
 
+    // v9: STORM-GATE — khi CHÍNH WebView (WVDom) liên tục nhận trang lỗi 5xx
+    // (server chết thật với client này), chặn MỌI fetch mới 30s: fail tức thì
+    // thay vì dội hàng trăm request (log 19:11: 139 lỗi/2 phút vì không có chốt).
+    @Volatile private var srvStormUntilMs = 0L
+    private val SRV_STORM_COOLDOWN_MS = 30_000L
+    private val wvSrvErrTimes = ArrayDeque<Long>()
+
+    private fun srvStormActive(): Boolean = System.currentTimeMillis() < srvStormUntilMs
+
+    private fun srvStormError() = ErrorLoadingException(
+        "SITE-5xx: server animevietsub đang trả lỗi 5xx (cả WebView đều thấy) — đợi ~${SRV_STORM_COOLDOWN_MS / 1000}s rồi thử lại; mở ${mainUrl} trong Chrome để kiểm tra (lỗi phía site, không phải plugin)"
+    )
+
     private fun siteDown(): Boolean = System.currentTimeMillis() < siteDownUntilMs
 
     private fun siteDownError() = ErrorLoadingException(
@@ -362,6 +407,21 @@ class AnimeVsubProvider : MainAPI() {
     private fun noteServerError(where: String, url: String) {
         val n = srvErrCount.incrementAndGet()
         nlog("[Site] lỗi 5xx #$n ($where) ${url.take(70)}")
+        // v9: lỗi nhìn thấy TỪ WEBVIEW (trang thật của trình duyệt) mới là bằng
+        // chứng "server chết với client này" -> bật STORM-GATE chặn fetch mới.
+        if (where == "WVDom") {
+            val now = System.currentTimeMillis()
+            synchronized(wvSrvErrTimes) {
+                wvSrvErrTimes.addLast(now)
+                while (wvSrvErrTimes.size > 6) wvSrvErrTimes.removeFirst()
+                val recent = wvSrvErrTimes.count { now - it <= 90_000 }
+                if (recent >= 2 && now >= srvStormUntilMs) {
+                    srvStormUntilMs = now + SRV_STORM_COOLDOWN_MS
+                    nlog("[Site] STORM-GATE BẬT ${SRV_STORM_COOLDOWN_MS / 1000}s: WebView cũng nhận trang 5xx — ngừng dội request, đợi site hồi phục")
+                    ntoast("AnimeVsub: server site đang lỗi 5xx — đợi ~30s rồi thử lại; mở animevietsub.sale trong Chrome để kiểm tra")
+                }
+            }
+        }
         if (n >= SITE_DOWN_THRESHOLD && !siteDown()) {
             siteDownUntilMs = System.currentTimeMillis() + SITE_DOWN_COOLDOWN_MS
             srvErrCount.set(0)
@@ -372,9 +432,14 @@ class AnimeVsubProvider : MainAPI() {
 
     private fun noteSiteOk() {
         srvErrCount.set(0)
+        synchronized(wvSrvErrTimes) { wvSrvErrTimes.clear() }
         if (siteDown()) {
             siteDownUntilMs = 0L
             nlog("[Site] site hồi phục — gỡ breaker")
+        }
+        if (srvStormActive()) {
+            srvStormUntilMs = 0L
+            nlog("[Site] site hồi phục — gỡ STORM-GATE")
         }
     }
 
@@ -499,12 +564,9 @@ class AnimeVsubProvider : MainAPI() {
      *       MODE_EPISODES (v7 — trang xem: đợi vùng #list-server render tập).
      * Sau mỗi lần WebView DOM capture thành công, cookies (cf_clearance...) được
      * cache để các lần gọi plain HTTP sau có cơ hội không phải chạy WebView nữa.
+     * v9: wrapper = cache -> STORM-GATE -> dedup in-flight -> fetchDocChain.
      */
     private suspend fun fetchDoc(url: String, useCache: Boolean = true, mode: Int = MODE_LISTING): Document {
-        // v8: KHÔNG fail tức thì theo breaker nữa — log 25-10 17:59-18:27: site
-        // flappy (plain 403-gate xen 520-storm) trong khi WebView VẪN VÀO ĐƯỢC
-        // (screenshot user 18:21 render đầy đủ). Breaker chỉ còn ý nghĩa với tầng
-        // plain/proxy; tầng WebView tự bảo vệ bằng bail nhanh khi thấy DOM 5xx.
         if (useCache) {
             docCache[url]?.let { cached ->
                 if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) {
@@ -519,18 +581,84 @@ class AnimeVsubProvider : MainAPI() {
                 }
             }
         }
+        // v9: STORM-GATE — WebView vừa xác nhận server trả 5xx -> fail TỨC THÌ,
+        // đừng dội thêm request vào server đang chết (log 19:11: 139 lỗi/2 phút).
+        if (srvStormActive()) {
+            nlog("[Fetch] STORM-GATE chặn fetch mới (server 5xx) $url")
+            throw srvStormError()
+        }
+        // v9: gộp các fetch TRÙNG URL đang chạy song song — CloudStream nạp 12
+        // mục danh mục cùng lúc + retry; log 19:11: 1 URL chạy lặp 4 lần full-chain.
+        var joinRetries = 0
+        while (true) {
+            val (isLeader, deferred) = joinOrCreateInflight(url)
+            if (!isLeader && joinRetries < 2) {
+                joinRetries++
+                nlog("[Fetch] join in-flight #$joinRetries $url")
+                try {
+                    return deferred.await()
+                } catch (e: Throwable) {
+                    nlog("[Fetch] leader chết (${e.message?.take(60) ?: "?"}) — tự chạy lại $url")
+                }
+                continue
+            }
+            try {
+                val doc = fetchDocChain(url, useCache, mode)
+                deferred.complete(doc)
+                return doc
+            } catch (t: Throwable) {
+                deferred.completeExceptionally(t)
+                throw t
+            } finally {
+                clearInflight(url, deferred)
+            }
+        }
+    }
+
+    /** v9: join-or-lead cho dedup in-flight (lock nội bộ — API 1-safe). */
+    private fun joinOrCreateInflight(url: String): Pair<Boolean, kotlinx.coroutines.CompletableDeferred<Document>> {
+        synchronized(inflightLock) {
+            val ex = inflightDocs[url]
+            if (ex != null) return Pair(false, ex)
+            val mine = kotlinx.coroutines.CompletableDeferred<Document>()
+            inflightDocs[url] = mine
+            return Pair(true, mine)
+        }
+    }
+
+    private fun clearInflight(url: String, mine: kotlinx.coroutines.CompletableDeferred<Document>) {
+        synchronized(inflightLock) {
+            if (inflightDocs[url] === mine) inflightDocs.remove(url)
+        }
+    }
+
+    /** Chuỗi fetch thật (v9 tách khỏi fetchDoc để wrapper lo storm-gate + dedup). */
+    private suspend fun fetchDocChain(url: String, useCache: Boolean, mode: Int): Document {
+        // v8: KHÔNG fail tức thì theo breaker nữa — log 25-10 17:59-18:27: site
+        // flappy (plain 403-gate xen 520-storm) trong khi WebView VẪN VÀO ĐƯỢC
+        // (screenshot user 18:21 render đầy đủ). Breaker chỉ còn ý nghĩa với tầng
+        // plain/proxy; tầng WebView tự bảo vệ bằng bail nhanh khi thấy DOM 5xx.
 
         // ── 1. Plain HTTP với cookie clearance đã có (nhanh nhất) ──
         val cachedCookies = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
-        if (cachedCookies != null) {
-            tryPlainDoc(url, cachedCookies)?.let {
+        // v9: GATE TOÀN CỤC — tối đa 3 chuỗi plain song song + jitter 80-280ms.
+        // Trước đây 12 mục danh mục nạp CÙNG LÚC ≈ 24 request/2s dội vào site —
+        // thứ rất có thể kích rate-limit origin -> trang "Lỗi Server 5xx" theo đợt.
+        while (!fetchGate.tryAcquire()) kotlinx.coroutines.delay(60)
+        try {
+            kotlinx.coroutines.delay(fetchRand.nextLong(80, 280))
+            if (cachedCookies != null) {
+                tryPlainDoc(url, cachedCookies)?.let {
+                    if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
+                    return it
+                }
+            }
+            tryPlainDoc(url, null)?.let {
                 if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
                 return it
             }
-        }
-        tryPlainDoc(url, null)?.let {
-            if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
-            return it
+        } finally {
+            fetchGate.release()
         }
         // ── 2. WebView-first (v8): plain đã chết (403-gate/520-storm) — vào WebView
         //    NGAY. Log 25-10: CORS proxy 100% timeout (đốt 10-20s/URL vô ích) nên
@@ -573,6 +701,12 @@ class AnimeVsubProvider : MainAPI() {
         }
         if (silent != null) return silent
 
+        // v9: storm đang bật -> gate/webview/proxy đều vô ích, fail tức thì.
+        if (srvStormActive()) {
+            nlog("[Fetch] STORM-GATE giữa chuỗi — dừng trước gate $url")
+            throw srvStormError()
+        }
+
         // ── 4. Unlock tương tác: Dialog WebView cho user tick "Xác Minh An Toàn" ──
         unlockGate(url, mode)?.let {
             if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
@@ -589,46 +723,67 @@ class AnimeVsubProvider : MainAPI() {
             return it
         }
 
+        // v9: storm bật -> proxy chỉ ăn timeout 10-20s, fail tức thì.
+        if (srvStormActive()) {
+            nlog("[Fetch] STORM-GATE — bỏ qua proxy $url")
+            throw srvStormError()
+        }
+
         // ── 5. CORS proxy — HẠ CUỐI (v8): log 25-10 18h: allorigins/codetabs 100%
         //    timeout 10-20s/URL, lần "200" duy nhất cũng là trang gate bị chặn
-        //    (blocked=true). Chỉ còn là phương sách cuối; giữ circuit breaker. ──
+        //    (blocked=true). Chỉ còn là phương sách cuối; giữ circuit breaker.
+        //    v9: chạy SONG SONG (race) + timeout cứng 9s/proxy (tryCorsProxy). ──
         if (System.currentTimeMillis() >= proxyDisabledUntilMs) {
-            for (proxy in corsProxies) {
-                val pt0 = System.currentTimeMillis()
-                try {
-                    // v5: cả "?url=" (allorigins) lẫn "?quest=" (codetabs) cần encode URL.
-                    val proxiedUrl = if (proxy.endsWith("?url=") || proxy.endsWith("?quest=")) {
-                        proxy + URLEncoder.encode(url, "UTF-8")
-                    } else proxy + url
-                    val resp = app.get(proxiedUrl, headers = commonHeaders)
-                    val html = resp.text
-                    // v5: trang lỗi 5xx của site đi qua proxy cũng phải chặn + đếm breaker.
-                    if (resp.code in 200..299 && !looksBlocked(html) && !looksServerError(html)) {
-                        val doc = resp.document
-                        if (doc.body()?.text()?.isNotBlank() == true) {
-                            nlog("[Fetch] proxy ${hostOf(proxy)} OK ${resp.code} len=${html.length} ms=${System.currentTimeMillis() - pt0} $url")
-                            proxyFailCount.set(0)
-                            noteSiteOk()
-                            if (useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
-                            return doc
-                        }
-                    }
-                    if (looksServerError(html)) noteServerError("proxy", url)
-                    nlog("[Fetch] proxy ${hostOf(proxy)} FAIL ${resp.code} blocked=${looksBlocked(html)} srvErr=${looksServerError(html)} len=${html.length} ms=${System.currentTimeMillis() - pt0} $url")
-                } catch (e: Throwable) {
-                    if (isCancellation(e)) throw e
-                    nlogE("[Fetch] proxy ${hostOf(proxy)}", e, url)
-                }
-                if (proxyFailCount.incrementAndGet() >= 4) {
-                    proxyDisabledUntilMs = System.currentTimeMillis() + PROXY_COOLDOWN_MS
-                    proxyFailCount.set(0)
-                    nlog("[Fetch] TẮT CORS proxy ${PROXY_COOLDOWN_MS / 60000} phút (fail liên tục)")
-                    break
-                }
+            val found = coroutineScope {
+                corsProxies.map { proxy -> async { tryCorsProxy(proxy, url) } }
+            }.awaitAll().filterNotNull().firstOrNull()
+            if (found != null) {
+                if (useCache) docCache[url] = CachedDoc(found, System.currentTimeMillis())
+                return found
+            }
+            if (proxyFailCount.get() >= 4) {
+                proxyDisabledUntilMs = System.currentTimeMillis() + PROXY_COOLDOWN_MS
+                proxyFailCount.set(0)
+                nlog("[Fetch] TẮT CORS proxy ${PROXY_COOLDOWN_MS / 60000} phút (fail liên tục)")
             }
         }
 
-        throw ErrorLoadingException("AnimeVsub: site vẫn chặn sau mọi đường (plain 403/520 + WebView + gate + proxy) — thử lại sau vài phút; nếu dialog xác minh hiện ra hãy tick để mở gate (xem animevsub_diag.txt)")
+        throw ErrorLoadingException("AnimeVsub: site vẫn chặn sau mọi đường (plain 403/520 + WebView + gate + proxy) — thử lại sau vài phút; mở animevietsub.sale trong Chrome để kiểm tra: Chrome cũng lỗi -> site đang sự cố 5xx, Chrome OK -> đợi dialog xác minh hiện ra và tick")
+    }
+
+    /** v9: thử 1 CORS proxy với timeout cứng 9s — log 25-10: khi server site
+     *  chết, allorigins/codetabs treo 10-20s/URL, đốt chuỗi fetch vô ích. */
+    private suspend fun tryCorsProxy(proxy: String, url: String): Document? {
+        val pt0 = System.currentTimeMillis()
+        try {
+            val proxiedUrl = if (proxy.endsWith("?url=") || proxy.endsWith("?quest=")) {
+                proxy + URLEncoder.encode(url, "UTF-8")
+            } else proxy + url
+            val resp = withTimeoutOrNull(9_000L) { app.get(proxiedUrl, headers = commonHeaders) }
+            if (resp == null) {
+                proxyFailCount.incrementAndGet()
+                nlog("[Fetch] proxy ${hostOf(proxy)} TIMEOUT>9s $url")
+                return null
+            }
+            val html = resp.text
+            if (resp.code in 200..299 && !looksBlocked(html) && !looksServerError(html)) {
+                val doc = resp.document
+                if (doc.body()?.text()?.isNotBlank() == true) {
+                    nlog("[Fetch] proxy ${hostOf(proxy)} OK ${resp.code} len=${html.length} ms=${System.currentTimeMillis() - pt0} $url")
+                    proxyFailCount.set(0)
+                    noteSiteOk()
+                    return doc
+                }
+            }
+            if (looksServerError(html)) noteServerError("proxy", url)
+            nlog("[Fetch] proxy ${hostOf(proxy)} FAIL ${resp.code} blocked=${looksBlocked(html)} srvErr=${looksServerError(html)} len=${html.length} ms=${System.currentTimeMillis() - pt0} $url")
+            proxyFailCount.incrementAndGet()
+        } catch (e: Throwable) {
+            if (isCancellation(e)) throw e
+            nlogE("[Fetch] proxy ${hostOf(proxy)}", e, url)
+            proxyFailCount.incrementAndGet()
+        }
+        return null
     }
 
     /** GET trả về text thô (dùng cho m3u8), có kiểm tra block-page. */
@@ -722,7 +877,8 @@ class AnimeVsubProvider : MainAPI() {
                 if (isCancellation(e)) throw e
                 nlog("[List] candidate fail $url: ${e.message}")
                 // v5: site-down -> các candidate kế cũng vậy, đừng lặp vô ích.
-                if (siteDown()) break
+                // v9: storm-gate (WebView cũng 5xx) -> break luôn.
+                if (siteDown() || srvStormActive()) break
             }
         }
         if (usedIdx >= 0) rememberPaginationStyle(request.data, page, usedIdx)
@@ -860,6 +1016,8 @@ class AnimeVsubProvider : MainAPI() {
             } catch (e: Throwable) {
                 if (isCancellation(e)) throw e
                 nlog("[Search] candidate fail $url: ${e.message}")
+                // v9: storm/breaker bật -> dừng toàn bộ biến thể, đừng đốt chuỗi nữa.
+                if (srvStormActive() || siteDown()) return emptyList()
             }
         }
         nlog("[Search] '$query' -> 0 kết quả sau ${candidates.size} biến thể")
@@ -2108,18 +2266,27 @@ class AnimeVsubProvider : MainAPI() {
      * 1 dialog duy nhất; tối đa 1 lần chủ động / 10 phút (GATE_RETRY_MS).
      */
     private suspend fun unlockGate(url: String, mode: Int = MODE_LISTING): Document? = gateMutex.withLock {
+        // v9: storm -> server đang 5xx với cả WebView, mở gate vô ích.
+        if (srvStormActive()) {
+            nlog("[Gate] bỏ qua — server đang lỗi 5xx (STORM-GATE)")
+            return@withLock null
+        }
         if (System.currentTimeMillis() - lastGateAttemptMs < GATE_RETRY_MS) {
             // Có unlock khác đang chạy/vừa chạy — trả null để caller thử đường khác.
             nlog("[Gate] bỏ qua (đã có unlock trong ${GATE_RETRY_MS / 60000} phút gần đây)")
             return@withLock null
         }
-        lastGateAttemptMs = System.currentTimeMillis()
 
         val ctx = appContext()
         if (ctx !is android.app.Activity || ctx.isFinishing) {
             nlog("[Gate] không có Activity foreground — không mở dialog xác minh")
             return@withLock null
         }
+
+        // v9-fix: chỉ tính "đã thử unlock" khi dialog THẬT SỰ mở được — trước đây
+        // lần attempt bị chặn (không Activity) cũng consume cooldown 10 phút ->
+        // các lần sau bị "bỏ qua" oan (log 19:11:25 -> 19:13 toàn "bỏ qua").
+        lastGateAttemptMs = System.currentTimeMillis()
 
         nlog("[Gate] mở dialog xác minh: $url")
         ntoast("AnimeVsub: site yêu cầu xác minh — hãy hoàn tất trong cửa sổ vừa mở")
