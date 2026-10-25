@@ -142,7 +142,7 @@ class AnimeVsubProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════════
     //  FLAGS / HẰNG SỐ
     // ═══════════════════════════════════════════════════════════════════════════
-    private val AVS_BUILD = "v7"
+    private val AVS_BUILD = "v7b"
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -888,8 +888,9 @@ class AnimeVsubProvider : MainAPI() {
         return "id=" + enc(id) + "&play=" + enc(play) + "&hash=" + enc(hash)
     }
 
-    /** Parse chuỗi meta "khối;;khối" -> danh sách máy chủ (ngược buildAvsMetaBlock). */
-    private fun parseAvsMeta(meta: String): List<AvsSrv> {
+    /** Parse chuỗi meta "khối;;khối" -> danh sách máy chủ (ngược buildAvsMetaBlock).
+     *  v7b-fix: trả MutableList để call site (loadLinks Step1p) gọi addAll được. */
+    private fun parseAvsMeta(meta: String): MutableList<AvsSrv> {
         val out = ArrayList<AvsSrv>()
         for (block in meta.split(";;")) {
             if (block.isBlank()) continue
@@ -2215,6 +2216,10 @@ class AnimeVsubProvider : MainAPI() {
 
         // ── Link PROXY dự phòng: local server, chuỗi referer đầy đủ ──
         //  Giới hạn số proxy sống đồng thời (tránh cạn port trong session dài).
+        //  v7b-fix: newExtractorLink là hàm suspend — KHÔNG được gọi bên trong
+        //  synchronized (critical section). Lock CHỈ quản lý vòng đời server;
+        //  phát link thực hiện sau khi đã thoát lock.
+        var proxyBase: String? = null
         synchronized(activeServers) {
             while (activeServers.size >= 8) {
                 try { activeServers.removeAt(0).stop() } catch (_: Throwable) {}
@@ -2224,16 +2229,22 @@ class AnimeVsubProvider : MainAPI() {
                 server.label = serverName
                 server.start()
                 activeServers.add(server)
-                val proxyBase = "http://127.0.0.1:${server.port}"
-                server.setM3U8(rewriteM3U8(trimLeadingSegments(m3u8Content, trim), proxyBase, m3u8BaseUrl))
-                callback(newExtractorLink(name, "$serverName • dự phòng", "$proxyBase/stream.m3u8", ExtractorLinkType.M3U8) {
-                    quality = Qualities.P1080.value
-                    headers = mapOf("User-Agent" to USER_AGENT)
-                })
-                nlog("[Register] emitted $proxyBase/stream.m3u8 segs=${segUrls.size}")
+                proxyBase = "http://127.0.0.1:${server.port}"
+                server.setM3U8(rewriteM3U8(trimLeadingSegments(m3u8Content, trim), "http://127.0.0.1:${server.port}", m3u8BaseUrl))
             } catch (e: Throwable) {
+                proxyBase = null
                 nlogE("[Register] bind", e, "không mở được port cục bộ — chỉ dùng link direct")
             }
+        }
+        val proxyEmitBase = proxyBase ?: return true
+        try {
+            callback(newExtractorLink(name, "$serverName • dự phòng", "$proxyEmitBase/stream.m3u8", ExtractorLinkType.M3U8) {
+                quality = Qualities.P1080.value
+                headers = mapOf("User-Agent" to USER_AGENT)
+            })
+            nlog("[Register] emitted $proxyEmitBase/stream.m3u8 segs=${segUrls.size}")
+        } catch (e: Throwable) {
+            nlogE("[Register] proxy-emit", e)
         }
         return true
     }
