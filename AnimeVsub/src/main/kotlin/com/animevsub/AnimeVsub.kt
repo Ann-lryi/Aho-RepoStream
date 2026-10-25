@@ -54,6 +54,20 @@
 //    * WVDom: poll thấy trang lỗi -> dừng capture NGAY (~1s thay vì chờ 22s),
 //      không trả DOM lỗi làm "DOM sạch cuối".
 //    * Bỏ proxy.cors.sh (NXDOMAIN — domain đã chết), thêm api.codetabs.com.
+//  v6 (25-10-2026, nâng cấp theo cấu trúc CMS thật — tham khảo Kodi addon
+//  sonle998/kodi-animevietsub: site dùng CMS họ OPhim/TPost với AJAX API):
+//    * STEP 0 MỚI trong loadLinks: POST ajax/player (id/play/link/hash,
+//      backuplinks=1) — API chính chủ trả JSON/HTML nguồn phát. Metadata tập
+//      (data-id/data-play/data-hash từ vùng #list-server của trang chi tiết)
+//      được load() nhét vào fragment #avs=<url-encoded> của episode data;
+//      loadLinks tách ra trước khi dựng watchUrl. Thành công -> bỏ qua 4 step nặng.
+//    * search: thử POST ajax/suggest (ajaxSearch=1&keysearch=...) TRƯỚC các
+//      biến thể GET /tim-kiem — 1 request duy nhất khi plain HTTP được qua.
+//    * load(): parse #list-server a[data-id] (máy chủ OPhim) -> eps + meta;
+//      ép các anchor xem-phim cũ chỉ lấp chỗ còn thiếu.
+//    * parseCards: fallback title từ .Title trong card .TPost/.TPostMv.
+//    * looksBlocked: thêm "xác minh người dùng việt nam" + "challenge-running"
+//      (dấu hiệu gate theo Kodi addon).
 // URL patterns đã xác minh qua search index + Telegram kênh chính thức (24-10-2026):
 //  - Chi tiết phim : /phim/{slug}-a{id}/          (vd /phim/dogulwang-a6014/)
 //  - Trang xem     : /phim/{slug}-a{id}/xem-phim.html
@@ -70,6 +84,7 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
+import java.net.URLDecoder
 import android.graphics.Bitmap
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
@@ -106,7 +121,7 @@ class AnimeVsubProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════════
     //  FLAGS / HẰNG SỐ
     // ═══════════════════════════════════════════════════════════════════════════
-    private val AVS_BUILD = "v5"
+    private val AVS_BUILD = "v6"
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -281,7 +296,10 @@ class AnimeVsubProvider : MainAPI() {
                lower.contains("cf_chl_opt") ||
                lower.contains("_cf_chl") ||
                lower.contains("turnstile") ||
-               (lower.contains("cloudflare") && lower.contains("challenge"))
+               (lower.contains("cloudflare") && lower.contains("challenge")) ||
+               // v6: nhận diện thêm theo Kodi addon (sonle998) — văn bản + node id
+               lower.contains("xác minh người dùng việt nam") ||
+               lower.contains("challenge-running")
     }
 
     // ═══ v5: NHẬN DIỆN TRANG LỖI 5xx CỦA SITE + SITE-DOWN BREAKER ═══
@@ -717,6 +735,8 @@ class AnimeVsubProvider : MainAPI() {
 
                 var title = a.attr("title").trim()
                 if (title.isBlank()) title = a.selectFirst("h3, h2, .title, .name, .film-title")?.text()?.trim() ?: ""
+                // v6: CMS site dạng OPhim/TPost — tên phim nằm ở .Title trong card
+                if (title.isBlank()) title = a.closest(".TPost, .TPostMv, li, article")?.selectFirst(".Title")?.text()?.trim() ?: ""
                 if (title.isBlank()) title = a.text().trim()
                 // v4: nhiều CMS đặt tên phim ở alt của ảnh card
                 if (title.isBlank()) title = a.selectFirst("img")?.attr("alt")?.trim() ?: ""
@@ -758,6 +778,34 @@ class AnimeVsubProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val keyword = URLEncoder.encode(query.trim(), "UTF-8")
+
+        // v6: API AJAX chính chủ (theo Kodi addon sonle998/kodi-animevietsub):
+        // POST ajax/suggest với ajaxSearch=1&keysearch=... — CMS OPhim trả HTML
+        // <li> gợi ý (có <a> + <img>) hoặc JSON. Rẻ hơn nhiều so với 4 biến thể GET
+        // qua WebView — thử TRƯỚC, thất bại thì rơi xuống biến thể GET cũ.
+        try {
+            val res = app.post(
+                "$mainUrl/ajax/suggest",
+                headers = commonHeaders + mapOf(
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Origin"  to mainUrl.trimEnd('/'),
+                    "Referer" to mainUrl
+                ),
+                data = mapOf("ajaxSearch" to "1", "keysearch" to query.trim())
+            )
+            val body = res.text
+            if (res.code in 200..299 && body.isNotBlank() && !looksBlocked(body) && !looksServerError(body)) {
+                val items = parseCards(Jsoup.parse(body, mainUrl))
+                nlog("[Search] ajax/suggest ${res.code} -> ${items.size} len=${body.length}")
+                if (items.isNotEmpty()) return items
+            } else {
+                nlog("[Search] ajax/suggest ${res.code} skip len=${body.length} title='${pageTitleOf(body)}'")
+            }
+        } catch (e: Throwable) {
+            if (isCancellation(e)) throw e
+            nlogE("[Search] ajax/suggest", e)
+        }
+
         val candidates = listOf(
             "$mainUrl/tim-kiem?keyword=$keyword",
             "$mainUrl/tim-kiem/$keyword",
@@ -853,7 +901,32 @@ class AnimeVsubProvider : MainAPI() {
 
         // ── Trích xuất tập: mọi anchor dẫn tới trang xem ──
         val epOrder = LinkedHashMap<String, String>()   // epName(normalized) -> watchUrl đầu tiên gặp
+        val epMeta  = LinkedHashMap<String, String>()   // v6: epName -> id=..&play=..&hash=.. (từ #list-server)
         val seenUrls = HashSet<String>()
+
+        // v6: CMS OPhim — vùng #list-server chứa a[data-id][data-hash] (máy chủ).
+        // Metadata này cho phép loadLinks gọi POST ajax/player TRỰC TIẾP (Step 0)
+        // thay vì phải đào lại trang xem. Nhét vào fragment #avs= của episode data
+        // (URL vẫn hợp lệ — CloudStream giữ nguyên fragment khi fixUrl).
+        val listServer = doc.selectFirst("#list-server") ?: doc.body()
+        for (a in listServer?.select("a[data-id]") ?: emptyList()) {
+            try {
+                val id = a.attr("data-id").trim()
+                if (id.isBlank()) continue
+                val play = a.attr("data-play").trim()
+                val hash = a.attr("data-hash").ifBlank { a.attr("data-href") }.trim()
+                var rawName = a.text().trim()
+                if (rawName.isBlank() || rawName.length > 40) rawName = id
+                val epName = normalizeEpName(rawName)
+                if (epOrder.containsKey(epName)) continue
+                val href = absolutize(a.attr("href"))
+                val watch = if (href != null && href.contains("xem-phim")) href
+                            else detail.trimEnd('/') + "/xem-phim.html?ep=$epName"
+                epOrder[epName] = watch
+                epMeta[epName] = "id=$id&play=$play&hash=$hash"
+            } catch (e: Throwable) { nlogE("[Load] list-server", e) }
+        }
+        nlog("[Load] list-server eps=${epOrder.size} meta=${epMeta.size}")
 
         for (a in doc.select("a[href]")) {
             val href = absolutize(a.attr("href")) ?: continue
@@ -887,7 +960,11 @@ class AnimeVsubProvider : MainAPI() {
         if (epOrder.isEmpty()) throw ErrorLoadingException("Không tìm thấy tập phim nào")
 
         val episodes = epOrder.map { (epName, watchUrl) ->
-            newEpisode(watchUrl) {
+            // v6: episode có metadata ajax/player -> gắn fragment #avs=<meta>
+            val data = epMeta[epName]?.let { m ->
+                watchUrl + "#avs=" + URLEncoder.encode(m, "UTF-8")
+            } ?: watchUrl
+            newEpisode(data) {
                 this.name    = "Tập $epName"
                 this.episode = epName.toIntOrNull()
             }
@@ -952,6 +1029,27 @@ class AnimeVsubProvider : MainAPI() {
         // CloudStream chạy fixUrl() trên data của newEpisode — nếu data đã là URL
         // tuyệt đối thì giữ nguyên; nếu là URL chi tiết thì dựng trang xem chuẩn.
         var watchUrl = data.trim()
+
+        // v6: tách metadata ajax/player từ fragment #avs= do load() gắn vào data
+        var avsId = ""; var avsPlay = ""; var avsHash = ""
+        val avsIdx = watchUrl.indexOf("#avs=")
+        if (avsIdx >= 0) {
+            val meta = try {
+                URLDecoder.decode(watchUrl.substring(avsIdx + 5), "UTF-8")
+            } catch (_: Throwable) { "" }
+            watchUrl = watchUrl.substring(0, avsIdx)
+            for (kv in meta.split('&')) {
+                val i = kv.indexOf('=')
+                if (i <= 0) continue
+                when (kv.substring(0, i).trim()) {
+                    "id"   -> avsId   = kv.substring(i + 1).trim()
+                    "play" -> avsPlay = kv.substring(i + 1).trim()
+                    "hash" -> avsHash = kv.substring(i + 1).trim()
+                }
+            }
+            nlog("[loadLinks] avs-meta id=$avsId play=$avsPlay hashLen=${avsHash.length}")
+        }
+
         if (!watchUrl.contains("xem-phim") && watchUrl.contains("/phim/")) {
             watchUrl = watchUrl.trimEnd('/') + "/xem-phim.html"
         }
@@ -967,6 +1065,61 @@ class AnimeVsubProvider : MainAPI() {
         }
 
         coroutineScope {
+            // ═══ STEP 0: POST ajax/player — API chính chủ CMS OPhim (metadata từ
+            //  #list-server do load() gắn vào fragment #avs=). 1 POST thay cho việc
+            //  đào trang xem; thành công thì bỏ qua cả 4 step nặng WebView. ═══
+            if (avsId.isNotBlank() && !linkFound && !siteDown()) {
+                try {
+                    val resp = app.post(
+                        "$mainUrl/ajax/player",
+                        headers = commonHeaders + mapOf(
+                            "X-Requested-With" to "XMLHttpRequest",
+                            "Origin"  to mainUrl.trimEnd('/'),
+                            "Referer" to watchUrl
+                        ),
+                        data = mapOf(
+                            "id" to avsId,
+                            "play" to avsPlay,
+                            "link" to avsHash,
+                            "backuplinks" to "1"
+                        )
+                    )
+                    val body = resp.text
+                    nlog("[Step0] ajax/player ${resp.code} len=${body.length} title='${pageTitleOf(body)}'")
+                    if (resp.code in 200..299 && body.isNotBlank() &&
+                        !looksBlocked(body) && !looksServerError(body)) {
+                        noteSiteOk()
+                        val (m3u8s, mp4s) = harvestMediaUrls(body)
+                        for (m3u8 in m3u8s) {
+                            val content = fetchText(m3u8, referer = detailBaseOf(watchUrl)) ?: continue
+                            if (content.contains("#EXTM3U") &&
+                                registerM3U8Link(content, m3u8, detailBaseOf(watchUrl), "Vietsub", callback)) {
+                                linkFound = true; break
+                            }
+                        }
+                        if (!linkFound && mp4s.isNotEmpty()) {
+                            nlog("[Step0] MP4 direct ${mp4s.first().take(90)}")
+                            callback(newExtractorLink(name, "MP4", mp4s.first(), ExtractorLinkType.VIDEO) {
+                                quality = Qualities.P720.value
+                                headers = mapOf("User-Agent" to USER_AGENT, "Referer" to detailBaseOf(watchUrl))
+                            })
+                            linkFound = true
+                        }
+                        if (!linkFound) {
+                            // JSON có thể chứa iframe HTML (playTech=iframe) — đào tiếp
+                            val ifr = harvestIframes(Jsoup.parse(body, mainUrl))
+                            nlog("[Step0] media m3u8=${m3u8s.size} mp4=${mp4s.size} iframe=${ifr.size}")
+                            if (ifr.isNotEmpty() && extractFromEmbed(ifr.first(), watchUrl, callback)) linkFound = true
+                        }
+                    }
+                    stepNotes.add("S0:${if (linkFound) "HIT" else "0"}")
+                } catch (e: Throwable) {
+                    if (isCancellation(e)) throw e
+                    nlogE("[Step0]", e)
+                    stepNotes.add("S0:ERR")
+                }
+            }
+
             // ═══ STEP 1: HTML trang xem (plain HTTP + cookie clearance) ═══
             if (!linkFound) {
                 try {
