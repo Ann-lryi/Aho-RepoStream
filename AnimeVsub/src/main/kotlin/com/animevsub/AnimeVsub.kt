@@ -28,6 +28,17 @@
 //      Dialog WebView full-screen cho user tick "Verify you are human" MỘT LẦN,
 //      bắt DOM qua JS bridge, lưu clearance cookie cho toàn bộ fetch sau đó
 //      (gateMutex + tối đa 1 lần/10 phút, bỏ qua khi không có Activity foreground).
+//  v4 (25-10-2026, fix lần 2 theo log thật — webview "OK" vẫn 0 items MỌI danh mục):
+//    * ROOT CAUSE: WebViewResolver trả RAW HTML TRƯỚC KHI JS render, trong khi
+//      site render danh sách phim bằng AJAX -> HTML thô KHÔNG có link /phim/
+//      -> parseCards ra 0 dù trang "sạch".
+//    * Fix cốt lõi: webviewDocCapture() — WebView TỰ QUẢN LÝ, poll DOM mỗi 0.8s
+//      qua JS bridge, CHỈ nhận khi DOM CÓ LINK PHIM (hoặc đã render đủ lâu).
+//      Silent pass trước (không UI); gate vẫn chặn -> unlockGate() mở Dialog
+//      full-screen cho user tick "Xác Minh An Toàn" MỘT lần.
+//    * UA đồng bộ WebView == plain HTTP (cf_clearance gắn với UA — lệch UA là 403).
+//    * parseCards: fallback title từ img[alt] + chặn title rác; log [Parse] 0-cards.
+//    * search: dừng sau 2 biến thể sạch 0 kết quả (tránh đốt 4 biến thể full-chain).
 // URL patterns đã xác minh qua search index + Telegram kênh chính thức (24-10-2026):
 //  - Chi tiết phim : /phim/{slug}-a{id}/          (vd /phim/dogulwang-a6014/)
 //  - Trang xem     : /phim/{slug}-a{id}/xem-phim.html
@@ -80,7 +91,7 @@ class AnimeVsubProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════════
     //  FLAGS / HẰNG SỐ
     // ═══════════════════════════════════════════════════════════════════════════
-    private val AVS_BUILD = "v3"
+    private val AVS_BUILD = "v4"
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -92,6 +103,17 @@ class AnimeVsubProvider : MainAPI() {
 
     // Timeout cho WebView hook flow — trang gate Turnstile có thể cần user tương tác.
     private val HOOK_TIMEOUT_MS = 60_000L
+
+    // v4: timeout WebView DOM capture (silent) — đợi JS render danh sách phim.
+    private val WV_SILENT_TIMEOUT_MS = 22_000L
+
+    // Chế độ hoàn tất của webviewDocCapture:
+    //  MODE_LISTING: chỉ nhận khi DOM có link /phim/{slug}-a{id} (cards đã render)
+    //  MODE_DETAIL : nhận khi có link xem-phim, hoặc sau ~8 poll (~6.4s)
+    //  MODE_LOOSE  : nhận khi DOM sạch sau 4 poll (~3.2s) — search variant, embed
+    private val MODE_LISTING = 0
+    private val MODE_DETAIL = 1
+    private val MODE_LOOSE = 2
 
     private val commonHeaders = mapOf(
         "User-Agent"      to USER_AGENT,
@@ -212,7 +234,8 @@ class AnimeVsubProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════════
     //  LỚP FETCH CLOUDFLARE-AWARE (port từ NguonC fetchListingDoc + cfCookieCache)
     //  Thứ tự: cache -> plain HTTP + cookie clearance -> plain không cookie
-    //          -> CORS proxy -> WebViewResolver (serialized, re-capture cookie).
+    //          -> CORS proxy (circuit breaker) -> WebView DOM capture (serialized)
+    //          -> Dialog xác minh tương tác (unlockGate).
     //  Site dùng gate "Xác Minh An Toàn" riêng TRƯỚC challenge Cloudflare chuẩn,
     //  nên looksBlocked() nhận thêm các cụm tiếng Việt của trang gate.
     // ═══════════════════════════════════════════════════════════════════════════
@@ -255,6 +278,38 @@ class AnimeVsubProvider : MainAPI() {
                 if (idx <= 0) null else it.substring(0, idx).trim() to it.substring(idx + 1).trim()
             }.toMap().ifEmpty { null }
         } catch (e: Throwable) { nlogE("[CookieMgr]", e); null }
+    }
+
+    /** Số link phim distinct (/phim/{slug}-a{id}) trong HTML — tiêu chí "trang đã render xong". */
+    private fun countPhimAnchors(html: String): Int {
+        return try {
+            Regex("""/phim/[^"'\s<>\\]*?-a\d+""").findAll(html)
+                .map { it.value }.toSet().size
+        } catch (_: Throwable) { 0 }
+    }
+
+    /** Số lần xuất hiện "xem-phim" (link tập) trong HTML. */
+    private fun countXemPhim(html: String): Int {
+        return try {
+            Regex("xem-phim", RegexOption.IGNORE_CASE).findAll(html).count()
+        } catch (_: Throwable) { 0 }
+    }
+
+    /** Lưu cookie từ CookieManager (clearance của WebView) vào cfCookieCache
+     *  để plain HTTP dùng lại. LƯU Ý: cf_clearance gắn với UA của WebView —
+     *  webviewDocCapture đặt UA trùng USER_AGENT để plain HTTP tái sử dụng được. */
+    private fun saveCfCookiesFromManager(tag: String) {
+        try {
+            val ck = CookieManager.getInstance().getCookie(mainUrl)
+            if (!ck.isNullOrBlank()) {
+                val map = ck.split(";").mapNotNull {
+                    val idx = it.indexOf('=')
+                    if (idx <= 0) null else it.substring(0, idx).trim() to it.substring(idx + 1).trim()
+                }.toMap()
+                cfCookieCache[mainUrl] = map
+                nlog("[$tag] cookie-cache +${map.size} cookie")
+            }
+        } catch (e: Throwable) { nlogE("[$tag] cookie-save", e) }
     }
 
     private fun absolutize(href: String?): String? {
@@ -314,10 +369,12 @@ class AnimeVsubProvider : MainAPI() {
 
     /**
      * Fetch một trang HTML bất kỳ của site, nhanh nhất có thể.
-     * Sau mỗi lần WebViewResolver thành công, cookies (cf_clearance...) được
-     * cache để các lần gọi plain HTTP sau không phải chạy WebView nữa.
+     * mode: MODE_LISTING (mặc định — chỉ nhận trang đã render cards),
+     *       MODE_DETAIL (trang chi tiết/xem), MODE_LOOSE (search, embed).
+     * Sau mỗi lần WebView DOM capture thành công, cookies (cf_clearance...) được
+     * cache để các lần gọi plain HTTP sau có cơ hội không phải chạy WebView nữa.
      */
-    private suspend fun fetchDoc(url: String, useCache: Boolean = true): Document {
+    private suspend fun fetchDoc(url: String, useCache: Boolean = true, mode: Int = MODE_LISTING): Document {
         if (useCache) {
             docCache[url]?.let { cached ->
                 if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) {
@@ -372,9 +429,12 @@ class AnimeVsubProvider : MainAPI() {
             }
         }
 
-        // ── 3. WebView im lặng (serialized) — Resolver trả trang thật nếu cookie còn hiệu lực ──
+        // ── 3. WebView DOM capture im lặng (serialized qua cfMutex) ──
+        //    v4: WebViewResolver cũ trả RAW HTML TRƯỚC KHI JS render — log 25-10
+        //    11:09: webview "OK" nhưng 0 link /phim/ -> 0 items mọi danh mục.
+        //    Giờ: WebView tự quản, poll DOM mỗi 0.8s, chỉ nhận khi có dữ liệu phim.
         val silent = cfMutex.withLock {
-            // Ai đó có thể đã giải xong trong lúc ta chờ lock.
+            // Ai đó có thể đã fetch xong trong lúc ta chờ lock.
             if (useCache) {
                 docCache[url]?.let { cached ->
                     if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) return@withLock cached.doc
@@ -388,32 +448,15 @@ class AnimeVsubProvider : MainAPI() {
                 }
             }
 
-            nlog("[Fetch] webview fallback $url")
-            val wt0 = System.currentTimeMillis()
-            val interceptor = WebViewResolver(Regex(Regex.escape(url)))
-            val resp = app.get(url, headers = commonHeaders, interceptor = interceptor)
-            try {
-                if (resp.cookies.isNotEmpty()) {
-                    cfCookieCache[mainUrl] = resp.cookies
-                    nlog("[Fetch] webview cookies+${resp.cookies.size}")
-                }
-            } catch (_: Throwable) {}
-            val doc = resp.document
-            val html = doc.outerHtml()
-            // v3: kiểm tra blocked TRƯỚC khi cache — log 25-10: webview trả gate
-            // nhanh (484ms) rồi bị cache gây 0 items cho tới hết TTL.
-            if (looksBlocked(html)) {
-                nlog("[Fetch] webview VẪN BLOCKED title='${pageTitleOf(html)}' ms=${System.currentTimeMillis() - wt0} $url")
-                return@withLock null
-            }
-            nlog("[Fetch] webview OK ms=${System.currentTimeMillis() - wt0} $url")
-            if (useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
+            nlog("[Fetch] webview-dom fallback mode=$mode $url")
+            val doc = webviewDocCapture(url, mode, WV_SILENT_TIMEOUT_MS, interactive = false)
+            if (doc != null && useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
             doc
         }
         if (silent != null) return silent
 
-        // ── 4. Unlock tương tác: Dialog WebView cho user tick "Verify you are human" ──
-        unlockGate(url)?.let {
+        // ── 4. Unlock tương tác: Dialog WebView cho user tick "Xác Minh An Toàn" ──
+        unlockGate(url, mode)?.let {
             if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
             return it
         }
@@ -422,8 +465,13 @@ class AnimeVsubProvider : MainAPI() {
             if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
             return it
         }
+        // Lần chót: silent webview với clearance mới (unlock khác vừa mở gate).
+        webviewDocCapture(url, mode, WV_SILENT_TIMEOUT_MS, interactive = false)?.let {
+            if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
+            return it
+        }
 
-        throw ErrorLoadingException("AnimeVsub: site đang chặn bởi trang xác minh — hãy thử lại và hoàn tất xác minh trong cửa sổ plugin mở ra (xem animevsub_diag.txt)")
+        throw ErrorLoadingException("AnimeVsub: site vẫn chặn sau khi thử mọi đường — hãy thử lại và hoàn tất xác minh trong cửa sổ plugin mở ra (xem animevsub_diag.txt)")
     }
 
     /** GET trả về text thô (dùng cho m3u8), có kiểm tra block-page. */
@@ -560,7 +608,16 @@ class AnimeVsubProvider : MainAPI() {
                 var title = a.attr("title").trim()
                 if (title.isBlank()) title = a.selectFirst("h3, h2, .title, .name, .film-title")?.text()?.trim() ?: ""
                 if (title.isBlank()) title = a.text().trim()
+                // v4: nhiều CMS đặt tên phim ở alt của ảnh card
+                if (title.isBlank()) title = a.selectFirst("img")?.attr("alt")?.trim() ?: ""
+                if (title.isBlank()) {
+                    title = a.closest("li, .item, .card, .movie-item, .film-item, article")
+                        ?.selectFirst("h3, h2, .title, .name")?.text()?.trim() ?: ""
+                }
                 if (title.isBlank()) continue
+                // v4: chặn title rác (anchor "Xem phim"/"Tập N" lọt vào card)
+                val tl = title.lowercase()
+                if (tl == "xem phim" || tl == "xem ngay" || tl.startsWith("tập ")) continue
                 // Tiêu đề rác kiểu "Xem phim ..." quá dài thường là link nội dung, bỏ.
                 if (title.length > 120) continue
 
@@ -575,6 +632,11 @@ class AnimeVsubProvider : MainAPI() {
             } catch (e: Throwable) {
                 nlogE("[Card]", e, a.attr("href").take(60))
             }
+        }
+        if (out.isEmpty()) {
+            // v4: chẩn đoán trang nhận được khi 0 cards — lần log sau sẽ xác định
+            // NGAY trang là gate/shell/trang thật nhưng selector lệch.
+            nlog("[Parse] 0 cards | title='${doc.title().take(50)}' aTotal=${doc.select("a").size} aPhim=${doc.select("a[href*=\"/phim/\"]").size} img=${doc.select("img").size} iframe=${doc.select("iframe").size} textLen=${doc.text().length}")
         }
         return out.values.toList()
     }
@@ -592,13 +654,19 @@ class AnimeVsubProvider : MainAPI() {
             "$mainUrl/tim-kiem.html?keyword=$keyword",
             "$mainUrl/?s=$keyword"
         )
+        var cleanMiss = 0
         for (url in candidates) {
             try {
-                val doc = fetchDoc(url)
+                val doc = fetchDoc(url, mode = MODE_LOOSE)
                 val items = parseCards(doc)
-                if (items.isNotEmpty()) {
-                    nlog("[Search] '$query' -> ${items.size} @ $url")
-                    return items
+                nlog("[Search] '$query' -> ${items.size} @ $url")
+                if (items.isNotEmpty()) return items
+                // v4: trang sạch mà 0 kết quả — đừng đốt thêm biến thể
+                // (mỗi biến thể chạy trọn fetch chain, rất chậm khi bị gate).
+                cleanMiss++
+                if (cleanMiss >= 2) {
+                    nlog("[Search] dừng sau $cleanMiss biến thể sạch 0 kết quả")
+                    return emptyList()
                 }
             } catch (e: Throwable) {
                 if (isCancellation(e)) throw e
@@ -628,7 +696,7 @@ class AnimeVsubProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val detail = detailUrl(url) ?: url
         val doc = try {
-            fetchDoc(detail)
+            fetchDoc(detail, mode = MODE_DETAIL)
         } catch (e: Throwable) {
             nlogE("[Load] fetchDoc", e, detail)
             throw e
@@ -784,7 +852,7 @@ class AnimeVsubProvider : MainAPI() {
             // ═══ STEP 1: HTML trang xem (plain HTTP + cookie clearance) ═══
             if (!linkFound) {
                 try {
-                    val doc = fetchDoc(watchUrl, useCache = false)
+                    val doc = fetchDoc(watchUrl, useCache = false, mode = MODE_DETAIL)
                     val html = doc.outerHtml()
 
                     val (m3u8s, mp4s) = harvestMediaUrls(html)
@@ -885,7 +953,7 @@ class AnimeVsubProvider : MainAPI() {
             // ═══ STEP 4: WebViewResolver broad trên từng embed (nếu còn đường) ═══
             if (!linkFound) {
                 try {
-                    val embeds = harvestIframes(fetchDoc(watchUrl, useCache = false)).take(MAX_EMBEDS)
+                    val embeds = harvestIframes(fetchDoc(watchUrl, useCache = false, mode = MODE_DETAIL)).take(MAX_EMBEDS)
                     nlog("[Step4] embeds=${embeds.size} ${embeds.joinToString(" | ") { it.take(60) }}")
                     for (embed in embeds) {
                         try {
@@ -925,7 +993,7 @@ class AnimeVsubProvider : MainAPI() {
         embed: String, watchUrl: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
-            val doc = fetchDoc(embed, useCache = false)
+            val doc = fetchDoc(embed, useCache = false, mode = MODE_LOOSE)
             val html = doc.outerHtml()
             val embedOrigin = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: mainUrl
 
@@ -950,7 +1018,7 @@ class AnimeVsubProvider : MainAPI() {
             // 1 cấp lồng: embed lại chứa iframe con.
             val nested = harvestIframes(doc).filter { it != embed }.firstOrNull()
             if (nested != null) {
-                val nestedDoc = fetchDoc(nested, useCache = false)
+                val nestedDoc = fetchDoc(nested, useCache = false, mode = MODE_LOOSE)
                 val nestedHtml = nestedDoc.outerHtml()
                 val nestedOrigin = Regex("""^(https?://[^/]+)""").find(nested)?.groupValues?.get(1) ?: embedOrigin
                 val (nm3u8, nmp4) = harvestMediaUrls(nestedHtml)
@@ -1220,12 +1288,13 @@ class AnimeVsubProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  GATE UNLOCK TƯƠNG TÁC (v3 — log 25-10: gate "Xác Minh An Toàn" không tự giải
-    //  được bằng HTTP/cookie; cần WebView thật + người dùng tick MỘT lần. Sau đó
-    //  clearance cookie dùng lại cho MỌI fetch plain, đúng quy trình NguonC).
-    //  Dialog full-screen nạp targetUrl; JS bridge gửi DOM về mỗi 4s; khi DOM sạch
-    //  (đã qua gate) -> lưu cookie + trả Document. gateMutex bảo đảm 1 dialog; tối
-    //  đa 1 lần chủ động / 10 phút; caller song song sẽ chờ rồi thử plain lại.
+    //  WEBVIEW DOM CAPTURE + GATE UNLOCK (v4 — log 25-10 11:09: webview "OK" vẫn
+    //  0 items mọi danh mục. Nguyên nhân: WebViewResolver trả RAW HTML TRƯỚC KHI
+    //  JS render — site render danh sách phim bằng AJAX nên HTML thô không có
+    //  link /phim/; hoặc gate chưa xong. Fix: WebView tự quản lý, poll DOM mỗi
+    //  0.8s qua JS bridge, CHỈ nhận khi DOM có dữ liệu phim theo mode. Silent
+    //  trước (không UI); nếu gate vẫn chặn -> unlockGate() mở Dialog full-screen
+    //  cho user tick "Xác Minh An Toàn" MỘT lần, clearance cookie dùng lại sau.)
     // ═══════════════════════════════════════════════════════════════════════════
 
     private val gateMutex = Mutex()
@@ -1233,9 +1302,11 @@ class AnimeVsubProvider : MainAPI() {
     private val GATE_RETRY_MS = 10 * 60 * 1000L
     private val GATE_OPEN_TIMEOUT_MS = 90_000L
 
-    private val gateDomJs = """
+    // Poll DOM mỗi 0.8s gửi về Kotlin qua bridge __avsGate (tên KHÁC hook bridge
+    // __avsBridge — bài học NguonC v3: trùng tên @JavascriptInterface -> crash).
+    private val domPollJs = """
 (function(){
-  if (window.__avsGateLoop) return; window.__avsGateLoop = true;
+  if (window.__avsDomLoop) return; window.__avsDomLoop = true;
   function send(){
     try {
       var h = document.documentElement.outerHTML;
@@ -1243,12 +1314,11 @@ class AnimeVsubProvider : MainAPI() {
     } catch (e) {}
   }
   send();
-  setInterval(send, 4000);
+  setInterval(send, 800);
 })();
 """
 
-    /** JS -> Kotlin bridge cho gate unlock. Tên object/method KHÁC hook bridge
-     *  (bài học NguonC v3: trùng tên @JavascriptInterface -> StackOverflowError). */
+    /** JS -> Kotlin bridge cho DOM poll. */
     private class AvsGateBridge(private val handler: (String, String) -> Unit) {
         @JavascriptInterface
         fun onDom(url: String?, html: String?) {
@@ -1257,9 +1327,142 @@ class AnimeVsubProvider : MainAPI() {
         }
     }
 
-    private suspend fun unlockGate(targetUrl: String): Document? = gateMutex.withLock {
+    /**
+     * Nạp url trong WebView TỰ QUẢN LÝ, poll DOM mỗi 0.8s:
+     *  - MODE_LISTING: hoàn tất khi DOM có link /phim/{slug}-a{id} (cards đã render)
+     *  - MODE_DETAIL : hoàn tất khi có link xem-phim, hoặc sau ~8 poll (~6.4s)
+     *  - MODE_LOOSE  : hoàn tất khi DOM sạch sau 4 poll (~3.2s)
+     * Nếu mọi poll đều blocked (gate chưa giải) -> trả null để caller escalate
+     * sang unlockGate() (interactive). interactive=true: WebView nằm trong Dialog
+     * full-screen để người dùng tick xác minh. Timeout: trả DOM sạch cuối cùng
+     * (nếu có) thay vì null — trang trúng nhưng ít dữ liệu vẫn được dùng.
+     */
+    private suspend fun webviewDocCapture(
+        url: String, mode: Int, timeoutMs: Long, interactive: Boolean
+    ): Document? {
+        val ctx = appContext()
+        if (ctx == null) {
+            nlog("[WVDom] không có context — bỏ qua webview $url")
+            return null
+        }
+        if (interactive && (ctx !is android.app.Activity || ctx.isFinishing)) return null
+
+        val done = kotlinx.coroutines.CompletableDeferred<Document?>()
+        var webView: WebView? = null
+        var dialog: android.app.Dialog? = null
+        var lastHtml: String? = null
+        var lastBlocked = true
+        try {
+            withContext(Dispatchers.Main) {
+                val wv = WebView(ctx)
+                webView = wv
+                wv.settings.javaScriptEnabled = true
+                wv.settings.domStorageEnabled = true
+                // v4: UA ĐỒNG BỘ với plain HTTP — cf_clearance gắn với UA, lệch UA là 403.
+                wv.settings.userAgentString = USER_AGENT
+                wv.settings.mediaPlaybackRequiresUserGesture = false
+                // Chặn tải ảnh: DOM sẵn sàng nhanh hơn hẳn, tiết kiệm băng thông.
+                try { wv.settings.blockNetworkImage = true } catch (_: Throwable) {}
+                try { CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true) } catch (_: Throwable) {}
+
+                var lastSig = ""
+                var pollIdx = 0
+                wv.addJavascriptInterface(AvsGateBridge { u, html ->
+                    if (done.isCompleted) return@AvsGateBridge
+                    pollIdx++
+                    val sig = html.length.toString() + ":" + html.take(120).hashCode()
+                    if (sig == lastSig) return@AvsGateBridge   // DOM không đổi — bỏ qua poll
+                    lastSig = sig
+                    val blocked = looksBlocked(html)
+                    val cards = countPhimAnchors(html)
+                    val xem = countXemPhim(html)
+                    nlog("[WVDom] poll#$pollIdx len=${html.length} blocked=$blocked cards=$cards xem=$xem ${u.take(70)}")
+                    lastHtml = html
+                    lastBlocked = blocked
+                    val ready = !blocked && when (mode) {
+                        MODE_LISTING -> cards > 0
+                        MODE_DETAIL  -> xem > 0 || cards > 0 || pollIdx >= 8
+                        else         -> pollIdx >= 4 || cards > 0 || xem > 0
+                    }
+                    if (ready) {
+                        saveCfCookiesFromManager("WVDom")
+                        try { wv.stopLoading() } catch (_: Throwable) {}
+                        done.complete(Jsoup.parse(html, u))
+                    }
+                }, "__avsGate")
+
+                wv.webChromeClient = WebChromeClient()
+                wv.webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(view: WebView?, u: String?, favicon: Bitmap?) {
+                        try { nlog("[WVDom] page-start ${u?.take(90)}") } catch (_: Throwable) {}
+                        view?.evaluateJavascript(domPollJs, null)
+                    }
+                    override fun onPageFinished(view: WebView?, u: String?) {
+                        try { nlog("[WVDom] page-finish ${u?.take(90)}") } catch (_: Throwable) {}
+                        view?.evaluateJavascript(domPollJs, null)
+                    }
+                }
+
+                if (interactive && ctx is android.app.Activity && !ctx.isFinishing) {
+                    try {
+                        val dlg = android.app.Dialog(ctx)
+                        dlg.setContentView(
+                            wv,
+                            android.view.ViewGroup.LayoutParams(
+                                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                                android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                            )
+                        )
+                        dlg.window?.setLayout(
+                            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                            android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                        dlg.setCanceledOnTouchOutside(false)
+                        dlg.setCancelable(true)   // Back = huỷ unlock
+                        dlg.setOnDismissListener {
+                            try { if (!done.isCompleted) done.complete(null) } catch (_: Throwable) {}
+                        }
+                        dlg.show()
+                        dialog = dlg
+                    } catch (e: Throwable) {
+                        // Vẫn chạy headless — challenge đôi khi tự giải mà không cần user.
+                        nlogE("[WVDom] dialog", e, "chạy headless")
+                    }
+                }
+
+                wv.loadUrl(url, mapOf("Referer" to "$mainUrl/"))
+            }
+
+            val t0 = System.currentTimeMillis()
+            var doc = withTimeoutOrNull(timeoutMs) { done.await() }
+            if (doc != null) {
+                nlog("[WVDom] OK interactive=$interactive ms=${System.currentTimeMillis() - t0} $url")
+            } else {
+                // Timeout/huỷ: nếu đã có DOM sạch (chưa "ready" vì thiếu cards/xem)
+                // thì vẫn trả — caller tự quyết (getMainPage sẽ thử candidate kế).
+                val lh = lastHtml
+                if (lh != null && !lastBlocked) {
+                    nlog("[WVDom] TIMEOUT nhưng DOM sạch (len=${lh.length}) — trả DOM cuối $url")
+                    doc = Jsoup.parse(lh, url)
+                } else {
+                    nlog("[WVDom] TIMEOUT/BỊ CHẶN ${timeoutMs / 1000}s interactive=$interactive $url")
+                }
+            }
+            return doc
+        } finally {
+            try { withContext(Dispatchers.Main) { dialog?.dismiss() } } catch (_: Throwable) {}
+            try { withContext(Dispatchers.Main) { webView?.destroy() } } catch (_: Throwable) {}
+        }
+    }
+
+    /**
+     * Unlock tương tác (v4): Dialog full-screen nạp url; thành công khi DOM có
+     * dữ liệu theo mode (đúng tiêu chí webviewDocCapture). gateMutex bảo đảm
+     * 1 dialog duy nhất; tối đa 1 lần chủ động / 10 phút (GATE_RETRY_MS).
+     */
+    private suspend fun unlockGate(url: String, mode: Int = MODE_LISTING): Document? = gateMutex.withLock {
         if (System.currentTimeMillis() - lastGateAttemptMs < GATE_RETRY_MS) {
-            // Có unlock khác đang chạy/vừa chạy — trả null để caller thử plain lại với cookie mới.
+            // Có unlock khác đang chạy/vừa chạy — trả null để caller thử đường khác.
             nlog("[Gate] bỏ qua (đã có unlock trong ${GATE_RETRY_MS / 60000} phút gần đây)")
             return@withLock null
         }
@@ -1271,97 +1474,11 @@ class AnimeVsubProvider : MainAPI() {
             return@withLock null
         }
 
-        nlog("[Gate] mở dialog xác minh: $targetUrl")
+        nlog("[Gate] mở dialog xác minh: $url")
         ntoast("AnimeVsub: site yêu cầu xác minh — hãy hoàn tất trong cửa sổ vừa mở")
-
-        val done = kotlinx.coroutines.CompletableDeferred<Document?>()
-        var webView: WebView? = null
-        var dialog: android.app.Dialog? = null
-        try {
-            withContext(Dispatchers.Main) {
-                val wv = WebView(ctx)
-                webView = wv
-                wv.settings.javaScriptEnabled = true
-                wv.settings.domStorageEnabled = true
-                wv.settings.userAgentString = USER_AGENT
-                wv.settings.mediaPlaybackRequiresUserGesture = false
-                try { CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true) } catch (_: Throwable) {}
-
-                var lastSig = ""
-                wv.addJavascriptInterface(AvsGateBridge { url, html ->
-                    val sig = html.length.toString() + ":" + html.take(120).hashCode()
-                    if (sig == lastSig) return@AvsGateBridge   // trùng DOM poll trước
-                    lastSig = sig
-                    val blocked = looksBlocked(html)
-                    nlog("[Gate] dom len=${html.length} blocked=$blocked url=${url.take(70)}")
-                    if (!blocked) {
-                        try {
-                            val ck = CookieManager.getInstance().getCookie(mainUrl)
-                            if (!ck.isNullOrBlank()) {
-                                cfCookieCache[mainUrl] = ck.split(";").mapNotNull {
-                                    val idx = it.indexOf('=')
-                                    if (idx <= 0) null else it.substring(0, idx).trim() to it.substring(idx + 1).trim()
-                                }.toMap()
-                                nlog("[Gate] cookie-cache +${cfCookieCache[mainUrl]?.size ?: 0} cookie")
-                            }
-                        } catch (e: Throwable) { nlogE("[Gate] cookie", e) }
-                        try { wv.stopLoading() } catch (_: Throwable) {}
-                        done.complete(Jsoup.parse(html, url))
-                    }
-                }, "__avsGate")
-
-                wv.webChromeClient = WebChromeClient()
-                wv.webViewClient = object : WebViewClient() {
-                    override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                        try { nlog("[Gate] page-start ${url?.take(90)}") } catch (_: Throwable) {}
-                        view?.evaluateJavascript(gateDomJs, null)
-                    }
-                    override fun onPageFinished(view: WebView?, url: String?) {
-                        try { nlog("[Gate] page-finish ${url?.take(90)}") } catch (_: Throwable) {}
-                        view?.evaluateJavascript(gateDomJs, null)
-                    }
-                }
-
-                val dlg = android.app.Dialog(ctx)
-                dlg.setContentView(
-                    wv,
-                    android.view.ViewGroup.LayoutParams(
-                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-                        android.view.ViewGroup.LayoutParams.MATCH_PARENT
-                    )
-                )
-                dlg.window?.setLayout(
-                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-                    android.view.ViewGroup.LayoutParams.MATCH_PARENT
-                )
-                dlg.setCanceledOnTouchOutside(false)
-                dlg.setCancelable(true)   // Back = huỷ unlock
-                dlg.setOnDismissListener {
-                    try { if (!done.isCompleted) done.complete(null) } catch (_: Throwable) {}
-                }
-                try {
-                    dlg.show()
-                    dialog = dlg
-                } catch (e: Throwable) {
-                    // Vẫn chạy headless — challenge đôi khi tự giải mà không cần user.
-                    nlogE("[Gate] show dialog", e, "chạy headless")
-                    done.complete(null)
-                }
-                wv.loadUrl(targetUrl, mapOf("Referer" to "$mainUrl/"))
-            }
-
-            val t0 = System.currentTimeMillis()
-            val doc = withTimeoutOrNull(GATE_OPEN_TIMEOUT_MS) { done.await() }
-            if (doc != null) {
-                nlog("[Gate] OK trong +${System.currentTimeMillis() - t0}ms")
-            } else {
-                nlog("[Gate] TIMEOUT/HỦY sau ${GATE_OPEN_TIMEOUT_MS / 1000}s")
-            }
-            doc
-        } finally {
-            try { withContext(Dispatchers.Main) { dialog?.dismiss() } } catch (_: Throwable) {}
-            try { withContext(Dispatchers.Main) { webView?.destroy() } } catch (_: Throwable) {}
-        }
+        val doc = webviewDocCapture(url, mode, GATE_OPEN_TIMEOUT_MS, interactive = true)
+        if (doc != null) nlog("[Gate] OK") else nlog("[Gate] TIMEOUT/HỦY sau ${GATE_OPEN_TIMEOUT_MS / 1000}s")
+        doc
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
