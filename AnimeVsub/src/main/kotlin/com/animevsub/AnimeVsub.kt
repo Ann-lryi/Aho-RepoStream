@@ -136,7 +136,27 @@
 //      không retry/không cache, getMainPage/search trả rỗng gọn gàng.
 //    * KHÔNG cache listing 0-card (trang rớt từng bị cache 5 phút).
 //    * NLOG INST ID: banner + mỗi dòng mang inst=xx + pid trong banner — lần
-//      diag sau sẽ thấy NGAY nếu vẫn còn 2 bản plugin chạy chung (v10.a vs v10.b).
+//      diag sau sẽ thấy NGAY nếu vẫn còn 2 bản plugin chạy chung (v11.a vs v11.b).
+//  v11 (26-10-2026, "phát video" — theo diag 19:14 + screenshot lỗi 2004: duyệt
+//  web đã thắng TOÀN BỘ [home 32 / search 32 / Hành Động 43 / Hài 41 / tập
+//  3-14-40-53], S3 bắt playlist 484KB/324 seg + 589KB/395 seg; NHƯNG mọi
+//  segment đều [Seg] 403 JSON — CDN stream.googleapiscdn.com từ chối MỌI lớp
+//  okhttp/URLConn (4 biến thể referer, có/không cookie) trong khi CHÍNH
+//  WebView vừa tải playlist 484KB thành công ngay trước đó → chỉ context
+//  trình duyệt thật (TLS Chrome + UA thật + cookie) được CDN chấp nhận):
+//    * CẦU WEBVIEW (AvsWvBridge): 1 WebView ẩn mở trang gốc của CDN (cùng
+//      origin với segment), segment bị chặn ở lớp HTTP thường sẽ được fetch()
+//      NGAY TRONG trang đó (same-origin + credentials — y hệt cách hls.js tải
+//      trong player) rồi trả bytes về proxy cục bộ cho ExoPlayer.
+//    * SEGMENT FETCHER 3 LỚP: okhttp (UA thật + cookie từng domain + Origin +
+//      Sec-Fetch + chuỗi referer origin->playlist->trang xem) -> URLConn ->
+//      CẦU WEBVIEW. Sau segment đầu nếu 2 lớp HTTP đều chặn → các segment sau
+//      đi thẳng cầu (bỏ 2-3s chết mỗi segment).
+//    * NEGATIVE-CACHE 5s: URL vừa fail-all không dội lại ngay (không dọa
+//      rate-limit thêm); log [Seg] dedup theo URL + peek 240 byte body 403 —
+//      JSON lỗi thật của CDN sẽ hiện thẳng trong diag lần sau.
+//    * BỎ LINK DIRECT: CDN 403 cả ExoPlayer (cùng okhttp) — chỉ còn 1 link
+//      "Vietsub" qua proxy cục bộ (hết cảnh chọn trúng "dự phòng" chết).
 // URL patterns đã xác minh qua search index + Telegram kênh chính thức (24-10-2026):
 //  - Chi tiết phim : /phim/{slug}-a{id}/          (vd /phim/dogulwang-a6014/)
 //  - Trang xem     : /phim/{slug}-a{id}/xem-phim.html
@@ -196,6 +216,17 @@ class AnimeVsubProvider : MainAPI() {
     /** UA thật của WebView (ghi lần đầu tạo WebView — chỉ để log chẩn đoán). */
     @Volatile private var wvUserAgent: String? = null
 
+    /** v11: UA dùng cho request video — ưu tiên UA THẬT của WebView. Diag 26-10:
+     *  CDN stream.googleapiscdn 403 mọi segment của okhttp mặc dù referer đủ cả
+     *  4 biến thể — cặp "UA Windows 141 + TLS okhttp" là dấu hiệu bị chặn. */
+    private fun deviceUa(): String = wvUserAgent ?: USER_AGENT
+
+    /** v11: cookie theo ĐÚNG domain của url từ CookieManager toàn cục (thứ mà
+     *  các WebView đã thu khi duyệt site/player). Proxy cũ gửi 0 cookie. */
+    private fun cookiesFor(url: String): String = try {
+        CookieManager.getInstance().getCookie(url) ?: ""
+    } catch (_: Throwable) { "" }
+
     /**
      * v10: TẮT tầng plain HTTP + CORS proxy cho trang site (mặc định).
      * Log 25-26/10: plain 100% 403 (len≈660 — CF edge chặn fingerprint TLS của
@@ -209,7 +240,7 @@ class AnimeVsubProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════════
     //  FLAGS / HẰNG SỐ
     // ═══════════════════════════════════════════════════════════════════════════
-    private val AVS_BUILD = "v10"
+    private val AVS_BUILD = "v11"
     // v10: định danh instance (random mỗi lần provider được nạp). Banner ghi cả
     // pid. Nếu diag có >=2 banner, hoặc 2 nhóm prefix "v10.xx" khác nhau -> app
     // đang chạy NHIỀU bản plugin song song (cài trùng extension / 2 repo) — đó
@@ -2486,7 +2517,7 @@ private fun currentActivity(): android.app.Activity? {
         probe.forEachIndexed { idx, segUrl ->
             val ok = try {
                 val req = okhttp3.Request.Builder().url(segUrl)
-                    .header("User-Agent", USER_AGENT)
+                    .header("User-Agent", deviceUa())
                     .header("Referer", referer)
                     .header("Range", "bytes=0-1024")
                     .build()
@@ -2500,10 +2531,12 @@ private fun currentActivity(): android.app.Activity? {
         return if (firstOk > 0) firstOk else 0
     }
 
-    /** Tạo link phát cho 1 playlist (v7): link TRỰC TIẾP trước (ExoPlayer tự gửi
-     *  UA+Referer cho cả playlist lẫn segment) + link proxy cục bộ DỰ PHÒNG với
-     *  chuỗi referer [site, playlist]. Log 25-10: proxy cũ dùng referer=playlist
-     *  URL -> CDN stream.googleapiscdn từ chối -> không phát được dù S3 "HIT". */
+    /** Tạo link phát cho 1 playlist. v11: CDN stream.googleapiscdn.com 403 MỌI
+     *  client không phải WebView thật (diag 26-10: 4 biến thể referer/origin của
+     *  okhttp đều 403 JSON; ExoPlayer cũng dùng okhttp nên link direct chắc chắn
+     *  chết) → chỉ phát 1 link DUY NHẤT qua proxy cục bộ (trong đó có cầu
+     *  WebView dự phòng); link direct chỉ còn là phương án cuối khi không mở
+     *  được port cục bộ. */
     private suspend fun registerM3U8Link(
         m3u8Content: String, m3u8Url: String, m3u8BaseUrl: String,
         serverName: String, callback: (ExtractorLink) -> Unit,
@@ -2520,18 +2553,7 @@ private fun currentActivity(): android.app.Activity? {
         val trim = preflightTrimCount(segUrls, ref)
         if (trim > 0) nlog("[Register] trim $trim segment đầu (probe chặn)")
 
-        // ── Link TRỰC TIẾP: phát luôn URL gốc, ExoPlayer gửi UA+Referer ──
-        try {
-            callback(newExtractorLink(name, serverName, m3u8Url, ExtractorLinkType.M3U8) {
-                quality = Qualities.P1080.value
-                headers = mapOf("User-Agent" to USER_AGENT, "Referer" to ref)
-            })
-            nlog("[Register] direct '$serverName' ${m3u8Url.take(80)}")
-        } catch (e: Throwable) {
-            nlogE("[Register] direct", e)
-        }
-
-        // ── Link PROXY dự phòng: local server, chuỗi referer đầy đủ ──
+        // ── Link PROXY cục bộ: nguồn phát chính (okhttp nhiều lớp + cầu WebView) ──
         //  Giới hạn số proxy sống đồng thời (tránh cạn port trong session dài).
         //  v7b-fix: newExtractorLink là hàm suspend — KHÔNG được gọi bên trong
         //  synchronized (critical section). Lock CHỈ quản lý vòng đời server;
@@ -2550,18 +2572,32 @@ private fun currentActivity(): android.app.Activity? {
                 server.setM3U8(rewriteM3U8(trimLeadingSegments(m3u8Content, trim), "http://127.0.0.1:${server.port}", m3u8BaseUrl))
             } catch (e: Throwable) {
                 proxyBase = null
-                nlogE("[Register] bind", e, "không mở được port cục bộ — chỉ dùng link direct")
+                nlogE("[Register] bind", e, "không mở được port cục bộ — rơi về link direct")
             }
         }
-        val proxyEmitBase = proxyBase ?: return true
+        val proxyEmitBase = proxyBase
+        if (proxyEmitBase != null) {
+            try {
+                callback(newExtractorLink(name, serverName, "$proxyEmitBase/stream.m3u8", ExtractorLinkType.M3U8) {
+                    quality = Qualities.P1080.value
+                    headers = mapOf("User-Agent" to deviceUa())
+                })
+                nlog("[Register] emitted $proxyEmitBase/stream.m3u8 segs=${segUrls.size}")
+                return true
+            } catch (e: Throwable) {
+                nlogE("[Register] proxy-emit", e)
+            }
+        }
+
+        // ── Cuối cùng: link direct (chỉ khi proxy không khả dụng) ──
         try {
-            callback(newExtractorLink(name, "$serverName • dự phòng", "$proxyEmitBase/stream.m3u8", ExtractorLinkType.M3U8) {
+            callback(newExtractorLink(name, serverName, m3u8Url, ExtractorLinkType.M3U8) {
                 quality = Qualities.P1080.value
-                headers = mapOf("User-Agent" to USER_AGENT)
+                headers = mapOf("User-Agent" to deviceUa(), "Referer" to ref)
             })
-            nlog("[Register] emitted $proxyEmitBase/stream.m3u8 segs=${segUrls.size}")
+            nlog("[Register] direct-fallback '$serverName' ${m3u8Url.take(80)}")
         } catch (e: Throwable) {
-            nlogE("[Register] proxy-emit", e)
+            nlogE("[Register] direct", e)
         }
         return true
     }
@@ -2601,6 +2637,15 @@ private fun currentActivity(): android.app.Activity? {
         private val threadPool = java.util.concurrent.Executors.newCachedThreadPool()
         @Volatile private var _m3u8: String = ""
         private val okLogCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+        // v11: sau segment đầu nếu 2 lớp HTTP đều bị chặn → bỏ luôn, đi thẳng cầu WebView
+        @Volatile private var directDead = false
+        // v11: URL vừa fail-all → không nhận lại trong 5s (chống dội request vào CDN)
+        private val segFailUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
+        // v11: log [Seg] dedup theo (tag|url) — hết cảnh 100 dòng 403/URL như diag 19:15
+        private val segFailLogged: MutableSet<String> = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+        // v11: tối đa 4 lần peek body lỗi 403 (JSON lỗi của CDN nói lý do thật)
+        private val bodyLogBudget = java.util.concurrent.atomic.AtomicInteger(4)
 
         fun getM3U8(): String = _m3u8
         fun setM3U8(v: String) { _m3u8 = v }
@@ -2657,23 +2702,35 @@ private fun currentActivity(): android.app.Activity? {
                             java.net.URLDecoder.decode(path.removePrefix("/seg/"), "UTF-8")
                         } catch (_: Throwable) { return }
                         val t0 = System.currentTimeMillis()
-                        var ok = false
 
-                        // ── Method 0: OkHttp (CloudStream baseClient) ──
-                        if (!ok) ok = viaOkHttp(segUrl, output, crlf, t0)
-                        // ── Method 1: OkHttp với Referer = origin/ ──
-                        if (!ok) {
-                            val origin = Regex("""^(https?://[^/]+)""").find(primaryRef())?.groupValues?.get(1) ?: ""
-                            if (origin.isNotEmpty()) ok = viaOkHttpOrigin(segUrl, "$origin/", output, crlf, t0)
+                        // v11: negative cache — URL vừa fail-all thì đừng dội lại trong 5s
+                        val now = System.currentTimeMillis()
+                        val bannedUntil = segFailUntil[segUrl]
+                        if (bannedUntil != null && now < bannedUntil) {
+                            writeSimple(output, crlf, 502, "502 upstream blocked")
+                            return
                         }
-                        // ── Method 2: HttpURLConnection (không chunked, UA riêng) ──
-                        if (!ok) ok = viaUrlConnection(segUrl, output, crlf, t0)
+
+                        var ok = false
+                        // ── Lớp 1+2: HTTP thường (okhttp nhiều biến thể + URLConn).
+                        //  v11: sau segment đầu tiên nếu cả 2 lớp đều bị chặn →
+                        //  directDead=true, các segment sau đi THẲNG CẦU WEBVIEW
+                        //  (tiết kiệm 2-3s chết mỗi segment).
+                        if (!directDead) {
+                            ok = viaOkHttp(segUrl, output, crlf, t0)
+                            if (!ok) ok = viaUrlConnection(segUrl, output, crlf, t0)
+                            if (!ok) directDead = true
+                        }
+                        // ── Lớp 3 (v11): CẦU WEBVIEW — fetch() trong trang cùng origin
+                        if (!ok) ok = viaBridge(segUrl, output, crlf, t0)
 
                         if (!ok) {
-                            val body = "502 upstream blocked".toByteArray(Charsets.UTF_8)
-                            output.write(("HTTP/1.1 502 Bad Gateway${crlf}Content-Length: ${body.size}${crlf}$crlf").toByteArray())
-                            output.write(body)
-                            nlog("[Seg] ALL-METHODS-FAILED url=...${segUrl.takeLast(40)}")
+                            segFailUntil[segUrl] = System.currentTimeMillis() + 5_000
+                            if (segFailUntil.size > 160) segFailUntil.clear()
+                            writeSimple(output, crlf, 502, "502 upstream blocked")
+                            if (segFailLogged.add("ALL|$segUrl")) {
+                                nlog("[Seg] ALL-METHODS-FAILED url=...${segUrl.takeLast(40)}")
+                            }
                         }
                     }
                     else -> {
@@ -2694,19 +2751,31 @@ private fun currentActivity(): android.app.Activity? {
             code !in 200..299 || (ct ?: "").contains("text/html", ignoreCase = true)
 
         private fun viaOkHttp(segUrl: String, output: java.io.OutputStream, crlf: String, t0: Long): Boolean {
-            // v7: thử TỪNG referer trong chuỗi (site -> playlist URL -> ...)
-            for (ref in referers) {
-                if (ref.isBlank()) continue
-                val req = okhttp3.Request.Builder().url(segUrl)
-                    .header("User-Agent", USER_AGENT)
+            // v11: giả lập đúng context trình duyệt — UA THẬT của WebView, cookie
+            // theo domain, Origin + Sec-Fetch kiểu XHR, chuỗi referer: origin CDN
+            // -> playlist -> trang xem. Diag 26-10: 4 biến thể cũ đều 403 vì thiếu
+            // UA thật + cookie; peek body 403 sẽ lộ lý do thật nếu vẫn chặn.
+            val originRoot = Regex("""^(https?://[^/]+)""").find(segUrl)?.groupValues?.get(1) ?: ""
+            val refs = (listOf("$originRoot/") + referers).distinct().filter { it.isNotBlank() }
+            val cookie = cookiesFor(segUrl)
+            for (ref in refs) {
+                val b = okhttp3.Request.Builder().url(segUrl)
+                    .header("User-Agent", deviceUa())
                     .header("Referer", ref)
                     .header("Accept", "*/*")
-                    .build()
+                    .header("Accept-Language", "vi-VN,vi;q=0.9,en-US;q=0.8")
+                if (cookie.isNotBlank()) b.header("Cookie", cookie)
+                if (originRoot.isNotEmpty()) {
+                    b.header("Origin", originRoot)
+                    b.header("Sec-Fetch-Dest", "empty")
+                    b.header("Sec-Fetch-Mode", "cors")
+                    b.header("Sec-Fetch-Site", "same-origin")
+                }
                 val ok = try {
-                    segClient.newCall(req).execute().use { resp ->
+                    segClient.newCall(b.build()).execute().use { resp ->
                         val ct = resp.header("Content-Type")
                         if (isBlockedResponse(resp.code, ct)) {
-                            nlog("[Seg] OKHTTP ${resp.code} ct=$ct ref=${ref.take(30)} url=...${segUrl.takeLast(40)}")
+                            logSegFail("OKHTTP", "${resp.code} ct=$ct ref=${ref.take(28)}", segUrl, resp)
                             return@use false
                         }
                         val body = resp.body ?: return@use false
@@ -2735,7 +2804,9 @@ private fun currentActivity(): android.app.Activity? {
                         true
                     }
                 } catch (e: Throwable) {
-                    nlog("[Seg] OKHTTP err ${e.message} ref=${ref.take(30)} url=...${segUrl.takeLast(40)}")
+                    if (segFailLogged.add("OKHTTP-ERR|$segUrl")) {
+                        nlog("[Seg] OKHTTP err ${e.message} ref=${ref.take(28)} url=...${segUrl.takeLast(40)}")
+                    }
                     false
                 }
                 if (ok) return true
@@ -2743,57 +2814,24 @@ private fun currentActivity(): android.app.Activity? {
             return false
         }
 
-        private fun viaOkHttpOrigin(segUrl: String, originRef: String, output: java.io.OutputStream, crlf: String, t0: Long): Boolean {
-            val req = okhttp3.Request.Builder().url(segUrl)
-                .header("User-Agent", USER_AGENT)
-                .header("Referer", originRef)
-                .header("Accept", "*/*")
-                .build()
-            return try {
-                segClient.newCall(req).execute().use { resp ->
-                    val ct = resp.header("Content-Type")
-                    if (isBlockedResponse(resp.code, ct)) {
-                        nlog("[Seg] OKHTTP-ORIGIN ${resp.code} ct=$ct url=...${segUrl.takeLast(40)}")
-                        return false
-                    }
-                    val body = resp.body ?: return false
-                    val head = StringBuilder("HTTP/1.1 200 OK").append(crlf)
-                        .append("Content-Type: video/mp2t").append(crlf)
-                        .append("Access-Control-Allow-Origin: *").append(crlf)
-                    val len = body.contentLength()
-                    if (len > 0) head.append("Content-Length: ").append(len).append(crlf)
-                    else head.append("Connection: close").append(crlf)
-                    head.append(crlf)
-                    output.write(head.toString().toByteArray())
-                    val buf = ByteArray(65536)
-                    body.byteStream().use { stream ->
-                        while (true) {
-                            val n = stream.read(buf)
-                            if (n < 0) break
-                            output.write(buf, 0, n)
-                            output.flush()
-                        }
-                    }
-                    true
-                }
-            } catch (e: Throwable) {
-                nlogE("[Seg] OKHTTP-ORIGIN", e, "...${segUrl.takeLast(40)}")
-                false
-            }
-        }
-
         private fun viaUrlConnection(segUrl: String, output: java.io.OutputStream, crlf: String, t0: Long): Boolean {
             return try {
                 val conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
                 conn.connectTimeout = 10_000
                 conn.readTimeout = 15_000
-                conn.setRequestProperty("User-Agent", USER_AGENT)
-                conn.setRequestProperty("Referer", primaryRef())
+                // v11: UA thật + cookie + referer = origin CDN (thay vì UA Windows)
+                conn.setRequestProperty("User-Agent", deviceUa())
+                val originRootU = Regex("""^(https?://[^/]+)""").find(segUrl)?.groupValues?.get(1) ?: ""
+                if (originRootU.isNotEmpty()) conn.setRequestProperty("Referer", "$originRootU/")
                 conn.setRequestProperty("Accept", "*/*")
+                val ck = cookiesFor(segUrl)
+                if (ck.isNotBlank()) conn.setRequestProperty("Cookie", ck)
                 val code = conn.responseCode
                 val ct = conn.contentType
                 if (isBlockedResponse(code, ct)) {
-                    nlog("[Seg] URLCONN $code ct=$ct url=...${segUrl.takeLast(40)}")
+                    if (segFailLogged.add("URLCONN|$segUrl")) {
+                        nlog("[Seg] URLCONN $code ct=$ct url=...${segUrl.takeLast(40)}")
+                    }
                     try { conn.disconnect() } catch (_: Throwable) {}
                     return false
                 }
@@ -2816,9 +2854,277 @@ private fun currentActivity(): android.app.Activity? {
                 }
                 true
             } catch (e: Throwable) {
-                nlogE("[Seg] URLCONN", e, "...${segUrl.takeLast(40)}")
+                if (segFailLogged.add("URLCONN-ERR|$segUrl")) {
+                    nlogE("[Seg] URLCONN", e, "...${segUrl.takeLast(40)}")
+                }
                 false
             }
+        }
+
+        /** v11: peek 240 byte đầu của response lỗi — JSON lỗi của CDN (token hết
+         *  hạn? referer? cookie?) sẽ hiện thẳng trong diag, lần sau không phải đoán. */
+        private fun logSegFail(tag: String, detail: String, segUrl: String, resp: okhttp3.Response? = null) {
+            if (!segFailLogged.add("$tag|$segUrl")) return
+            var extra = ""
+            if (resp != null && bodyLogBudget.getAndDecrement() > 0) {
+                try {
+                    extra = " body=" + resp.peekBody(240L).string()
+                        .replace("\n", " ").replace("\r", "").take(180)
+                } catch (_: Throwable) {}
+            }
+            nlog("[Seg] $tag $detail url=...${segUrl.takeLast(36)}$extra")
+        }
+
+        private fun writeSimple(output: java.io.OutputStream, crlf: String, code: Int, text: String) {
+            try {
+                val body = text.toByteArray(Charsets.UTF_8)
+                output.write(("HTTP/1.1 $code Bad Gateway$crlf").toByteArray())
+                output.write(("Content-Length: ${body.size}$crlf$crlf").toByteArray())
+                output.write(body)
+                output.flush()
+            } catch (_: Throwable) {}
+        }
+
+        /** v11: LỚP 3 — lấy segment qua CẦU WEBVIEW (fetch() trong trang cùng
+         *  origin với CDN). Diag 26-10: đây là context duy nhất CDN chấp nhận. */
+        private fun viaBridge(segUrl: String, output: java.io.OutputStream, crlf: String, t0: Long): Boolean {
+            val bytes = try {
+                segBridge.fetchBytes(segUrl)
+            } catch (e: Throwable) {
+                if (segFailLogged.add("WVB-EX|$segUrl")) nlogE("[Seg] WVB", e, "...${segUrl.takeLast(36)}")
+                null
+            } ?: run {
+                if (segFailLogged.add("WVB|$segUrl")) {
+                    nlog("[Seg] WVB miss url=...${segUrl.takeLast(36)}")
+                }
+                return false
+            }
+            return try {
+                val head = StringBuilder("HTTP/1.1 200 OK").append(crlf)
+                    .append("Content-Type: video/mp2t").append(crlf)
+                    .append("Access-Control-Allow-Origin: *").append(crlf)
+                    .append("Content-Length: ").append(bytes.size).append(crlf).append(crlf)
+                output.write(head.toString().toByteArray())
+                output.write(bytes)
+                output.flush()
+                if (okLogCount.incrementAndGet() <= 40) {
+                    nlog("[Seg] WVB OK bytes=${bytes.size} t=${System.currentTimeMillis() - t0}ms url=...${segUrl.takeLast(26)}")
+                }
+                true
+            } catch (e: Throwable) {
+                nlogE("[Seg] WVB write", e)
+                false
+            }
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    //  v11 — HUB NHẬN DỮ LIỆU TỪ JS (inject 1 lần trước khi trang mở — bảo đảm
+    //  window.__avsSegHub tồn tại ở mọi document; chunk base64 ~256KB/lần để
+    //  an toàn với segment lớn, không phụ thuộc giới hạn evaluateJavascript).
+    // ═════════════════════════════════════════════════════════════════════
+    private class SegHub {
+        val parts = java.util.concurrent.ConcurrentHashMap<String, StringBuilder>()
+        val status = java.util.concurrent.ConcurrentHashMap<String, String>()
+        val latches = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.CountDownLatch>()
+
+        @JavascriptInterface
+        fun chunk(id: String?, part: String?) {
+            if (id == null || part.isNullOrEmpty()) return
+            try { parts.getOrPut(id) { StringBuilder() }.append(part) } catch (_: Throwable) {}
+        }
+
+        @JavascriptInterface
+        fun finish(id: String?, code: String?) {
+            if (id == null) return
+            try {
+                status[id] = code ?: "X:null"
+                latches.remove(id)?.countDown()
+            } catch (_: Throwable) {}
+        }
+    }
+
+    /** v11: cầu WebView dùng chung — tạo lười (chỉ khi lớp HTTP thường bị chặn). */
+    private val segBridge by lazy { AvsWvBridge() }
+
+    private inner class AvsWvBridge {
+        private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+        private val gate = java.util.concurrent.Semaphore(2)   // tối đa 2 fetch đồng thời
+        private val lock = Any()
+        private val reqCounter = java.util.concurrent.atomic.AtomicInteger(0)
+
+        private var wv: WebView? = null
+        private var hub: SegHub? = null
+        private var baseOf: String = ""
+        @Volatile private var ready = false
+        @Volatile private var failStreak = 0
+        @Volatile private var dead = false
+
+        private fun destroyWv() {
+            try { wv?.destroy() } catch (_: Throwable) {}
+            wv = null
+            hub = null
+            ready = false
+        }
+
+        /** Bảo đảm WebView đang mở trang cùng origin với url (originRoot có "/" cuối). */
+        private fun ensure(originRoot: String): Boolean {
+            synchronized(lock) {
+                try {
+                    if (ready && baseOf == originRoot) return true
+                    if (baseOf != originRoot) {
+                        if (baseOf.isNotEmpty()) nlog("[WVB] đổi origin $baseOf -> $originRoot")
+                        destroyWv()
+                        baseOf = originRoot
+                        dead = false
+                        failStreak = 0
+                    }
+                    if (wv == null) {
+                        // v11: cầu WebView sống DAI (không huỷ khi phát xong) — ưu tiên
+                        // APPLICATION context (diagContext) để không leak Activity; chỉ
+                        // rơi về appContext() (activity) khi không còn cách nào khác.
+                        val ctx = diagContext() ?: appContext() ?: run {
+                            nlog("[WVB] không có context — cầu không khả dụng")
+                            return false
+                        }
+                        val created = java.util.concurrent.CountDownLatch(1)
+                        var createdOk = false
+                        mainHandler.post {
+                            try {
+                                val w = WebView(ctx)
+                                w.settings.javaScriptEnabled = true
+                                w.settings.domStorageEnabled = true
+                                try { w.settings.blockNetworkImage = true } catch (_: Throwable) {}
+                                try { CookieManager.getInstance().setAcceptThirdPartyCookies(w, true) } catch (_: Throwable) {}
+                                w.webChromeClient = WebChromeClient()
+                                // Hub phải inject TRƯỚC khi trang mở (document start)
+                                // — interface add sau khi trang tải xong không bảo đảm
+                                // xuất hiện trong context hiện có.
+                                val h = SegHub()
+                                hub = h
+                                w.addJavascriptInterface(h, "__avsSegHub")
+                                w.webViewClient = object : WebViewClient() {
+                                    override fun onPageFinished(view: WebView?, u: String?) {
+                                        if (u != null && u.startsWith(originRoot.dropLast(1))) {
+                                            if (!ready) nlog("[WVB] sẵn sàng: trang gốc CDN đã mở $originRoot")
+                                            ready = true
+                                        }
+                                    }
+                                }
+                                w.loadUrl(originRoot)
+                                wv = w
+                                createdOk = true
+                            } catch (e: Throwable) {
+                                nlogE("[WVB] tạo WebView", e)
+                            }
+                            created.countDown()
+                        }
+                        if (!created.await(10L, java.util.concurrent.TimeUnit.SECONDS)) {
+                            nlog("[WVB] tạo WebView TIMEOUT (main thread bận?)")
+                            return false
+                        }
+                        if (!createdOk) return false
+                    }
+                    if (!ready) {
+                        val t0 = System.currentTimeMillis()
+                        while (!ready && System.currentTimeMillis() - t0 < 15_000) Thread.sleep(120)
+                        // Trang lỗi CF/404 của CDN vẫn đủ (cùng origin — fetch vẫn same-origin)
+                        if (!ready) nlog("[WVB] trang gốc chưa báo xong sau 15s — vẫn thử fetch")
+                    }
+                    return true
+                } catch (e: InterruptedException) {
+                    return false
+                }
+            }
+        }
+
+        /** Fetch 1 URL qua fetch() trong trang WebView (same-origin + credentials —
+         *  y hệt cách hls.js tải segment trong player). Trả bytes hoặc null. */
+        fun fetchBytes(url: String): ByteArray? {
+            if (dead) return null
+            val originRoot = Regex("""^(https?://[^/]+)""").find(url)?.groupValues?.get(1)?.let { "$it/" }
+                ?: return null
+            if (!ensure(originRoot)) return null
+            try { gate.acquire() } catch (_: InterruptedException) { return null }
+            val id = "r${reqCounter.incrementAndGet()}"
+            var h: SegHub? = null
+            try {
+                h = hub ?: return null
+                val latch = java.util.concurrent.CountDownLatch(1)
+                h.latches[id] = latch
+                val urlB64 = android.util.Base64.encodeToString(url.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+                val js = """
+                    (function(){
+                      var B = window.__avsSegHub;
+                      if (!B) { return; }
+                      var ID = '$id';
+                      fetch(atob('$urlB64'), {credentials:'include'}).then(function(r){
+                        if (!r.ok) { B.finish(ID, 'E:' + r.status); return; }
+                        return r.arrayBuffer().then(function(b){
+                          var a = new Uint8Array(b), i = 0, CH = 262144;
+                          function step() {
+                            try {
+                              var end = Math.min(i + CH, a.length), s = '';
+                              for (var j = i; j < end; j += 8192) {
+                                s += String.fromCharCode.apply(null, a.subarray(j, Math.min(j + 8192, end)));
+                              }
+                              B.chunk(ID, btoa(s));
+                              i = end;
+                              if (i < a.length) setTimeout(step, 0); else B.finish(ID, 'OK');
+                            } catch (e2) { B.finish(ID, 'X:' + (e2 && e2.message ? e2.message : 'err')); }
+                          }
+                          step();
+                        });
+                      }).catch(function(e){ B.finish(ID, 'X:' + (e && e.message ? e.message : 'err')); });
+                    })();
+                """.trimIndent()
+                mainHandler.post {
+                    val wv0 = wv
+                    if (wv0 == null) latch.countDown()
+                    else try { wv0.evaluateJavascript(js, null) } catch (e: Throwable) {
+                        nlogE("[WVB] evaluate", e)
+                        latch.countDown()
+                    }
+                }
+                if (!latch.await(30L, java.util.concurrent.TimeUnit.SECONDS)) {
+                    nlog("[WVB] TIMEOUT ...${url.takeLast(36)}")
+                    return noteFail()
+                }
+                val st = h.status.remove(id)
+                val data = h.parts.remove(id)
+                return when {
+                    st == "OK" && data != null -> try {
+                        val out = android.util.Base64.decode(data.toString(), android.util.Base64.DEFAULT)
+                        failStreak = 0
+                        out
+                    } catch (e: Throwable) {
+                        nlogE("[WVB] b64", e, "...${url.takeLast(30)}")
+                        noteFail()
+                    }
+                    st != null && st.startsWith("E:") -> {
+                        nlog("[WVB] HTTP $st ...${url.takeLast(36)}")
+                        noteFail()
+                    }
+                    else -> {
+                        nlog("[WVB] lỗi JS ${st?.take(90) ?: "null"} ...${url.takeLast(36)}")
+                        noteFail()
+                    }
+                }
+            } catch (e: InterruptedException) {
+                return null
+            } finally {
+                try { h?.latches?.remove(id) } catch (_: Throwable) {}
+                gate.release()
+            }
+        }
+
+        private fun noteFail(): ByteArray? {
+            failStreak++
+            if (failStreak >= 3) {
+                dead = true
+                nlog("[WVB] cầu TẮT sau 3 lỗi liên tiếp — các segment sau sẽ qua lớp HTTP thường")
+            }
+            return null
         }
     }
 }
