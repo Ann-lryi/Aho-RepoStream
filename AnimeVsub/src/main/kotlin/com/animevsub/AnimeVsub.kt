@@ -157,6 +157,41 @@
 //      JSON lỗi thật của CDN sẽ hiện thẳng trong diag lần sau.
 //    * BỎ LINK DIRECT: CDN 403 cả ExoPlayer (cùng okhttp) — chỉ còn 1 link
 //      "Vietsub" qua proxy cục bộ (hết cảnh chọn trúng "dự phòng" chết).
+//  v12 (26-10-2026, "giải mã envelope" — BREAKTHROUGH từ phân tích offline TRỰC
+//  TIẾP trên CDN (curl/node tách từng lớp, đã fetch được VIDEO THẬT 0x47 TS):
+//  playlist plugin bắt được là "PHONG BÒ" GIAN LẬN — 138 "segment" là MỒI, tham
+//  số _t của chúng là 138 MẢNH của playlist thật bị mã hoá. Đó là lý do MỌI
+//  segment 403 {"error":"Missing segment token"} — URL mồi CHORIZO không có
+//  token thật. Toàn bộ thuật toán đã được tái hiện và kiểm chứng bằng dữ liệu
+//  thật (node + VM chạy chính JS của CDN):
+//    Pipeline playlist thật (4 lớp):
+//      1. GET /playlist/<id64>/playlist.m3u8?token=<JWT>&fc=<b64(host)>
+//         JWT = const avsToken NẰM SẴN trong HTML trang player (hạn 2h, gắn IP).
+//         Response headers: X-Edge-Tag(cn) X-Cache-Node(sk) X-Request-Trace(ts)
+//         X-Proxy-Digest(uid) + X-Envelope (USDK binary chứa JSON {cn,sk,ts,uid}).
+//      2. Nối 138 mảnh _t -> "unshuffle" (Fisher-Yates NGƯỢC, LCG
+//         imul(s,1664525)+1013904223, seed = parseInt(sk[0..8],16) kiểu JS:
+//         dừng ở ký tự không-hex, NaN->0) -> base64url-decode.
+//      3. AES-256-GCM: key = HMAC-SHA256(key=b64url(cn), msg="uid:ts:sk:0"),
+//         iv = cn[0..12] -> plaintext VẪN là noise (entropy 8.0) vì còn lớp cuối.
+//      4. J-unmask: xorshift32(seed=fnv1a(sk+"|"+ts)) -> bảng hoán vị
+//         Fisher-Yates (aw từ n-1 về 1 — KHÔNG có aw=0!) -> XOR keystream
+//         (refresh 32-bit mỗi 4 byte, byte-thứ = (aq >>> 8*(3&ar)) & 255)
+//         -> PLAYLIST THẬT: #EXT-X-KEY /seg-key/... + 138 URL placeholder
+//         /hls/<24hex>.ts?e=<AES-CTR>&i=<counter>.
+//    * URL THẬT nằm trong tham số e: AES-256-CTR(key=HMAC-SHA256(
+//      key=UTF8(sessionKey), msg="url-cipher|"+fileId), counter=i) — sessionKey
+//      = 64 ký tự LẺ của jti trong JWT. URL giải mã ra = lh3.googleusercontent.com
+//      (video NGỤY TRANG thành file PNG, dữ liệu AES-128 HLS bắt đầu từ byte 128
+//      — #EXT-X-BYTERANGE@128 lo việc bỏ header PNG; ExoPlayer tự decrypt AES-128).
+//    * S6 MỚI trong extractFromEmbed: gặp player stream.googleapiscdn.com ->
+//      lấy JWT (plain okhttp UA thật; hụt -> fetchDoc WebView) -> GET envelope
+//      (okhttp, kèm headers) -> giải mã 4 lớp CỤC BỘ -> thay 138 URL placeholder
+//      bằng URL thật -> inline key /seg-key/ thành data: URI (fetch thử; hụt giữ
+//      URL gốc) -> phát qua proxy cục bộ /stream.m3u8, SEGMENT ĐI THẲNG google
+//      (không qua /seg/ — bảo toàn Range header cho BYTERANGE).
+//    * Nếu GCM auth fail với ":0" -> thử không-suffix (trường hợp harden OFF).
+//      Envelope không phải dạng mồi (không có _c=) -> bỏ qua S6, flow cũ chạy.
 // URL patterns đã xác minh qua search index + Telegram kênh chính thức (24-10-2026):
 //  - Chi tiết phim : /phim/{slug}-a{id}/          (vd /phim/dogulwang-a6014/)
 //  - Trang xem     : /phim/{slug}-a{id}/xem-phim.html
@@ -240,7 +275,7 @@ class AnimeVsubProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════════
     //  FLAGS / HẰNG SỐ
     // ═══════════════════════════════════════════════════════════════════════════
-    private val AVS_BUILD = "v11"
+    private val AVS_BUILD = "v12"
     // v10: định danh instance (random mỗi lần provider được nạp). Banner ghi cả
     // pid. Nếu diag có >=2 banner, hoặc 2 nhóm prefix "v10.xx" khác nhau -> app
     // đang chạy NHIỀU bản plugin song song (cài trùng extension / 2 repo) — đó
@@ -1920,11 +1955,435 @@ class AnimeVsubProvider : MainAPI() {
         return linkFound
     }
 
-    /** Đào 1 embed: HTML -> m3u8/mp4; nếu không thấy, đào iframe lồng thêm 1 cấp. */
+    // (v12 banner — xem đầu file)
+// ═══════════════════════════════════════════════════════════════════════════
+    //  v12 — GIẢI MÃ ENVELOPE CỦA CDN stream.googleapiscdn.com (đã kiểm chứng
+    //  với dữ liệu thật; xem header v12 đầu file). Playlist mà WebView capture
+    //  là "phong bò" mồi — _t là 138 mảnh của playlist thật bị mã hoá 4 lớp.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private val avsPlayerRegex = Regex("""stream\.googleapiscdn\.com/player/([0-9a-f]{16,64})""")
+    private val avsPlaceholderRegex = Regex("""^https://stream\.googleapiscdn\.com/hls/([0-9a-f]{8,64})\.ts\?""")
+
+    /** v12: tra header KHÔNG phân biệt hoa-thường (okhttp/CloudStream thường
+     *  trả Map key viết thường — tra Title-Case sẽ trống). */
+    private fun avsHeader(headers: Map<String, String>, name: String): String? {
+        for ((k, v) in headers) if (k.equals(name, ignoreCase = true)) return v
+        return null
+    }
+
+    /** base64url decode (JS atob sau khi đổi -_ về +/). */
+    private fun avsB64UrlDecode(s: String): ByteArray {
+        val norm = s.replace('-', '+').replace('_', '/')
+        val pad = (4 - (norm.length % 4)) % 4
+        return android.util.Base64.decode(norm + "=".repeat(pad), android.util.Base64.DEFAULT)
+    }
+
+    /** btoa chuẩn (fc param). */
+    private fun avsB64Std(s: String): String =
+        android.util.Base64.encodeToString(s.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+
+    /** JS parseInt(s.substring(0,8),16) >>> 0 — parse các ký tự hex ĐẦU TIÊN,
+     *  dừng ở ký tự không-hex; không parse được chữ nào -> NaN -> 0. */
+    private fun avsJsHexSeed(s: String): Long {
+        var v = 0L
+        var any = false
+        for (ch in s.take(8)) {
+            val d = Character.digit(ch, 16)
+            if (d < 0) break
+            v = v * 16L + d
+            any = true
+        }
+        return if (any) (v and 0xFFFFFFFFL) else 0L
+    }
+
+    /** LCG của hàm Y trong avs-loader: (imul(s,1664525) + 1013904223) >>> 0. */
+    private fun avsLcg(s: Long): Long = (s * 1664525L + 1013904223L) and 0xFFFFFFFFL
+
+    /** Bước 2 — "unshuffle" (đảo ngược Fisher-Yates của server) trên chuỗi _t đã nối. */
+    private fun avsUnshuffle(input: String, sk: String): String {
+        val arr = input.toCharArray()
+        var seed = avsJsHexSeed(sk)
+        val pairs = ArrayList<Pair<Int, Int>>(arr.size)
+        var i = arr.size - 1
+        while (i > 0) {
+            seed = avsLcg(seed)
+            pairs.add(i to (seed % (i + 1L)).toInt())
+            i--
+        }
+        for (j in pairs.indices.reversed()) {
+            val (a, b) = pairs[j]
+            val t = arr[a]; arr[a] = arr[b]; arr[b] = t
+        }
+        return String(arr)
+    }
+
+    /** FNV-1a 32-bit (hàm H trong loader). */
+    private fun avsFnv1a(s: String): Long {
+        var h = 2166136261L
+        for (ch in s) {
+            h = ((h xor (255L and ch.code.toLong())) and 0xFFFFFFFFL)
+            h = (h * 16777619L) and 0xFFFFFFFFL
+        }
+        return h and 0xFFFFFFFFL
+    }
+
+    /** Bước 4 — J-unmask: xorshift32 + hoán vị + XOR keystream.
+     *  ĐỐI CHỨNG từng phép với bản JS gốc: vòng hoán vị aw = n-1 về 1 (>0,
+     *  KHÔNG có aw=0); byte keystream thứ (3 & ar) của thanh ghi 32-bit. */
+    private fun avsJUnmask(data: ByteArray, permKey: String, permSalt: String): ByteArray {
+        val n = data.size
+        val out = ByteArray(n)
+        var x = avsFnv1a("$permKey|$permSalt")
+        if (x == 0L) x = 1L
+        // xorshift32 — mỗi next() trả uint32
+        fun next(): Long {
+            x = (x xor (x shl 13)) and 0xFFFFFFFFL
+            x = (x xor (x ushr 17)) and 0xFFFFFFFFL
+            x = (x xor (x shl 5)) and 0xFFFFFFFFL
+            return x
+        }
+        val perm = LongArray(n) { it.toLong() }
+        for (aw in n - 1 downTo 1) {
+            val j = (next() % (aw + 1L)).toInt()
+            val t = perm[aw]; perm[aw] = perm[j]; perm[j] = t
+        }
+        var reg = 0L
+        for (ar in 0 until n) {
+            if ((ar & 3) == 0) reg = next()
+            out[perm[ar].toInt()] = ((data[ar].toInt() and 0xFF) xor
+                ((reg ushr (8 * (3 and ar))) and 0xFFL).toInt()).toByte()
+        }
+        return out
+    }
+
+    /** Bước 3 — AES-256-GCM: key = HMAC-SHA256(b64urlDecode(cn), "uid:ts:sk" + hardenSuffix),
+     *  iv = cn[0..12]. Trả null nếu auth fail (sai session/tham số). */
+    private fun avsEnvelopeDecrypt(ctWithTag: ByteArray, cn: String, sk: String, uid: String, ts: String, hardenSuffix: String): ByteArray? {
+        return try {
+            val cnBytes = avsB64UrlDecode(cn)
+            val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+            mac.init(javax.crypto.spec.SecretKeySpec(cnBytes, "HmacSHA256"))
+            val derived = mac.doFinal("$uid:$ts:$sk$hardenSuffix".toByteArray(Charsets.UTF_8))
+            val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(
+                javax.crypto.Cipher.DECRYPT_MODE,
+                javax.crypto.spec.SecretKeySpec(derived, "AES"),
+                javax.crypto.spec.GCMParameterSpec(128, cnBytes.copyOfRange(0, 12))
+            )
+            cipher.doFinal(ctWithTag)
+        } catch (t: Throwable) {
+            if (isCancellation(t)) throw t
+            null
+        }
+    }
+
+    /** Parse X-Envelope (USDK binary): magic "USDK" + ver + len2B + JSON {cn,sk,ts,uid}. */
+    private fun avsParseEnvelope(xEnvelope: String): Array<String>? {
+        return try {
+            val raw = avsB64UrlDecode(xEnvelope)
+            if (raw.size < 11 || raw[0] != 0x55.toByte() || raw[1] != 0x53.toByte() ||
+                raw[2] != 0x44.toByte() || raw[3] != 0x4B.toByte()) return null
+            val len = ((raw[5].toInt() and 0xFF) shl 8) or (raw[6].toInt() and 0xFF)
+            if (7 + len > raw.size) return null
+            val o = org.json.JSONObject(String(raw, 7, len, Charsets.UTF_8))
+            arrayOf(o.optString("cn"), o.optString("sk"), o.optString("ts"), o.optString("uid"))
+        } catch (t: Throwable) {
+            if (isCancellation(t)) throw t
+            null
+        }
+    }
+
+    /** sessionKey = các ký tự LẺ của jti (hàm a3 trong loader). */
+    private fun avsSessionKey(jwt: String): String? {
+        return try {
+            val mid = jwt.substringAfter('.').substringBefore('.')
+            val norm = mid.replace('-', '+').replace('_', '/')
+            val pad = (4 - (norm.length % 4)) % 4
+            val payload = String(android.util.Base64.decode(norm + "=".repeat(pad), android.util.Base64.DEFAULT), Charsets.UTF_8)
+            val jti = org.json.JSONObject(payload).optString("jti")
+            if (jti.isBlank()) null else {
+                val sb = StringBuilder()
+                for (i in jti.indices) if (i % 2 == 1) sb.append(jti[i])
+                sb.toString()
+            }
+        } catch (t: Throwable) {
+            if (isCancellation(t)) throw t
+            null
+        }
+    }
+
+    /** Giải mã tham số e của URL placeholder -> URL thật (lh3.googleusercontent.com/...). */
+    private fun avsDecryptUrlCipher(eB64: String, fileId: String, counter: Long, sessionKey: String): String? {
+        return try {
+            val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+            mac.init(javax.crypto.spec.SecretKeySpec(sessionKey.toByteArray(Charsets.UTF_8), "HmacSHA256"))
+            val key = mac.doFinal(("url-cipher|" + fileId).toByteArray(Charsets.UTF_8))
+            val ctr = ByteArray(16)
+            ctr[12] = ((counter ushr 24) and 0xFF).toByte()
+            ctr[13] = ((counter ushr 16) and 0xFF).toByte()
+            ctr[14] = ((counter ushr 8) and 0xFF).toByte()
+            ctr[15] = (counter and 0xFF).toByte()
+            val cipher = javax.crypto.Cipher.getInstance("AES/CTR/NoPadding")
+            cipher.init(javax.crypto.Cipher.DECRYPT_MODE, javax.crypto.spec.SecretKeySpec(key, "AES"), javax.crypto.spec.IvParameterSpec(ctr))
+            val out = cipher.doFinal(avsB64UrlDecode(eB64))
+            val u = String(out, Charsets.UTF_8)
+            if (u.startsWith("http")) u else null
+        } catch (t: Throwable) {
+            if (isCancellation(t)) throw t
+            null
+        }
+    }
+
+    /** Phát playlist ĐÃ GIÃI MÃ: proxy cục bộ chỉ serve /stream.m3u8; các URL
+     *  segment (googleusercontent) đi THẲNG từ ExoPlayer — bảo toàn Range cho
+     *  #EXT-X-BYTERANGE (proxy cũ không chuyển tiếp Range -> không dùng /seg/). */
+    private fun registerDecodedPlaylist(finalM3u8: String, serverName: String, callback: (ExtractorLink) -> Unit): Boolean {
+        var proxyBase: String? = null
+        synchronized(activeServers) {
+            while (activeServers.size >= 8) {
+                try { activeServers.removeAt(0).stop() } catch (_: Throwable) {}
+            }
+            try {
+                val server = AvsProxyServer(emptyList())
+                server.label = serverName
+                server.start()
+                activeServers.add(server)
+                proxyBase = "http://127.0.0.1:${server.port}"
+                server.setM3U8(finalM3u8)
+            } catch (e: Throwable) {
+                proxyBase = null
+                nlogE("[Register] decoded bind", e)
+            }
+        }
+        val base = proxyBase ?: return false
+        return try {
+            callback(newExtractorLink(name, serverName, "$base/stream.m3u8", ExtractorLinkType.M3U8) {
+                quality = Qualities.P1080.value
+                headers = mapOf("User-Agent" to deviceUa())
+            })
+            nlog("[Register] decoded emitted $base/stream.m3u8")
+            true
+        } catch (e: Throwable) {
+            nlogE("[Register] decoded emit", e)
+            false
+        }
+    }
+
+    /** v12 S6 — đường chính cho player stream.googleapiscdn.com: lấy JWT -> GET
+     *  envelope -> giải mã 4 lớp -> thay URL placeholder -> inline key -> phát. */
+    private suspend fun avsEnvelopeExtract(playerUrl: String, watchUrl: String, callback: (ExtractorLink) -> Unit): Boolean {
+        val id64 = avsPlayerRegex.find(playerUrl)?.groupValues?.get(1) ?: return false
+        val t0 = System.currentTimeMillis()
+        try {
+            // ── 1. JWT từ HTML trang player (plain okhttp UA thật; hụt -> WebView) ──
+            var jwt = ""
+            var jwtVia = "none"
+            try {
+                val resp = app.get(
+                    playerUrl,
+                    headers = mapOf(
+                        "User-Agent" to deviceUa(),
+                        "Accept" to "*/*",
+                        "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8"
+                    )
+                )
+                if (resp.code in 200..299) {
+                    jwt = Regex("""const avsToken = "([^"]+)"""").find(resp.text)?.groupValues?.get(1) ?: ""
+                    if (jwt.isNotEmpty()) jwtVia = "plain"
+                } else {
+                    nlog("[S6] player plain ${resp.code} len=${resp.text.length}")
+                }
+            } catch (e: Throwable) {
+                if (isCancellation(e)) throw e
+                nlog("[S6] player plain err ${e.message?.take(60)}")
+            }
+            if (jwt.isEmpty()) {
+                try {
+                    val doc = fetchDoc(playerUrl, useCache = false, mode = MODE_LOOSE)
+                    jwt = Regex("""const avsToken = "([^"]+)"""").find(doc.outerHtml())?.groupValues?.get(1) ?: ""
+                    if (jwt.isNotEmpty()) jwtVia = "webview"
+                } catch (e: Throwable) {
+                    if (isCancellation(e)) throw e
+                    nlogE("[S6] player webview", e)
+                }
+            }
+            if (jwt.isEmpty()) {
+                nlog("[S6] KHÔNG lấy được avsToken — bỏ qua envelope")
+                return false
+            }
+            val sessionKey = avsSessionKey(jwt)
+            if (sessionKey.isNullOrBlank()) {
+                nlog("[S6] jti rỗng — JWT lạ")
+                return false
+            }
+            nlog("[S6] jwt via=$jwtVia len=${jwt.length} skLen=${sessionKey.length}")
+
+            // ── 2. GET envelope playlist (okhttp — cần response headers) ──
+            val fc = java.net.URLEncoder.encode(avsB64Std("stream.googleapiscdn.com"), "UTF-8")
+            val plUrl = "https://stream.googleapiscdn.com/playlist/$id64/playlist.m3u8" +
+                "?token=" + java.net.URLEncoder.encode(jwt, "UTF-8") + "&fc=$fc"
+            val resp2 = app.get(
+                plUrl,
+                headers = mapOf(
+                    "User-Agent" to deviceUa(),
+                    "Accept" to "*/*",
+                    "Referer" to playerUrl
+                )
+            )
+            val envBody = resp2.text
+            nlog("[S6] envelope ${resp2.code} len=${envBody.length} ms=${System.currentTimeMillis() - t0}")
+            if (resp2.code !in 200..299) {
+                nlog("[S6] envelope REJECT body=${resp2.text.take(90)}")
+                return false
+            }
+
+            // ── 3. Envelope fields (X-Envelope ưu tiên; fallback từng header) ──
+            val xEnv = avsHeader(resp2.headers, "X-Envelope")
+            var cn = ""; var sk = ""; var ts = ""; var uid = ""
+            if (!xEnv.isNullOrBlank()) {
+                val fields = avsParseEnvelope(xEnv)
+                if (fields != null) { cn = fields[0]; sk = fields[1]; ts = fields[2]; uid = fields[3] }
+            }
+            if (cn.isBlank()) cn = avsHeader(resp2.headers, "X-Edge-Tag") ?: ""
+            if (sk.isBlank()) sk = avsHeader(resp2.headers, "X-Cache-Node") ?: ""
+            if (ts.isBlank()) ts = avsHeader(resp2.headers, "X-Request-Trace") ?: "0"
+            if (uid.isBlank()) uid = avsHeader(resp2.headers, "X-Proxy-Digest") ?: "anon"
+            nlog("[S6] env cn=${cn.take(10)}… sk=${sk.take(10)}… ts=$ts uidLen=${uid.length}")
+            if (cn.isBlank() || sk.isBlank()) {
+                nlog("[S6] thiếu cn/sk — không phải envelope?")
+                return false
+            }
+
+            // ── 4. Thu _t — chỉ chạy khi đúng là envelope (dòng URL đầu có _c=) ──
+            val lines = envBody.split("\n")
+            var isEnvelope = false
+            for (l in lines) {
+                val t = l.trim()
+                if (t.isEmpty() || t.startsWith("#")) continue
+                if (Regex("""[?&]_c=[0-9]+""").containsMatchIn(t)) isEnvelope = true
+                break
+            }
+            if (!isEnvelope) {
+                nlog("[S6] playlist không phải envelope (không có _c=) — flow cũ xử lý")
+                return false
+            }
+            val tChunks = ArrayList<String>(lines.size)
+            for (l in lines) {
+                if (l.isBlank() || l.startsWith("#")) continue
+                val m = Regex("""[?&]_t=([^&\s]+)""").find(l) ?: continue
+                tChunks.add(m.groupValues[1])
+            }
+            if (tChunks.isEmpty()) {
+                nlog("[S6] không có mảnh _t")
+                return false
+            }
+            nlog("[S6] chunks=${tChunks.size} joinedLen=${tChunks.joinToString("").length}")
+
+            // ── 5. Unshuffle -> base64url -> AES-GCM -> J-unmask ──
+            val joined = tChunks.joinToString("")
+            val unshuffled = avsUnshuffle(joined, sk)
+            val ct = avsB64UrlDecode(unshuffled)
+            val plain = avsEnvelopeDecrypt(ct, cn, sk, uid, ts, ":0")
+                ?: avsEnvelopeDecrypt(ct, cn, sk, uid, ts, "")
+                ?: run {
+                    nlog("[S6] GCM auth FAIL (2 biến thể) — session/tham số lệch")
+                    return false
+                }
+            val bodyText = String(avsJUnmask(plain, sk, ts), Charsets.UTF_8)
+            if (!bodyText.contains("#EXT-X-KEY") && !bodyText.contains("#EXTINF")) {
+                nlog("[S6] unmask ra nội dung lạ head=${bodyText.take(60)}")
+                return false
+            }
+            val bodyLines = bodyText.split("\n")
+
+            // ── 6. Lắp playlist cuối: tag # của envelope + body đã giải mã ──
+            val outLines = ArrayList<String>(lines.size + bodyLines.size)
+            for (l in lines) {
+                val t = l.trim()
+                if (t.startsWith("#") && !t.startsWith("#EXTINF") &&
+                    !t.startsWith("#EXT-X-ENDLIST") && !t.startsWith("#EXT-X-KEY")) outLines.add(l)
+            }
+            outLines.add("")
+            for (bl in bodyLines) {
+                if (bl.startsWith("/")) outLines.add("https://stream.googleapiscdn.com$bl") else outLines.add(bl)
+            }
+            nlog("[S6] real playlist OK lines=${outLines.size} totalMs=${System.currentTimeMillis() - t0}")
+
+            // ── 7. Giải mã URL placeholder -> URL googleusercontent thật ──
+            var decoded = 0
+            var failed = 0
+            for (i in outLines.indices) {
+                val l = outLines[i]
+                if (l.isBlank() || l.startsWith("#")) continue
+                val pm = avsPlaceholderRegex.find(l) ?: continue
+                val fileId = pm.groupValues[1]
+                val e = Regex("""[?&]e=([^&\s]+)""").find(l)?.groupValues?.get(1)
+                val idx = Regex("""[?&]i=(\d+)""").find(l)?.groupValues?.get(1)?.toLongOrNull()
+                val real = if (e != null && idx != null) avsDecryptUrlCipher(e, fileId, idx, sessionKey) else null
+                if (real != null) { outLines[i] = real; decoded++ } else failed++
+            }
+            nlog("[S6] url-cipher decoded=$decoded failed=$failed")
+            if (decoded == 0) {
+                nlog("[S6] không giải mã được URL nào — sessionKey lệch?")
+                return false
+            }
+
+            // ── 8. Inline key /seg-key/ thành data: URI (hụt -> giữ URL gốc) ──
+            for (i in outLines.indices) {
+                val l = outLines[i]
+                if (!l.startsWith("#EXT-X-KEY")) continue
+                val ku = Regex("""URI="([^"]+)"""").find(l)?.groupValues?.get(1) ?: continue
+                if (!ku.contains("/seg-key/")) break
+                try {
+                    val req = okhttp3.Request.Builder().url(ku)
+                        .header("User-Agent", deviceUa())
+                        .header("Accept", "*/*")
+                        .build()
+                    segClient.newCall(req).execute().use { kr ->
+                        val kb = if (kr.code in 200..299) kr.body?.bytes() else null
+                        if (kb != null && kb.size == 16) {
+                            val b64 = android.util.Base64.encodeToString(kb, android.util.Base64.NO_WRAP)
+                            outLines[i] = l.replace(Regex("""URI="[^"]+""""),
+                                """URI="data:application/octet-stream;base64,$b64"""")
+                            nlog("[S6] key inlined (16B data: URI)")
+                        } else {
+                            nlog("[S6] key fetch ${kr.code} len=${kb?.size ?: -1} — giữ URL gốc")
+                        }
+                    }
+                } catch (e: Throwable) {
+                    if (isCancellation(e)) throw e
+                    nlog("[S6] key fetch err ${e.message?.take(50)} — giữ URL gốc")
+                }
+                break
+            }
+
+            val finalM3u8 = outLines.joinToString("\n")
+            if (registerDecodedPlaylist(finalM3u8, "Vietsub", callback)) {
+                nlog("[S6] SUCCESS ms=${System.currentTimeMillis() - t0}")
+                return true
+            }
+            nlog("[S6] register thất bại")
+            return false
+        } catch (e: Throwable) {
+            if (isCancellation(e)) throw e
+            nlogE("[S6]", e, playerUrl.take(70))
+            return false
+        }
+    }
+
+    /** Đào 1 embed: HTML -> m3u8/mp4; nếu không thấy, đào iframe lồng thêm 1 cấp.
+     *  v12: player stream.googleapiscdn.com đi qua S6 (giải mã envelope) TRƯỚC. */
     private suspend fun extractFromEmbed(
         embed: String, watchUrl: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
+            // v12 S6: playlist WebView capture là phong bò mồi — giải mã cục bộ ngay,
+            // thành công thì KHÔNG cần WebView S3/S4 nữa (tiết kiệm 5-15s/lượt xem).
+            if (embed.contains("stream.googleapiscdn.com/player/") &&
+                avsEnvelopeExtract(embed, watchUrl, callback)) {
+                return true
+            }
             val doc = fetchDoc(embed, useCache = false, mode = MODE_LOOSE)
             val html = doc.outerHtml()
             val embedOrigin = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: mainUrl
@@ -2543,6 +3002,12 @@ private fun currentActivity(): android.app.Activity? {
         siteReferer: String = ""
     ): Boolean {
         if (!m3u8Content.contains("#EXTM3U")) return false
+        // v12: playlist "phong bò" mồi của googleapiscdn (URL có _c=&_t=) — mọi
+        // segment sẽ 403 "Missing segment token" -> lỗi 2004. Chỉ S6 giải mã được.
+        if (m3u8Content.contains("&_t=") && m3u8Content.contains("&_c=")) {
+            nlog("[Register] envelope mồi googleapiscdn — bỏ qua (chờ S6 giải mã)")
+            return false
+        }
         val ref = siteReferer.ifBlank { m3u8Url }
 
         val segUrls = m3u8Content.lines().map { it.trim() }
