@@ -171,7 +171,18 @@ class AnimeVsubProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════════
     //  FLAGS / HẰNG SỐ
     // ═══════════════════════════════════════════════════════════════════════════
-    private val AVS_BUILD = "v10"
+    // v12 = v10 + fix chuỗi phát video (evidence diag 26-10 22:16 + 27-10 05:34):
+    //  (1) Hook WebView RUNTIME cho embed player — player JS (stream.googleapiscdn)
+    //      lấy m3u8 bằng XHR lúc chạy, scrape DOM luôn ra 0 [m3u8=0 mp4=0] — đây
+    //      là mảnh ghép còn thiếu của chuỗi lỗi 2004.
+    //  (2) PLAIN-BREAKER: plain HTML 100% 403/520 trong mọi log v8-v11 — sau 3
+    //      lần fail liên tục tắt tầng plain 10 phút (bớt nửa request, nhanh hơn).
+    //  (3) WVDom fast-fail trang 404 / "Tên miền tạm thời bị chặn" (đỡ chờ 20s+).
+    //  (4) wvGate: tối đa 2 WebView song song — đừng dội 5-6 WebView vào site.
+    //  (5) avsHookJs forward thêm body chứa .m3u8 (JSON API của player trả m3u8
+    //      bọc trong JSON — URL không có .m3u8 nên tiêu chí cũ bỏ sót).
+    //  (6) bỏ genre Học Đường (site redirect /404).
+    private val AVS_BUILD = "v12"
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -221,6 +232,21 @@ class AnimeVsubProvider : MainAPI() {
     // in-flight + STORM-GATE (khai báo ở khối breaker dưới) — chống dội request.
     private val fetchGate = java.util.concurrent.Semaphore(3)
     private val fetchRand = kotlin.random.Random
+
+    // v12 PLAIN-BREAKER: tầng plain cho trang HTML của site bị CF chặn 100%
+    // (mọi log v8-v11: plain luôn 403 REJECT len=661-761 / 520) — mỗi URL vẫn đốt
+    // 2 request vô ích trước khi vào WebView. Sau 3 lần fail liên tục: TẮT 10
+    // phút, vào WebView ngay. Reset khi plain thành công. Ajax (/ajax/player,
+    // suggest) + fetchText (m3u8 ở CDN) đi đường riêng — KHÔNG bị ảnh hưởng.
+    private val plainDeadStreak = java.util.concurrent.atomic.AtomicInteger(0)
+    @Volatile private var plainHtmlDeadUntilMs = 0L
+    private val PLAIN_DEAD_THRESHOLD = 3
+    private val PLAIN_DEAD_COOLDOWN_MS = 10 * 60 * 1000L
+
+    // v12: tối đa 2 WebView DOM capture song song — log 27-10 05:34 thấy 3 WVDom
+    // spawn trong 100ms; dội hàng loạt WebView cùng lúc là thứ khiến origin
+    // "nghi ngờ" theo cảm nhận của user.
+    private val wvGate = java.util.concurrent.Semaphore(2)
     private val inflightLock = Any()
     private val inflightDocs = HashMap<String, kotlinx.coroutines.CompletableDeferred<Document>>()
 
@@ -644,26 +670,37 @@ class AnimeVsubProvider : MainAPI() {
         // plain/proxy; tầng WebView tự bảo vệ bằng bail nhanh khi thấy DOM 5xx.
 
         // ── 1. Plain HTTP với cookie clearance đã có (nhanh nhất) ──
-        val cachedCookies = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
-        // v10: GATE TOÀN CỤC — tối đa 3 chuỗi plain song song + jitter 150-450ms
-        // (nới thêm so với v9 80-280ms — giảm nhịp request, tránh kích rate-limit).
-        // Trước đây 12 mục danh mục nạp CÙNG LÚC ≈ 24 request/2s dội vào site —
-        // thứ rất có thể kích rate-limit origin -> trang "Lỗi Server 5xx" theo đợt.
-        while (!fetchGate.tryAcquire()) kotlinx.coroutines.delay(60)
-        try {
-            kotlinx.coroutines.delay(fetchRand.nextLong(150, 450))
-            if (cachedCookies != null) {
-                tryPlainDoc(url, cachedCookies)?.let {
-                    if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
-                    return it
+        // v12 PLAIN-BREAKER: sau 3 lần plain fail liên tục (403/challenge/520) thì
+        // tắt tầng plain 10 phút — vào WebView ngay, không đốt request vô ích.
+        if (System.currentTimeMillis() < plainHtmlDeadUntilMs) {
+            nlog("[Fetch] plain TẮT (breaker 403 liên tục) — vào WebView luôn $url")
+        } else {
+            val cachedCookies = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
+            // GATE TOÀN CỤC — tối đa 3 chuỗi plain song song + jitter 150-450ms.
+            while (!fetchGate.tryAcquire()) kotlinx.coroutines.delay(60)
+            try {
+                kotlinx.coroutines.delay(fetchRand.nextLong(150, 450))
+                val viaCk = if (cachedCookies != null) tryPlainDoc(url, cachedCookies) else null
+                val doc = viaCk ?: tryPlainDoc(url, null)
+                if (doc != null) {
+                    if (hostOf(url) == hostOf(mainUrl)) {
+                        plainDeadStreak.set(0)
+                        plainHtmlDeadUntilMs = 0L
+                    }
+                    if (useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
+                    return doc
                 }
+                if (hostOf(url) == hostOf(mainUrl)) {
+                    val n = plainDeadStreak.incrementAndGet()
+                    val nowMs = System.currentTimeMillis()
+                    if (n >= PLAIN_DEAD_THRESHOLD && nowMs >= plainHtmlDeadUntilMs) {
+                        plainHtmlDeadUntilMs = nowMs + PLAIN_DEAD_COOLDOWN_MS
+                        nlog("[Fetch] plain TẮT ${PLAIN_DEAD_COOLDOWN_MS / 60000} phút (streak=$n lần 403/challenge liên tục) — vào WebView ngay")
+                    }
+                }
+            } finally {
+                fetchGate.release()
             }
-            tryPlainDoc(url, null)?.let {
-                if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
-                return it
-            }
-        } finally {
-            fetchGate.release()
         }
         // ── 2. WebView-first (v8): plain đã chết (403-gate/520-storm) — vào WebView
         //    NGAY. Log 25-10: CORS proxy 100% timeout (đốt 10-20s/URL vô ích) nên
@@ -825,15 +862,14 @@ class AnimeVsubProvider : MainAPI() {
     @Volatile private var homePageStyle = 0   // 0: /trang-N.html, 1: ?page=N
     @Volatile private var genrePageStyle = 0  // 0: trang-N.html, 1: ?page=N
 
-    // v10: giảm 12 -> 6 mục trang chủ (bỏ 6 thể loại ít dùng) — mỗi lần mở app
-    // giảm một nửa số request dội vào site, giảm nguy cơ kích rate-limit -> 5xx.
+    // v12: còn 5 mục (bỏ Học Đường — evidence 27-10 05:34:22: site tự redirect
+    // /the-loai/hoc-duong/ sang /404, WVDom chờ nguyên timeout 22s vô ích).
     override val mainPage = mainPageOf(
         "HOME" to "Mới Cập Nhật",
         "GENRE::hanh-dong"  to "Hành Động",
         "GENRE::hai-huoc"   to "Hài Hước",
         "GENRE::tinh-cam"   to "Tình Cảm",
-        "GENRE::kinh-di"    to "Kinh Dị",
-        "GENRE::hoc-duong"  to "Học Đường"
+        "GENRE::kinh-di"    to "Kinh Dị"
     )
 
     /** Danh sách URL ứng viên cho 1 trang listing — cái nào parse ra card thì dùng. */
@@ -1522,9 +1558,12 @@ class AnimeVsubProvider : MainAPI() {
             var watchDoc: Document? = null
             if (!siteDown()) {
                 try {
-                    val ck = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
-                    watchDoc = (if (ck != null) tryPlainDoc(watchUrl, ck) else null)
-                        ?: tryPlainDoc(watchUrl, null)
+                    // v12: tôn trọng plain-breaker — đừng đốt thêm 2 request 403 vô ích
+                    if (System.currentTimeMillis() >= plainHtmlDeadUntilMs) {
+                        val ck = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
+                        watchDoc = (if (ck != null) tryPlainDoc(watchUrl, ck) else null)
+                            ?: tryPlainDoc(watchUrl, null)
+                    }
                     if (watchDoc != null) {
                         noteSiteOk()
                         nlog("[Step1p] watch plain OK len=${watchDoc!!.outerHtml().length} $watchUrl")
@@ -1778,7 +1817,16 @@ class AnimeVsubProvider : MainAPI() {
         embed: String, watchUrl: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
-            val doc = fetchDoc(embed, useCache = false, mode = MODE_LOOSE)
+            // v12: fetchDoc hụt (site 5xx/CF) KHÔNG được giết luồng — m3u8 nằm ở
+            // CDN (khác origin với site), hook bên dưới vẫn phải có cơ hội chạy.
+            val doc: Document? = try {
+                fetchDoc(embed, useCache = false, mode = MODE_LOOSE)
+            } catch (e: Throwable) {
+                if (isCancellation(e)) throw e
+                nlogE("[Embed] fetchDoc", e, embed.take(60))
+                null
+            }
+            if (doc != null) run {
             val html = doc.outerHtml()
             val embedOrigin = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: mainUrl
 
@@ -1822,6 +1870,15 @@ class AnimeVsubProvider : MainAPI() {
                     return true
                 }
             }
+            } // run
+
+            // v12 — CHỐT CHUỖI LỖI 2004: player JS (vd stream.googleapiscdn.com)
+            // lấy m3u8 bằng fetch/XHR LÚC CHẠY — scrape DOM luôn ra 0 (log 26-10
+            // 22:16: [Embed] m3u8=0 mp4=0 dù DOM render đủ 405KB). Hook WebView
+            // nạp TRANG PLAYER và bắt đúng response runtime: patch fetch/XHR,
+            // forward body có playlist/URL media -> registerM3U8Link.
+            nlog("[Embed] DOM không có media — mở hook WebView runtime ${embed.take(60)}")
+            if (tryHookFlow(embed, callback)) return true
         } catch (e: Throwable) {
             if (isCancellation(e)) throw e
             nlogE("[Embed]", e, embed.take(70))
@@ -1856,9 +1913,14 @@ class AnimeVsubProvider : MainAPI() {
       if (Object.keys(window.__avsSeen).length > 64) window.__avsSeen = {};
       window.__avsSeen[sig] = 1;
       var s = String(u);
+      if (b.length > 2000000) return;
       var isPlaylist = b.indexOf('#EXTM3U') >= 0;
       var isMediaUrl = s.indexOf('.m3u8') >= 0 || s.indexOf('.m3u9') >= 0 || s.indexOf('.mp4') >= 0;
-      if (isPlaylist || (isMediaUrl && s.indexOf('http') === 0)) {
+      // v12: player thường trả m3u8 BỌC TRONG JSON (URL của request không có
+      // .m3u8) — forward thêm khi BODY chứa URL media. Harvest bên Kotlin lo
+      // tách URL (đã unescape \/). Cap 2MB tránh đẩy body khổng lồ qua bridge.
+      var bodyHasMedia = b.indexOf('.m3u8') >= 0 || b.indexOf('.m3u9') >= 0 || b.indexOf('.mp4') >= 0;
+      if (isPlaylist || isMediaUrl || bodyHasMedia) {
         window.__avsBridge.onCapture(abs(u), b);
       }
     } catch (e) {}
@@ -2018,14 +2080,11 @@ class AnimeVsubProvider : MainAPI() {
                     val recv = try { captures.receive() } catch (e: Throwable) { nlogE("[Hook] receive", e); null }
                     if (recv == null) break
                     val (capUrl, capBody) = recv
-                    // Có playlist -> dừng trang để player không tải tiếp quảng cáo/segment.
-                    try {
-                        withContext(Dispatchers.Main) {
-                            webView?.stopLoading()
-                            webView?.loadUrl("about:blank")
-                        }
-                    } catch (_: Throwable) {}
 
+                    // v12: xử lý capture TRƯỚC — chỉ dừng trang khi đăng ký THÀNH
+                    // CÔNG. Tiêu chí pass() rộng hơn (body chứa .m3u8 cũng forward)
+                    // nên có capture rác; dừng trang sớm trước đây giết luôn capture
+                    // thật đi sau.
                     val body = capBody.trim()
                     if (body.startsWith("#EXTM3U")) {
                         val base = Regex("""^(https?://[^/]+/.*/)""").find(capUrl)?.groupValues?.get(1) ?: ""
@@ -2053,6 +2112,15 @@ class AnimeVsubProvider : MainAPI() {
                                 registered = true
                             }
                         }
+                    }
+                    if (registered) {
+                        // Có playlist -> dừng trang để player không tải tiếp quảng cáo/segment.
+                        try {
+                            withContext(Dispatchers.Main) {
+                                webView?.stopLoading()
+                                webView?.loadUrl("about:blank")
+                            }
+                        } catch (_: Throwable) {}
                     }
                 }
                 registered
@@ -2148,6 +2216,10 @@ class AnimeVsubProvider : MainAPI() {
         }
         if (interactive && (ctx !is android.app.Activity || ctx.isFinishing)) return null
 
+        // v12: chờ lượt WebView (tối đa 2 capture song song) — sau mọi early-return
+        // để không rò rỉ permit.
+        while (!wvGate.tryAcquire()) kotlinx.coroutines.delay(60)
+
         val done = kotlinx.coroutines.CompletableDeferred<Document?>()
         var webView: WebView? = null
         var dialog: android.app.Dialog? = null
@@ -2186,6 +2258,15 @@ class AnimeVsubProvider : MainAPI() {
                     if (srvErr) {
                         noteServerError("WVDom", u)
                         sawSrvErr = true
+                        try { wv.stopLoading() } catch (_: Throwable) {}
+                        if (!done.isCompleted) done.complete(null)
+                        return@AvsGateBridge
+                    }
+                    // v12: trang 404 / "Tên miền tạm thời bị chặn" — site tự redirect
+                    // slug chết sang /404 (evidence 27-10 05:34:22, đợi nguyên timeout
+                    // 22s vô ích). Trả null NGAY để caller thử candidate kế.
+                    if (u.endsWith("/404") || html.contains("Tên miền tạm thời bị chặn")) {
+                        nlog("[WVDom] 404/tên-miền-bị-chặn — trả null ngay $u")
                         try { wv.stopLoading() } catch (_: Throwable) {}
                         if (!done.isCompleted) done.complete(null)
                         return@AvsGateBridge
@@ -2271,6 +2352,7 @@ class AnimeVsubProvider : MainAPI() {
         } finally {
             try { withContext(Dispatchers.Main) { dialog?.dismiss() } } catch (_: Throwable) {}
             try { withContext(Dispatchers.Main) { webView?.destroy() } } catch (_: Throwable) {}
+            wvGate.release()
         }
     }
 
