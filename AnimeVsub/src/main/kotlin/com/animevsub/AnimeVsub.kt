@@ -114,6 +114,29 @@
 //      các lần sau bị "bỏ qua" oan — log 19:11:25 -> 19:13 toàn "bỏ qua").
 //    * Thông báo phân biệt rõ SITE-5xx (server chết, đợi + kiểm tra Chrome) vs
 //      bị chặn (cần tick gate); getMainPage/search break sớm khi storm bật.
+//  v10 (26-10-2026, "hướng mới" hoàn thiện — theo log+screenshot 06:30: WebView
+//  VÀO ĐƯỢC THẬT (Tình Cảm 32 items, Hành Động 38 items) nhưng chỉ ~50% request;
+//  log còn tiết lộ app đang chạy >=2 INSTANCE plugin song song: 3 session banner
+//  trong 40s + fetch 11 thể loại trong khi mainPage mới chỉ 5 — 2 instance KHÔNG
+//  dùng chung gate/storm-gate nên nhân đôi traffic, nuôi bộ chống xâm nhập):
+//    * WEBVIEW UA THẬT: xoá userAgentString=USER_AGENT trong webviewDocCapture
+//      + ajaxPlayerViaWebView — WebView dùng UA Android thật (fingerprint nhất
+//      quán); UA Windows chỉ còn cho tầng plain dự phòng (PLAIN_FIRST).
+//    * PLAIN_FIRST=false: TẮT hẳn plain HTTP + CORS proxy cho trang site — log
+//      cho thấy plain 100% 403 len≈660 (CF edge chặn TLS okhttp) hoặc 520 trang
+//      lỗi; mỗi request chết là nhiễu nuôi detector + đốt 2-4 request/URL.
+//    * WV PACING (wvPace): 2 lần WebView nạp trang cách nhau >=1.2-2.2s — nhịp
+//      người thật, áp cho webviewDocCapture + ajaxPlayerViaWebView + tryHookFlow.
+//    * RETRY 5xx: WVDom thấy trang lỗi -> backoff 3.5s/7s, capture lại tối đa 3
+//      lần (log: Tình Cảm ăn lỗi liên tục rồi thành công — site cho qua theo đợt).
+//    * STORM-GATE MỀM: chốt 3 lỗi WVDom/90s (trước 2), cooldown 20s, và fetch
+//      mới KHÔNG fail tức thì nữa mà CHỜ gate nhấc tối đa ~16-18s — hết cảnh
+//      bấm vào phim bị văng lỗi khi site vừa hồi phục (log [Load] 06:31).
+//    * SOFT-404: site điều hướng sang /404 (Học Đường 06:30:53) -> nhận diện,
+//      không retry/không cache, getMainPage/search trả rỗng gọn gàng.
+//    * KHÔNG cache listing 0-card (trang rớt từng bị cache 5 phút).
+//    * NLOG INST ID: banner + mỗi dòng mang inst=xx + pid trong banner — lần
+//      diag sau sẽ thấy NGAY nếu vẫn còn 2 bản plugin chạy chung (v10.a vs v10.b).
 // URL patterns đã xác minh qua search index + Telegram kênh chính thức (24-10-2026):
 //  - Chi tiết phim : /phim/{slug}-a{id}/          (vd /phim/dogulwang-a6014/)
 //  - Trang xem     : /phim/{slug}-a{id}/xem-phim.html
@@ -162,19 +185,36 @@ class AnimeVsubProvider : MainAPI() {
     override val hasDownloadSupport = false
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
-    // Đổi hằng số:
-private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+    // v10: UA Windows CHỈ còn dùng cho tầng plain HTTP dự phòng (PLAIN_FIRST).
+    // WebView dùng UA THẬT của thiết bị (Linux; Android) — fingerprint nhất quán
+    // (UA <-> platform <-> touch đều thật), khác hẳn dấu hiệu giả mạo mà bộ chống
+    // xâm nhập của site hay phạt. Hệ quả chấp nhận được: cf_clearance do WebView
+    // (UA thật) thu được sẽ KHÔNG dùng lại được cho plain (UA khác) — vì plain
+    // cho domain này đã 100% 403 ở edge CF (fingerprint TLS okhttp) từ trước.
+    private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 
-// Trong webviewDocCapture() và ajaxPlayerViaWebView(): XOÁ dòng này —
-// wv.settings.userAgentString = USER_AGENT
-// Để WebView dùng UA thật (Linux; Android 17; Chrome/13x) — đây là fingerprint
-// "sạch" nhất có thể có. UA Windows chạy trên Android WebView là dấu hiệu
-// giả mạo dễ bị origin phạt.
+    /** UA thật của WebView (ghi lần đầu tạo WebView — chỉ để log chẩn đoán). */
+    @Volatile private var wvUserAgent: String? = null
+
+    /**
+     * v10: TẮT tầng plain HTTP + CORS proxy cho trang site (mặc định).
+     * Log 25-26/10: plain 100% 403 (len≈660 — CF edge chặn fingerprint TLS của
+     * okhttp, cookie clearance cũng vô ích) hoặc 520 kèm trang lỗi ~888KB. Mỗi
+     * request chết như vậy vừa vô ích vừa là "nhiễu" nuôi bộ chống xâm nhập của
+     * site -> mọi trang đi thẳng WebView (UA thật). Bật true chỉ khi site bỏ
+     * chặn okhttp (ví dụ sau khi đổi domain/CDN).
+     */
+    private val PLAIN_FIRST = false
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  FLAGS / HẰNG SỐ
     // ═══════════════════════════════════════════════════════════════════════════
-    private val AVS_BUILD = "v9"
+    private val AVS_BUILD = "v10"
+    // v10: định danh instance (random mỗi lần provider được nạp). Banner ghi cả
+    // pid. Nếu diag có >=2 banner, hoặc 2 nhóm prefix "v10.xx" khác nhau -> app
+    // đang chạy NHIỀU bản plugin song song (cài trùng extension / 2 repo) — đó
+    // chính là thứ nhân đôi traffic kích chống xâm nhập của site.
+    private val AVS_INST = (0..0xFF).random().toString(16).padStart(2, '0')
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -287,7 +327,7 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
                     } catch (_: Throwable) { "?" }
                     val dev = try { android.os.Build.MODEL } catch (_: Throwable) { "?" }
                     val os  = try { android.os.Build.VERSION.RELEASE } catch (_: Throwable) { "?" }
-                    f.appendText("═══ AnimeVsub $AVS_BUILD session ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())} | $dev | Android $os | app $appVer ═══\n")
+                    f.appendText("═══ AnimeVsub $AVS_BUILD inst=$AVS_INST pid=${android.os.Process.myPid()} session ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())} | $dev | Android $os | app $appVer ═══\n")
                     f.appendText("log file: ${f.absolutePath}\n")
                 }
                 // Giữ file dưới ~384KB (cắt bớt đầu, giữ 128KB gần nhất).
@@ -295,7 +335,7 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
                     f.writeText(f.readText().takeLast(128 * 1024))
                 }
                 val ts = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US).format(java.util.Date())
-                f.appendText("$ts $AVS_BUILD $msg\n")
+                f.appendText("$ts $AVS_BUILD.$AVS_INST $msg\n")
             }
         } catch (_: Throwable) {}
     }
@@ -342,6 +382,23 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 
     private val cfCookieCache = ConcurrentHashMap<String, Map<String, String>>()
     private val cfMutex = Mutex()
+
+    // v10: PACING WebView — 2 lần nạp trang cách nhau >= 1.2-2.2s (nhịp người
+    // thật). Áp cho MỌI WebView nạp trang site (capture/hook/ajax-player).
+    @Volatile private var wvNextSlotMs = 0L
+    // v10: kết quả capture WebView gần nhất (cfMutex tuần tự hoá nên đọc an toàn).
+    @Volatile private var lastWvSawSrvErr = false
+    @Volatile private var wvSoft404 = false
+
+    /** Chờ tới lượt nạp trang WebView kế tiếp — gọi TRƯỚC khi vào Dispatchers.Main. */
+    private suspend fun wvPace() {
+        val wait = wvNextSlotMs - System.currentTimeMillis()
+        if (wait > 0) {
+            nlog("[WV] pacing chờ ${wait}ms (giãn nhịp WebView)")
+            kotlinx.coroutines.delay(wait)
+        }
+        wvNextSlotMs = System.currentTimeMillis() + fetchRand.nextLong(1200, 2200)
+    }
 
     private fun looksBlocked(html: String): Boolean {
         if (html.isBlank()) return true
@@ -393,10 +450,10 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
     private val SITE_DOWN_COOLDOWN_MS = 90_000L
 
     // v9: STORM-GATE — khi CHÍNH WebView (WVDom) liên tục nhận trang lỗi 5xx
-    // (server chết thật với client này), chặn MỌI fetch mới 30s: fail tức thì
-    // thay vì dội hàng trăm request (log 19:11: 139 lỗi/2 phút vì không có chốt).
+    // (server chết thật với client này) -> giãn nhịp toàn cục 20s. v10: fetch
+    // mới CHỜ gate nhấc (awaitStormLift) thay vì fail tức thì.
     @Volatile private var srvStormUntilMs = 0L
-    private val SRV_STORM_COOLDOWN_MS = 30_000L
+    private val SRV_STORM_COOLDOWN_MS = 20_000L
     private val wvSrvErrTimes = ArrayDeque<Long>()
 
     private fun srvStormActive(): Boolean = System.currentTimeMillis() < srvStormUntilMs
@@ -404,6 +461,21 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
     private fun srvStormError() = ErrorLoadingException(
         "SITE-5xx: server animevietsub đang trả lỗi 5xx (cả WebView đều thấy) — đợi ~${SRV_STORM_COOLDOWN_MS / 1000}s rồi thử lại; mở ${mainUrl} trong Chrome để kiểm tra (lỗi phía site, không phải plugin)"
     )
+
+    /**
+     * v10: storm bật -> fetch mới CHỜ gate nhấc (tối đa ~16-18s + jitter) thay
+     * vì fail tức thì. Log 06:30: site cho qua ~50% request và hồi phục sau vài
+     * chục giây — chờ thường thành công; fail tức thì là bỏ mất đường còn sống
+     * (log [Load] 06:31:32: bấm phim bị văng lỗi trong khi listing vừa tải xong).
+     */
+    private suspend fun awaitStormLift(url: String): Boolean {
+        if (!srvStormActive()) return true
+        val remain = srvStormUntilMs - System.currentTimeMillis()
+        val wait = remain.coerceIn(0L, 16_000L) + fetchRand.nextLong(0, 2_500)
+        nlog("[Fetch] STORM-GATE — chờ ~${wait / 1000}s thay vì fail tức thì $url")
+        kotlinx.coroutines.delay(wait)
+        return !srvStormActive()
+    }
 
     private fun siteDown(): Boolean = System.currentTimeMillis() < siteDownUntilMs
 
@@ -422,10 +494,10 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
                 wvSrvErrTimes.addLast(now)
                 while (wvSrvErrTimes.size > 6) wvSrvErrTimes.removeFirst()
                 val recent = wvSrvErrTimes.count { now - it <= 90_000 }
-                if (recent >= 2 && now >= srvStormUntilMs) {
+                if (recent >= 3 && now >= srvStormUntilMs) {
                     srvStormUntilMs = now + SRV_STORM_COOLDOWN_MS
-                    nlog("[Site] STORM-GATE BẬT ${SRV_STORM_COOLDOWN_MS / 1000}s: WebView cũng nhận trang 5xx — ngừng dội request, đợi site hồi phục")
-                    ntoast("AnimeVsub: server site đang lỗi 5xx — đợi ~30s rồi thử lại; mở animevietsub.sale trong Chrome để kiểm tra")
+                    nlog("[Site] STORM-GATE BẬT ${SRV_STORM_COOLDOWN_MS / 1000}s: WebView cũng nhận trang 5xx — giãn nhịp, đợi site hồi phục")
+                    ntoast("AnimeVsub: server site đang lỗi 5xx — đợi ~${SRV_STORM_COOLDOWN_MS / 1000}s rồi thử lại; mở animevietsub.sale trong Chrome để kiểm tra")
                 }
             }
         }
@@ -588,9 +660,9 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
                 }
             }
         }
-        // v9: STORM-GATE — WebView vừa xác nhận server trả 5xx -> fail TỨC THÌ,
-        // đừng dội thêm request vào server đang chết (log 19:11: 139 lỗi/2 phút).
-        if (srvStormActive()) {
+        // v10: storm bật -> CHỜ gate nhấc (site hồi phục nhanh — log 06:30) thay
+        // vì fail tức thì; hết thời gian chờ mà vẫn storm mới ném lỗi.
+        if (srvStormActive() && !awaitStormLift(url)) {
             nlog("[Fetch] STORM-GATE chặn fetch mới (server 5xx) $url")
             throw srvStormError()
         }
@@ -646,26 +718,30 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
         // (screenshot user 18:21 render đầy đủ). Breaker chỉ còn ý nghĩa với tầng
         // plain/proxy; tầng WebView tự bảo vệ bằng bail nhanh khi thấy DOM 5xx.
 
-        // ── 1. Plain HTTP với cookie clearance đã có (nhanh nhất) ──
+        // ── 1. Plain HTTP (v10: TẮT mặc định — PLAIN_FIRST=false) ──
+        // Log 25-26/10: plain 100% 403 len≈660 (edge CF chặn fingerprint TLS
+        // okhttp — cookie clearance cũng vô ích) hoặc 520 trang lỗi 888KB. Mỗi
+        // request chết vừa vô ích vừa nuôi bộ chống xâm nhập -> bỏ hẳn, vào
+        // WebView ngay (UA thật). Bật PLAIN_FIRST=true nếu site bỏ chặn okhttp.
         val cachedCookies = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
-        // v9: GATE TOÀN CỤC — tối đa 3 chuỗi plain song song + jitter 80-280ms.
-        // Trước đây 12 mục danh mục nạp CÙNG LÚC ≈ 24 request/2s dội vào site —
-        // thứ rất có thể kích rate-limit origin -> trang "Lỗi Server 5xx" theo đợt.
-        while (!fetchGate.tryAcquire()) kotlinx.coroutines.delay(60)
-        try {
-            kotlinx.coroutines.delay(fetchRand.nextLong(80, 280))
-            if (cachedCookies != null) {
-                tryPlainDoc(url, cachedCookies)?.let {
+        if (PLAIN_FIRST) {
+            // v9: GATE TOÀN CỤC — tối đa 3 chuỗi plain song song + jitter.
+            while (!fetchGate.tryAcquire()) kotlinx.coroutines.delay(60)
+            try {
+                kotlinx.coroutines.delay(fetchRand.nextLong(150, 450))
+                if (cachedCookies != null) {
+                    tryPlainDoc(url, cachedCookies)?.let {
+                        if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
+                        return it
+                    }
+                }
+                tryPlainDoc(url, null)?.let {
                     if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
                     return it
                 }
+            } finally {
+                fetchGate.release()
             }
-            tryPlainDoc(url, null)?.let {
-                if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
-                return it
-            }
-        } finally {
-            fetchGate.release()
         }
         // ── 2. WebView-first (v8): plain đã chết (403-gate/520-storm) — vào WebView
         //    NGAY. Log 25-10: CORS proxy 100% timeout (đốt 10-20s/URL vô ích) nên
@@ -694,7 +770,7 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
             // v8: không check breaker trong lock — nếu site thật sự chết,
             // webviewDocCapture tự bail ~2s khi poll thấy DOM 5xx.
             val fresh = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
-            if (fresh != null && fresh != cachedCookies) {
+            if (PLAIN_FIRST && fresh != null && fresh != cachedCookies) {
                 tryPlainDoc(url, fresh)?.let {
                     if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
                     return@withLock it
@@ -702,14 +778,44 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
             }
 
             nlog("[Fetch] webview-dom fallback mode=$mode $url")
-            val doc = webviewDocCapture(url, mode, WV_SILENT_TIMEOUT_MS, interactive = false)
-            if (doc != null && useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
+            // v10: WVDom thấy trang 5xx -> backoff rồi capture lại (tối đa 3 lần)
+            // — log 06:30: Tình Cảm ăn trang lỗi liên tục rồi thành công, site cho
+            // qua theo đợt -> bỏ trắng category ngay lần đầu là lãng phí.
+            var doc: Document? = null
+            var attempt = 0
+            while (attempt <= 2) {
+                lastWvSawSrvErr = false
+                wvSoft404 = false
+                doc = webviewDocCapture(url, mode, WV_SILENT_TIMEOUT_MS, interactive = false)
+                if (doc != null) break
+                if (!lastWvSawSrvErr) break   // bị chặn gate/timeout/404 — retry kiểu này vô ích
+                attempt++
+                if (attempt > 2) break
+                val back = 3_500L * attempt + fetchRand.nextLong(0, 1_500)
+                nlog("[Fetch] WVDom thấy 5xx lần $attempt — backoff ${back}ms rồi thử lại $url")
+                kotlinx.coroutines.delay(back)
+            }
+            if (doc != null) {
+                // v10: KHÔNG cache listing 0-card (trang 404/rỗng từng bị cache 5 phút).
+                if (useCache && mode == MODE_LISTING && parseCards(doc).isEmpty()) {
+                    nlog("[Fetch] KHÔNG cache listing 0-card $url")
+                } else if (useCache) {
+                    docCache[url] = CachedDoc(doc, System.currentTimeMillis())
+                }
+            }
             doc
         }
         if (silent != null) return silent
 
-        // v9: storm đang bật -> gate/webview/proxy đều vô ích, fail tức thì.
-        if (srvStormActive()) {
+        // v10: site điều hướng sang trang /404 (soft-block) — không retry, không
+        // gate, ném lỗi đánh dấu để getMainPage/search trả rỗng gọn gàng.
+        if (wvSoft404) {
+            nlog("[Fetch] soft-404 — site điều hướng trang này sang /404 $url")
+            throw ErrorLoadingException("AVS-SOFT404: $url bị điều hướng sang trang 404")
+        }
+
+        // v10: storm bật -> chờ gate nhấc thay vì fail tức thì.
+        if (srvStormActive() && !awaitStormLift(url)) {
             nlog("[Fetch] STORM-GATE giữa chuỗi — dừng trước gate $url")
             throw srvStormError()
         }
@@ -720,7 +826,7 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
             return it
         }
         // Nếu một unlock khác vừa chạy xong -> clearance cookie mới có thể đã có.
-        tryPlainDoc(url, cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl))?.let {
+        if (PLAIN_FIRST) tryPlainDoc(url, cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl))?.let {
             if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
             return it
         }
@@ -730,17 +836,15 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
             return it
         }
 
-        // v9: storm bật -> proxy chỉ ăn timeout 10-20s, fail tức thì.
-        if (srvStormActive()) {
+        // v10: storm bật -> chờ gate nhấc thay vì fail tức thì.
+        if (srvStormActive() && !awaitStormLift(url)) {
             nlog("[Fetch] STORM-GATE — bỏ qua proxy $url")
             throw srvStormError()
         }
 
-        // ── 5. CORS proxy — HẠ CUỐI (v8): log 25-10 18h: allorigins/codetabs 100%
-        //    timeout 10-20s/URL, lần "200" duy nhất cũng là trang gate bị chặn
-        //    (blocked=true). Chỉ còn là phương sách cuối; giữ circuit breaker.
-        //    v9: chạy SONG SONG (race) + timeout cứng 9s/proxy (tryCorsProxy). ──
-        if (System.currentTimeMillis() >= proxyDisabledUntilMs) {
+        // ── 5. CORS proxy (v10: chỉ chạy khi PLAIN_FIRST=true — proxy cũng chỉ là
+        //    plain HTTP từ server công cộng, tất cả đều bị chặn/timeout 9s) ──
+        if (PLAIN_FIRST && System.currentTimeMillis() >= proxyDisabledUntilMs) {
             val found = coroutineScope {
                 corsProxies.map { proxy -> async { tryCorsProxy(proxy, url) } }
             }.awaitAll().filterNotNull().firstOrNull()
@@ -755,7 +859,7 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
             }
         }
 
-        throw ErrorLoadingException("AnimeVsub: site vẫn chặn sau mọi đường (plain 403/520 + WebView + gate + proxy) — thử lại sau vài phút; mở animevietsub.sale trong Chrome để kiểm tra: Chrome cũng lỗi -> site đang sự cố 5xx, Chrome OK -> đợi dialog xác minh hiện ra và tick")
+        throw ErrorLoadingException("AnimeVsub: không lấy được trang sau mọi đường (WebView + gate) — thử lại sau vài phút; mở animevietsub.sale trong Chrome để kiểm tra: Chrome cũng lỗi 5xx -> site/IP đang bị chặn, Chrome OK -> đợi dialog xác minh hiện ra và tick")
     }
 
     /** v9: thử 1 CORS proxy với timeout cứng 9s — log 25-10: khi server site
@@ -835,7 +939,6 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
     "GENRE::kinh-di"    to "Kinh Dị",
     "GENRE::hoc-duong"  to "Học Đường"
 )
-// + delay(150, 450) thay vì (80, 280)
 
     /** Danh sách URL ứng viên cho 1 trang listing — cái nào parse ra card thì dùng. */
     private fun listingCandidates(data: String, page: Int): List<String> {
@@ -878,6 +981,9 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
             } catch (e: Throwable) {
                 if (isCancellation(e)) throw e
                 nlog("[List] candidate fail $url: ${e.message}")
+                // v10: soft-404 — URL không tồn tại (site điều hướng /404), đừng
+                // thử candidate kế (cùng cụm URL) -> trả rỗng gọn gàng.
+                if (e.message?.contains("AVS-SOFT404") == true) break
                 // v5: site-down -> các candidate kế cũng vậy, đừng lặp vô ích.
                 // v9: storm-gate (WebView cũng 5xx) -> break luôn.
                 if (siteDown() || srvStormActive()) break
@@ -972,6 +1078,10 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
         // POST ajax/suggest với ajaxSearch=1&keysearch=... — CMS OPhim trả HTML
         // <li> gợi ý (có <a> + <img>) hoặc JSON. Rẻ hơn nhiều so với 4 biến thể GET
         // qua WebView — thử TRƯỚC, thất bại thì rơi xuống biến thể GET cũ.
+        // v10: ajax/suggest là POST plain okhttp — bị chặn như mọi request plain
+        // (520 trang lỗi, log 06:30:28) -> chỉ thử khi PLAIN_FIRST=true. Tìm kiếm
+        // đi thẳng /tim-kiem qua fetchDoc (WebView UA thật).
+        if (PLAIN_FIRST) {
         try {
             val res = app.post(
                 "$mainUrl/ajax/suggest",
@@ -994,6 +1104,7 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
             if (isCancellation(e)) throw e
             nlogE("[Search] ajax/suggest", e)
         }
+        } // if (PLAIN_FIRST)
 
         val candidates = listOf(
             "$mainUrl/tim-kiem?keyword=$keyword",
@@ -1018,6 +1129,8 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
             } catch (e: Throwable) {
                 if (isCancellation(e)) throw e
                 nlog("[Search] candidate fail $url: ${e.message}")
+                // v10: soft-404 — biến thể này không tồn tại, bỏ phần còn lại.
+                if (e.message?.contains("AVS-SOFT404") == true) return emptyList()
                 // v9: storm/breaker bật -> dừng toàn bộ biến thể, đừng đốt chuỗi nữa.
                 if (srvStormActive() || siteDown()) return emptyList()
             }
@@ -1244,12 +1357,14 @@ private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
         fun jsq(s: String) = s.replace("\\", "\\\\").replace("'", "\\'")
             .replace("\n", "").replace("\r", "").replace("</", "<\\/")
         try {
+            // v10: giãn nhịp WebView (lần nạp trang này cũng chiếm slot).
+            wvPace()
             withContext(Dispatchers.Main) {
                 val wv = WebView(ctx)
                 webView = wv
                 wv.settings.javaScriptEnabled = true
                 wv.settings.domStorageEnabled = true
-                wv.settings.userAgentString = USER_AGENT
+                // v10: UA thật của thiết bị — cùng fingerprint với webviewDocCapture.
                 try { wv.settings.blockNetworkImage = true } catch (_: Throwable) {}
                 try { CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true) } catch (_: Throwable) {}
                 val js = """
@@ -1946,6 +2061,8 @@ private fun currentActivity(): android.app.Activity? {
             val captures = Channel<Pair<String, String>>(Channel.UNLIMITED)
             val captureCount = java.util.concurrent.atomic.AtomicInteger(0)
 
+            // v10: giãn nhịp WebView (flow hook nạp trang xem/embed — cũng chiếm slot).
+            wvPace()
             withContext(Dispatchers.Main) {
                 val wv = WebView(ctx)
                 webView = wv
@@ -2152,13 +2269,22 @@ private fun currentActivity(): android.app.Activity? {
         var lastBlocked = true
         var sawSrvErr = false
         try {
+            // v10: giãn nhịp — mọi lần WebView nạp trang cách nhau >=1.2-2.2s.
+            wvPace()
             withContext(Dispatchers.Main) {
                 val wv = WebView(ctx)
                 webView = wv
                 wv.settings.javaScriptEnabled = true
                 wv.settings.domStorageEnabled = true
-                // v4: UA ĐỒNG BỘ với plain HTTP — cf_clearance gắn với UA, lệch UA là 403.
-                wv.settings.userAgentString = USER_AGENT
+                // v10: KHÔNG đặt UA — WebView dùng UA THẬT của thiết bị (Android
+                // + Chrome thật). UA Windows chạy trên WebView Android là dấu hiệu
+                // giả mạo mà bộ chống xâm nhập của site hay phạt. cf_clearance thu
+                // được gắn với UA thật — plain (UA khác) đừng mong dùng lại.
+                val realUa = wv.settings.userAgentString
+                if (realUa != wvUserAgent) {
+                    wvUserAgent = realUa
+                    nlog("[WV] UA thật của thiết bị: $realUa")
+                }
                 wv.settings.mediaPlaybackRequiresUserGesture = false
                 // Chặn tải ảnh: DOM sẵn sàng nhanh hơn hẳn, tiết kiệm băng thông.
                 try { wv.settings.blockNetworkImage = true } catch (_: Throwable) {}
@@ -2174,6 +2300,9 @@ private fun currentActivity(): android.app.Activity? {
                     lastSig = sig
                     val blocked = looksBlocked(html)
                     val srvErr = looksServerError(html)
+                    // v10: site điều hướng sang trang /404 (soft-block — log 06:30:53
+                    // "page-start .../404", DOM sạch 1852B nhưng 0 cards).
+                    val soft404 = u.substringBefore('?').trimEnd('/').endsWith("/404")
                     val cards = countPhimAnchors(html)
                     val xem = countXemPhim(html)
                     val eps = countEpisodeAnchors(html)
@@ -2183,6 +2312,14 @@ private fun currentActivity(): android.app.Activity? {
                     if (srvErr) {
                         noteServerError("WVDom", u)
                         sawSrvErr = true
+                        lastWvSawSrvErr = true
+                        try { wv.stopLoading() } catch (_: Throwable) {}
+                        if (!done.isCompleted) done.complete(null)
+                        return@AvsGateBridge
+                    }
+                    if (soft404) {
+                        wvSoft404 = true
+                        nlog("[WVDom] DỪNG: trang bị điều hướng /404 (không tồn tại/soft-block) $u")
                         try { wv.stopLoading() } catch (_: Throwable) {}
                         if (!done.isCompleted) done.complete(null)
                         return@AvsGateBridge
@@ -2254,6 +2391,8 @@ private fun currentActivity(): android.app.Activity? {
                 // thì vẫn trả — caller tự quyết (getMainPage sẽ thử candidate kế).
                 if (sawSrvErr) {
                     nlog("[WVDom] DỪNG: trang lỗi 5xx (site-down) interactive=$interactive $url")
+                } else if (wvSoft404) {
+                    nlog("[WVDom] DỪNG: điều hướng /404 interactive=$interactive $url")
                 } else {
                     val lh = lastHtml
                     if (lh != null && !lastBlocked) {
