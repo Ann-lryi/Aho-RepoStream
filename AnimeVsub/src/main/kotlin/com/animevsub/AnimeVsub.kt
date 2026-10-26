@@ -182,7 +182,7 @@ class AnimeVsubProvider : MainAPI() {
     //  (5) avsHookJs forward thêm body chứa .m3u8 (JSON API của player trả m3u8
     //      bọc trong JSON — URL không có .m3u8 nên tiêu chí cũ bỏ sót).
     //  (6) bỏ genre Học Đường (site redirect /404).
-    private val AVS_BUILD = "v12"
+    private val AVS_BUILD = "v13"
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -672,10 +672,13 @@ class AnimeVsubProvider : MainAPI() {
         // ── 1. Plain HTTP với cookie clearance đã có (nhanh nhất) ──
         // v12 PLAIN-BREAKER: sau 3 lần plain fail liên tục (403/challenge/520) thì
         // tắt tầng plain 10 phút — vào WebView ngay, không đốt request vô ích.
+        // v13 FIX: cachedCookies phải nằm ở SCOPE HÀM (trước breaker if) — v12 khai
+        // trong else nên cụm "fresh != cachedCookies" ở cfMutex.withLock mất tham
+        // chiếu -> CI: Unresolved reference 'cachedCookies' (732:43).
+        val cachedCookies = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
         if (System.currentTimeMillis() < plainHtmlDeadUntilMs) {
             nlog("[Fetch] plain TẮT (breaker 403 liên tục) — vào WebView luôn $url")
         } else {
-            val cachedCookies = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
             // GATE TOÀN CỤC — tối đa 3 chuỗi plain song song + jitter 150-450ms.
             while (!fetchGate.tryAcquire()) kotlinx.coroutines.delay(60)
             try {
