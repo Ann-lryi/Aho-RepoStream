@@ -182,7 +182,21 @@ class AnimeVsubProvider : MainAPI() {
     //  (5) avsHookJs forward thêm body chứa .m3u8 (JSON API của player trả m3u8
     //      bọc trong JSON — URL không có .m3u8 nên tiêu chí cũ bỏ sót).
     //  (6) bỏ genre Học Đường (site redirect /404).
-    private val AVS_BUILD = "v14"
+    // v15 = v14 + 3 tầng chống chặn segment (diag 27-10 11:47: CDN báo
+    //  "Missing segment token" dù token JWT nằm đúng trong query — CDN KHÔNG
+    //  đọc token từ query mà từ ngữ cảnh session mà player JS thiết lập):
+    //  (R0) SEG-RECIPE — hook JS ghi nhận request /chunks/ THẬT của player gốc
+    //       (URL đầy đủ + header tự set) rồi proxy replicate 1-1 (param bổ sung
+    //       kiểu sid + headers). Player trong WebView là môi trường DUY NHẤT
+    //       mà CDN chấp nhận (playlist fetch OK ở đó).
+    //  (R1) RELAY WEBVIEW — WebView hook được "nhận nuôi" thay vì hủy; segment
+    //       được fetch QUA chính ngữ cảnh player (cookie HttpOnly + UA + origin),
+    //       byte stream về qua bridge base64 96KB/chunk. Luôn hoạt động khi
+    //       recipe thiếu/thất bại vì dùng đúng ngữ cảnh đã fetch playlist OK.
+    //  (R2) chống bão: 403 JSON (auth) nghỉ 4s, 403 HTML (Cloudflare) nghỉ 30s
+    //       — diag cho thấy bão request khiến CF escalate tới NXDOMAIN.
+    //  + retry DNS 1 lần (UnknownHostException thoáng qua 06:28/11:49).
+    private val AVS_BUILD = "v15"
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -1928,6 +1942,23 @@ class AnimeVsubProvider : MainAPI() {
       }
     } catch (e) {}
   }
+  // v15: ghi nhận request playlist/segment CỦA PLAYER (URL + header tự set)
+  // — đây là công thức CDN chấp nhận, proxy replicate thay vì đoán.
+  function rec(u, hdrs, m, cred){
+    try {
+      var s = String(u);
+      if (s.indexOf('/chunks/') < 0 && s.indexOf('/playlist/') < 0) return;
+      var parts = [];
+      try {
+        if (hdrs) {
+          if (typeof hdrs.forEach === 'function') hdrs.forEach(function(v, k){ parts.push(k + '=' + v); });
+          else if (hdrs.length) { for (var i = 0; i < hdrs.length; i++) { parts.push(hdrs[i][0] + '=' + hdrs[i][1]); } }
+          else { for (var k in hdrs) { parts.push(k + '=' + hdrs[k]); } }
+        }
+      } catch (e2) {}
+      window.__avsBridge.onReq(abs(s), parts.join('|'), String(m || 'GET'), String(cred || ''));
+    } catch (e) {}
+  }
   function xhrText(x){
     try { return x.responseText; } catch (e) {}
     try { return new TextDecoder('utf-8').decode(x.response); } catch (e) {}
@@ -1939,7 +1970,16 @@ class AnimeVsubProvider : MainAPI() {
       window.fetch = function(){
         var args = arguments;
         var u = (args[0] && args[0].url) ? String(args[0].url) : String(args[0]);
+        var init = args[1];
+        try { rec(u, init ? init.headers : null, init ? init.method : 'GET', init ? init.credentials : ''); } catch (e0) {}
         return of.apply(this, args).then(function(res){
+          try {
+            if (String(u).indexOf('/playlist/') >= 0) {
+              var hs = [];
+              res.headers.forEach(function(v, k){ hs.push(k + '=' + v); });
+              window.__avsBridge.onPlRes(abs(u), hs.join('|'));
+            }
+          } catch (e1) {}
           try { res.clone().text().then(function(t){ pass(u, t); }, function(){}); } catch (e) {}
           return res;
         });
@@ -1947,11 +1987,17 @@ class AnimeVsubProvider : MainAPI() {
     }
   } catch (e) {}
   try {
-    var oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function(m, u){ this.__avsU = u; return oo.apply(this, arguments); };
+    var oo = XMLHttpRequest.prototype.open, osh = XMLHttpRequest.prototype.setRequestHeader, os = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(m, u){ this.__avsU = u; this.__avsM = m; this.__avsH = {}; return oo.apply(this, arguments); };
+    XMLHttpRequest.prototype.setRequestHeader = function(k, v){ try { if (this.__avsH) { this.__avsH[k] = v; } } catch (e) {} return osh.apply(this, arguments); };
     XMLHttpRequest.prototype.send = function(){
       var self = this;
+      try { rec(self.__avsU, self.__avsH, self.__avsM, String(self.withCredentials)); } catch (e0) {}
       this.addEventListener('load', function(){
+        try {
+          var su = String(self.__avsU || '');
+          if (su.indexOf('/playlist/') >= 0) { window.__avsBridge.onPlRes(abs(su), self.getAllResponseHeaders() || ''); }
+        } catch (e1) {}
         try { var t = xhrText(self); if (t) { pass(self.__avsU, t); } } catch (e) {}
       });
       return os.apply(this, arguments);
@@ -1961,14 +2007,37 @@ class AnimeVsubProvider : MainAPI() {
 """
 
     /** JS -> Kotlin bridge. Kotlin handler không được trùng tên @JavascriptInterface
-     *  (bài học NguonC v3: trùng tên -> StackOverflowError giết cả data path). */
+     *  (bài học NguonC v3: trùng tên -> StackOverflowError giết cả data path).
+     *  v15: thêm onReq (metadata request của player), onPlRes (header response
+     *  playlist), onRelayChunk (byte segment relay qua WebView). */
     private class AvsCaptureBridge(
-        private val handler: (String, String) -> Unit
+        private val handler: (String, String) -> Unit,
+        private val reqHandler: (String, String, String, String) -> Unit = { _, _, _, _ -> },
+        private val plResHandler: (String, String) -> Unit = { _, _ -> },
+        private val relayHandler: (String, String?, Int, String?) -> Unit = { _, _, _, _ -> }
     ) {
         @JavascriptInterface
         fun onCapture(url: String?, body: String?) {
             if (url.isNullOrBlank() || body.isNullOrBlank()) return
             try { handler(url, body) } catch (_: Throwable) {}
+        }
+
+        @JavascriptInterface
+        fun onReq(url: String?, headers: String?, method: String?, cred: String?) {
+            if (url.isNullOrBlank()) return
+            try { reqHandler(url, headers ?: "", method ?: "GET", cred ?: "") } catch (_: Throwable) {}
+        }
+
+        @JavascriptInterface
+        fun onPlRes(url: String?, headers: String?) {
+            if (url.isNullOrBlank()) return
+            try { plResHandler(url, headers ?: "") } catch (_: Throwable) {}
+        }
+
+        @JavascriptInterface
+        fun onRelayChunk(id: String?, b64: String?, last: Int, err: String?) {
+            if (id.isNullOrBlank()) return
+            try { relayHandler(id, b64, last, err) } catch (_: Throwable) {}
         }
     }
 
@@ -2004,6 +2073,9 @@ class AnimeVsubProvider : MainAPI() {
         val flowT0 = System.currentTimeMillis()
         var webView: WebView? = null
         var dialog: android.app.Dialog? = null
+        // v15-fix: khai báo NGOÀI try — try{} là scope riêng, biến khai trong try
+        // không nhìn thấy ở finally (bài học scope v12 lặp lại — kotlinc bắt được).
+        var adoptedRelay = false
         try {
             val ctx = appContext()
             if (ctx == null) {
@@ -2030,11 +2102,31 @@ class AnimeVsubProvider : MainAPI() {
                 wv.settings.mediaPlaybackRequiresUserGesture = false
                 try { CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true) } catch (_: Throwable) {}
                 wv.addJavascriptInterface(
-                    AvsCaptureBridge { url, body ->
-                        captureCount.incrementAndGet()
-                        nlog("[Hook] bridge +${System.currentTimeMillis() - flowT0}ms url=${url.take(60)} len=${body.length} head=${body.take(12)}")
-                        captures.trySend(url to body)
-                    },
+                    AvsCaptureBridge(
+                        handler = { url, body ->
+                            captureCount.incrementAndGet()
+                            nlog("[Hook] bridge +${System.currentTimeMillis() - flowT0}ms url=${url.take(60)} len=${body.length} head=${body.take(12)}")
+                            captures.trySend(url to body)
+                        },
+                        reqHandler = { url, headers, method, _ ->
+                            // v15: request /chunks/ ĐẦU TIÊN của player = công thức vàng
+                            if (url.contains("/chunks/")) {
+                                if (segObservedUrl == null) {
+                                    segObservedUrl = url
+                                    segObservedHeaders = parseHdrPairs(headers)
+                                    nlog("[Hook] SEG-REQ +${System.currentTimeMillis() - flowT0}ms $method url=${url.take(100)} hdrs=${headers.take(140)}")
+                                }
+                            } else if (url.contains("/playlist/")) {
+                                nlog("[Hook] PL-REQ +${System.currentTimeMillis() - flowT0}ms $method url=${url.take(80)}")
+                            }
+                        },
+                        plResHandler = { url, headers ->
+                            nlog("[Hook] PL-RES ${url.take(60)} hdrs=${headers.take(260)}")
+                        },
+                        relayHandler = { id, b64, last, err ->
+                            handleRelayChunk(id, b64, last, err)
+                        }
+                    ),
                     "__avsBridge"
                 )
                 wv.webChromeClient = WebChromeClient()
@@ -2054,8 +2146,11 @@ class AnimeVsubProvider : MainAPI() {
                     }
                 }
 
-                // Dialog full-screen khi có Activity: gate Turnstile có người dùng hỗ trợ tick.
-                if (ctx is android.app.Activity && !ctx.isFinishing) {
+                // v15: chỉ hiện dialog cho target SITE (Turnstile có thể cần người
+                // tick). Embed CDN (player) không có gate — dialog chỉ che màn hình
+                // vô ích, WebView chạy ngầm.
+                val isSiteTarget = targetUrl.startsWith(mainUrl)
+                if (ctx is android.app.Activity && !ctx.isFinishing && isSiteTarget) {
                     try {
                         val dlg = android.app.Dialog(ctx)
                         dlg.setContentView(
@@ -2084,22 +2179,23 @@ class AnimeVsubProvider : MainAPI() {
             var registered = false
             val hookResult = withTimeoutOrNull(HOOK_TIMEOUT_MS) {
                 var tries = 0
+                var pendingPl: Pair<String, String>? = null
                 while (!registered && tries < 6) {
                     tries++
                     val recv = try { captures.receive() } catch (e: Throwable) { nlogE("[Hook] receive", e); null }
                     if (recv == null) break
                     val (capUrl, capBody) = recv
 
-                    // v12: xử lý capture TRƯỚC — chỉ dừng trang khi đăng ký THÀNH
-                    // CÔNG. Tiêu chí pass() rộng hơn (body chứa .m3u8 cũng forward)
-                    // nên có capture rác; dừng trang sớm trước đây giết luôn capture
-                    // thật đi sau.
+                    // v12: tiêu chí pass() rộng (body chứa .m3u8 cũng forward) nên
+                    // có capture rác — chỉ tin playlist/harvest.
                     val body = capBody.trim()
                     if (body.startsWith("#EXTM3U")) {
-                        val base = Regex("""^(https?://[^/]+/.*/)""").find(capUrl)?.groupValues?.get(1) ?: ""
-                        if (registerM3U8Link(body, capUrl, base, "Vietsub", callback, siteReferer = targetUrl)) {
-                            registered = true
-                        }
+                        // v15: HẸN đăng ký — quan sát player gốc fetch segment TRƯỚC
+                        // để học công thức (param sid/header tự set). Player trong
+                        // WebView là môi trường DUY NHẤT CDN chấp nhận (proxy trần
+                        // bị 403 "Missing segment token" dù token nằm trong query).
+                        pendingPl = recv
+                        break
                     } else {
                         val (m3u8s, mp4s) = harvestMediaUrls(body)
                         val m3u8 = m3u8s.firstOrNull()
@@ -2122,14 +2218,51 @@ class AnimeVsubProvider : MainAPI() {
                             }
                         }
                     }
-                    if (registered) {
-                        // Có playlist -> dừng trang để player không tải tiếp quảng cáo/segment.
-                        try {
-                            withContext(Dispatchers.Main) {
-                                webView?.stopLoading()
-                                webView?.loadUrl("about:blank")
-                            }
-                        } catch (_: Throwable) {}
+                }
+
+                // path harvest (json/mp4) — giữ hành vi v12: dừng trang sau đăng ký
+                if (registered) {
+                    try {
+                        withContext(Dispatchers.Main) {
+                            webView?.stopLoading()
+                            webView?.loadUrl("about:blank")
+                        }
+                    } catch (_: Throwable) {}
+                }
+
+                // ── v15: path PLAYLIST — quan sát player rồi mới đăng ký ──
+                if (!registered && pendingPl != null) {
+                    val (capUrlP, capBodyP) = pendingPl
+                    // (1) đá player phát (muted) để nó tự fetch segment
+                    try {
+                        withContext(Dispatchers.Main) { webView?.evaluateJavascript(AVS_KICK_JS, null) }
+                    } catch (_: Throwable) {}
+                    // (2) chờ request /chunks/ đầu tiên của player (tối đa 8s)
+                    segObservedUrl = null
+                    segObservedHeaders = emptyMap()
+                    val obsT0 = System.currentTimeMillis()
+                    while (segObservedUrl == null && System.currentTimeMillis() - obsT0 < 8_000) {
+                        kotlinx.coroutines.delay(400)
+                    }
+                    if (segObservedUrl != null) buildSegRecipe()
+                    else nlog("[Hook] player không fetch segment trong 8s — sẽ dựa relay WebView")
+                    // (3) đăng ký playlist (recipe sẵn sàng cho direct + proxy)
+                    val baseP = Regex("""^(https?://[^/]+/.*/)""").find(capUrlP)?.groupValues?.get(1) ?: ""
+                    if (registerM3U8Link(capBodyP, capUrlP, baseP, "Vietsub", callback, siteReferer = targetUrl)) {
+                        registered = true
+                        if (!targetUrl.startsWith(mainUrl)) {
+                            // v15: NHẬN NUÔI WebView làm relay thay vì hủy — ngữ cảnh
+                            // player (cookie HttpOnly/UA/origin) dùng fetch segment.
+                            adoptRelayWebView(webView, dialog)
+                            adoptedRelay = true
+                        } else {
+                            try {
+                                withContext(Dispatchers.Main) {
+                                    webView?.stopLoading()
+                                    webView?.loadUrl("about:blank")
+                                }
+                            } catch (_: Throwable) {}
+                        }
                     }
                 }
                 registered
@@ -2158,8 +2291,12 @@ class AnimeVsubProvider : MainAPI() {
             }
             return registered
         } finally {
-            try { withContext(Dispatchers.Main) { dialog?.dismiss() } } catch (_: Throwable) {}
-            try { withContext(Dispatchers.Main) { webView?.destroy() } } catch (_: Throwable) {}
+            // v15: WebView đã nhận nuôi làm relay thì KHÔNG hủy — ngữ cảnh player
+            // là tài nguyên fetch segment; dọn bởi idle-check 14 phút.
+            if (!adoptedRelay) {
+                try { withContext(Dispatchers.Main) { dialog?.dismiss() } } catch (_: Throwable) {}
+                try { withContext(Dispatchers.Main) { webView?.destroy() } } catch (_: Throwable) {}
+            }
         }
     }
 
@@ -2407,6 +2544,191 @@ class AnimeVsubProvider : MainAPI() {
     //  KHÔNG BAO GIỜ serve trang Cloudflare/HTML làm video (check status + content-type).
     // ═══════════════════════════════════════════════════════════════════════════
 
+    // ═════ v15: SEG-RECIPE + RELAY WEBVIEW state ═════
+    //  Player JS trong WebView hook là môi trường DUY NHẤT CDN chấp nhận —
+    //  quan sát request /chunks/ của nó rồi replicate; giữ WebView sống làm relay.
+    private data class SegRecipe(
+        val extraParams: String,
+        val headers: Map<String, String>,
+        val sampleUrl: String,
+        val at: Long
+    )
+
+    @Volatile private var segRecipe: SegRecipe? = null
+    @Volatile private var segObservedUrl: String? = null
+    @Volatile private var segObservedHeaders: Map<String, String> = emptyMap()
+    @Volatile private var lastPlaylistLines: List<String>? = null
+
+    private class RelayBuf {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val buf = java.io.ByteArrayOutputStream()
+        @Volatile var done = false
+        @Volatile var err: String? = null
+    }
+
+    @Volatile private var relayWv: WebView? = null
+    @Volatile private var relayDialog: android.app.Dialog? = null
+    private val relayLock = Any()
+    private val relayPending = java.util.concurrent.ConcurrentHashMap<String, RelayBuf>()
+    private val relaySeq = java.util.concurrent.atomic.AtomicInteger(0)
+    @Volatile private var relayLastUseMs = 0L
+
+    private val AVS_KICK_JS = "(function(){try{var vs=document.querySelectorAll('video');for(var i=0;i<vs.length;i++){vs[i].muted=true;var p=vs[i].play();if(p&&p.catch)p.catch(function(){});}}catch(e){}})();"
+
+    private val AVS_CALM_JS = "(function(){try{var vs=document.querySelectorAll('video');for(var i=0;i<vs.length;i++){try{vs[i].pause();}catch(e){}}}catch(e){}})();"
+
+    private val avsRelayJs = """
+(function(){
+  if (window.__avsRelayInstalled) return; window.__avsRelayInstalled = true;
+  window.__avsRelay = function(id, url, headers){
+    try {
+      var opt = {credentials: 'include'};
+      if (headers) { var h = {}; for (var k in headers) { h[k] = headers[k]; } opt.headers = h; }
+      fetch(url, opt).then(function(r){
+        if (!r.ok) { window.__avsBridge.onRelayChunk(id, '', 1, 'HTTP' + r.status); return; }
+        return r.arrayBuffer().then(function(ab){
+          var u8 = new Uint8Array(ab), n = u8.length;
+          if (n === 0) { window.__avsBridge.onRelayChunk(id, '', 1, null); return; }
+          var CH = 98304;
+          for (var i = 0; i < n; i += CH) {
+            var end = Math.min(i + CH, n), bin = '';
+            for (var j = i; j < end; j += 8192) {
+              var e2 = Math.min(j + 8192, end);
+              bin += String.fromCharCode.apply(null, u8.subarray(j, e2));
+            }
+            window.__avsBridge.onRelayChunk(id, btoa(bin), end >= n ? 1 : 0, null);
+          }
+        });
+      }).catch(function(e){ window.__avsBridge.onRelayChunk(id, '', 1, '' + e); });
+    } catch (e) { window.__avsBridge.onRelayChunk(id, '', 1, '' + e); }
+  };
+})();
+"""
+
+    private fun parseHdrPairs(s: String): Map<String, String> =
+        s.split('|').mapNotNull { p ->
+            val i = p.indexOf('=')
+            if (i <= 0) null else p.substring(0, i).trim() to p.substring(i + 1).trim()
+        }.toMap()
+
+    /** v15: so URL segment player fetch với dòng playlist tương ứng -> param bổ
+     *  sung (sid=...) + header player tự set. Đây là công thức proxy sẽ dùng. */
+    private fun buildSegRecipe() {
+        val obs = segObservedUrl ?: return
+        try {
+            val obsPath = obs.substringBefore('?')
+            val obsQ = obs.substringAfter('?', "")
+            val line = lastPlaylistLines?.firstOrNull { it.substringBefore('?') == obsPath }
+            val lineNames = (line?.substringAfter('?', "") ?: "")
+                .split('&').map { it.substringBefore('=') }.toSet()
+            val extra = obsQ.split('&').filter { it.isNotBlank() && it.substringBefore('=') !in lineNames }
+            segRecipe = SegRecipe(extra.joinToString("&"), segObservedHeaders, obs, System.currentTimeMillis())
+            nlog("[Hook] SEG-RECIPE extra=[${extra.joinToString("&").take(90)}] hdrs=[${segObservedHeaders.keys.joinToString(",").take(90)}]")
+        } catch (e: Throwable) {
+            nlogE("[Hook] recipe", e)
+        }
+    }
+
+    private fun handleRelayChunk(id: String, b64: String?, last: Int, err: String?) {
+        val rb = relayPending[id] ?: return
+        if (!err.isNullOrBlank()) {
+            rb.err = err
+            rb.done = true
+        } else {
+            if (!b64.isNullOrEmpty()) {
+                try { rb.buf.write(android.util.Base64.decode(b64, android.util.Base64.DEFAULT)) } catch (_: Throwable) { rb.err = "b64"; rb.done = true }
+            }
+            if (last == 1) rb.done = true
+        }
+        if (rb.done) try { rb.latch.countDown() } catch (_: Throwable) {}
+    }
+
+    /** v15: nhận nuôi WebView hook — thu nhỏ dialog còn 1px trong suốt (nếu có),
+     *  lắp máy relay JS, hẹn giờ dọn khi nhàn rỗi. */
+    private fun adoptRelayWebView(wv: WebView?, dlg: android.app.Dialog?) {
+        if (wv == null) return
+        try {
+            relayLastUseMs = System.currentTimeMillis()
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                try {
+                    synchronized(relayLock) {
+                        val old = relayWv
+                        if (old != null && old !== wv) { try { old.destroy() } catch (_: Throwable) {} }
+                        val oldDlg = relayDialog
+                        if (oldDlg != null && oldDlg !== dlg) { try { oldDlg.dismiss() } catch (_: Throwable) {} }
+                        relayWv = wv
+                        relayDialog = dlg
+                    }
+                    dlg?.window?.let { win ->
+                        try {
+                            win.addFlags(android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
+                            win.setDimAmount(0f)
+                            win.setBackgroundDrawableResource(android.R.color.transparent)
+                            win.setLayout(1, 1)
+                        } catch (_: Throwable) {}
+                    }
+                    try { wv.evaluateJavascript(AVS_CALM_JS, null) } catch (_: Throwable) {}
+                    try { wv.evaluateJavascript(avsRelayJs, null) } catch (_: Throwable) {}
+                    nlog("[Relay] WebView nhận nuôi — giữ ngữ cảnh player cho segment")
+                } catch (_: Throwable) {}
+            }
+            scheduleRelayIdleCheck()
+        } catch (_: Throwable) {}
+    }
+
+    private fun scheduleRelayIdleCheck() {
+        try {
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                try {
+                    val idle = System.currentTimeMillis() - relayLastUseMs
+                    if (idle > 14 * 60_000L) {
+                        synchronized(relayLock) {
+                            try { relayWv?.destroy() } catch (_: Throwable) {}
+                            try { relayDialog?.dismiss() } catch (_: Throwable) {}
+                            relayWv = null
+                            relayDialog = null
+                        }
+                        nlog("[Relay] nhàn rỗi >14 phút — giải phóng WebView")
+                    } else {
+                        scheduleRelayIdleCheck()
+                    }
+                } catch (_: Throwable) {}
+            }, 60_000L)
+        } catch (_: Throwable) {}
+    }
+
+    /** v15: fetch segment QUA WebView relay — đúng ngữ cảnh player. Blocking
+     *  (chạy trên thread socket của proxy); byte về qua bridge base64. */
+    private fun relayFetchSegment(segUrl: String, extraHeaders: Map<String, String>, timeoutMs: Long): ByteArray? {
+        val wv = synchronized(relayLock) { relayWv } ?: return null
+        relayLastUseMs = System.currentTimeMillis()
+        val id = "r" + relaySeq.incrementAndGet()
+        val rb = RelayBuf()
+        relayPending[id] = rb
+        val urlJs = segUrl.replace("\\", "\\\\").replace("'", "\\'")
+        val hdrArg = if (extraHeaders.isEmpty()) "null" else
+            "{" + extraHeaders.entries.joinToString(",") {
+                "'" + it.key.replace("'", "").replace("\n", " ") + "':'" +
+                    it.value.replace("'", "").replace("\n", " ") + "'"
+            } + "}"
+        val js = "try{window.__avsRelay('$id','$urlJs',$hdrArg);}catch(e){try{window.__avsBridge.onRelayChunk('$id','',1,''+e);}catch(e2){}}"
+        try {
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                try {
+                    val w = synchronized(relayLock) { relayWv }
+                    if (w != null && w === wv) w.evaluateJavascript(js, null)
+                } catch (_: Throwable) {}
+            }
+            val dl = System.currentTimeMillis() + timeoutMs
+            while (!rb.done && System.currentTimeMillis() < dl) {
+                rb.latch.await(400, java.util.concurrent.TimeUnit.MILLISECONDS)
+            }
+            return if (rb.done && rb.err == null) rb.buf.toByteArray() else null
+        } finally {
+            relayPending.remove(id)
+        }
+    }
+
     private val activeServers = mutableListOf<AvsProxyServer>()
 
     private fun rewriteM3U8(m3u8: String, proxyBase: String, m3u8BaseUrl: String = ""): String {
@@ -2471,19 +2793,22 @@ class AnimeVsubProvider : MainAPI() {
             .filter { it.isNotEmpty() && !it.startsWith("#") }
             .map { if (it.startsWith("http") || m3u8BaseUrl.isEmpty()) it else m3u8BaseUrl.trimEnd('/') + "/" + it }
         nlog("[Register] '$serverName' segments=${segUrls.size} first=${segUrls.firstOrNull()?.take(100)} referer=${ref.take(60)}")
+        // v15: lưu dòng playlist cho buildSegRecipe (so với request của player)
+        lastPlaylistLines = segUrls
 
         val trim = preflightTrimCount(segUrls, ref)
         if (trim > 0) nlog("[Register] trim $trim segment đầu (probe chặn)")
 
         // ── Link TRỰC TIẾP: phát luôn URL gốc, ExoPlayer gửi UA+Referer ──
-        // v14: kèm Cookie của domain CDN (nếu WebView player đã để lại) — ExoPlayer
-        // sẽ gửi đúng ngữ cảnh như XHR gốc của player.
+        // v14: kèm Cookie của domain CDN (nếu WebView player đã để lại).
+        // v15: kèm thêm header học được từ player (recipe) — ExoPlayer gửi cho
+        // cả playlist lẫn segment.
         val ckDirect = try { android.webkit.CookieManager.getInstance().getCookie(m3u8Url) } catch (_: Throwable) { null }
         val ckMap = if (ckDirect.isNullOrBlank()) emptyMap() else mapOf("Cookie" to ckDirect)
         try {
             callback(newExtractorLink(name, serverName, m3u8Url, ExtractorLinkType.M3U8) {
                 quality = Qualities.P1080.value
-                headers = mapOf("User-Agent" to USER_AGENT, "Referer" to ref) + ckMap
+                headers = mapOf("User-Agent" to USER_AGENT, "Referer" to ref) + ckMap + (segRecipe?.headers ?: emptyMap())
             })
             nlog("[Register] direct '$serverName' ${m3u8Url.take(80)}")
         } catch (e: Throwable) {
@@ -2560,6 +2885,9 @@ class AnimeVsubProvider : MainAPI() {
         private val threadPool = java.util.concurrent.Executors.newCachedThreadPool()
         @Volatile private var _m3u8: String = ""
         private val okLogCount = java.util.concurrent.atomic.AtomicInteger(0)
+        // v15: cửa sổ lạnh sau 403 auth (JSON) 4s / Cloudflare (HTML) 30s + relay gate
+        @Volatile var segAuthBackoffUntil = 0L
+        @Volatile var relayGateUntilMs = 0L
 
         fun getM3U8(): String = _m3u8
         fun setM3U8(v: String) { _m3u8 = v }
@@ -2619,14 +2947,22 @@ class AnimeVsubProvider : MainAPI() {
                         var ok = false
 
                         // ── Method 0: OkHttp (CloudStream baseClient) ──
-                        if (!ok) ok = viaOkHttp(segUrl, output, crlf, t0)
-                        // ── Method 1: OkHttp với Referer = origin/ ──
-                        if (!ok) {
-                            val origin = Regex("""^(https?://[^/]+)""").find(primaryRef())?.groupValues?.get(1) ?: ""
-                            if (origin.isNotEmpty()) ok = viaOkHttpOrigin(segUrl, "$origin/", output, crlf, t0)
+                        if (System.currentTimeMillis() < segAuthBackoffUntil) {
+                            // v15: trong cửa sổ lạnh sau 403 — trả 502 ngay, không
+                            // dội request (bão request làm CF escalate tới NXDOMAIN).
+                            nlog("[Seg] backoff — bỏ qua fetch url=...${segUrl.takeLast(30)}")
+                        } else {
+                            // ── Method R0: RECIPE (học từ player gốc — v15) ──
+                            if (!ok) ok = viaRecipe(segUrl, output, crlf, t0)
+                            // ── Method R1: RELAY qua WebView (ngữ cảnh player thật) ──
+                            if (!ok) ok = viaRelay(segUrl, output, crlf, t0)
+                            if (!ok) ok = viaOkHttp(segUrl, output, crlf, t0)
+                            if (!ok) {
+                                val origin = Regex("""^(https?://[^/]+)""").find(primaryRef())?.groupValues?.get(1) ?: ""
+                                if (origin.isNotEmpty()) ok = viaOkHttpOrigin(segUrl, "$origin/", output, crlf, t0)
+                            }
+                            if (!ok) ok = viaUrlConnection(segUrl, output, crlf, t0)
                         }
-                        // ── Method 2: HttpURLConnection (không chunked, UA riêng) ──
-                        if (!ok) ok = viaUrlConnection(segUrl, output, crlf, t0)
 
                         if (!ok) {
                             val body = "502 upstream blocked".toByteArray(Charsets.UTF_8)
@@ -2668,6 +3004,128 @@ class AnimeVsubProvider : MainAPI() {
 
         private fun logFullUrlOnce(segUrl: String) {
             if (fullUrlLogged.compareAndSet(false, true)) nlog("[Seg] URL-ĐẦY-ĐỦ $segUrl")
+        }
+
+        // ════════ v15: các method chống chặn segment ════════
+
+        // Phân loại 403: JSON = auth của CDN (nghỉ ngắn 4s); text/html = Cloudflare
+        // block (nghỉ dài 30s). Ngăn bão request khiến CF escalate tới NXDOMAIN
+        // (diag 11:47-11:49: 403 JSON -> 403 HTML -> UnknownHostException).
+        private fun noteAuthFail(ct: String?) {
+            val html = (ct ?: "").contains("text/html", ignoreCase = true)
+            segAuthBackoffUntil = System.currentTimeMillis() + if (html) 30_000L else 4_000L
+        }
+
+        // DoH của app thỉnh thoảng fail thoáng qua (diag 06:28 + 11:49 UnknownHost
+        // rồi tự hết) — retry 1 lần sau 1.2s trước khi bỏ.
+        private fun callWithDnsRetry(req: okhttp3.Request): okhttp3.Response {
+            return try {
+                segClient.newCall(req).execute()
+            } catch (e: java.net.UnknownHostException) {
+                nlog("[Seg] DNS fail (${e.message?.take(50)}) — retry sau 1.2s")
+                Thread.sleep(1_200)
+                segClient.newCall(req).execute()
+            }
+        }
+
+        // Ghi body 2xx vào socket trả về ExoPlayer. Trả về số byte đã gửi (-1 nếu rỗng).
+        private fun streamOkHttpBody(resp: okhttp3.Response, output: java.io.OutputStream, crlf: String): Long {
+            val body = resp.body ?: return -1
+            val head = StringBuilder("HTTP/1.1 200 OK").append(crlf)
+                .append("Content-Type: video/mp2t").append(crlf)
+                .append("Access-Control-Allow-Origin: *").append(crlf)
+            val len = body.contentLength()
+            if (len > 0) head.append("Content-Length: ").append(len).append(crlf)
+            else head.append("Connection: close").append(crlf)
+            head.append(crlf)
+            output.write(head.toString().toByteArray())
+            val buf = ByteArray(65536)
+            var sent = 0L
+            body.byteStream().use { stream ->
+                while (true) {
+                    val n = stream.read(buf)
+                    if (n < 0) break
+                    output.write(buf, 0, n)
+                    output.flush()
+                    sent += n
+                }
+            }
+            return sent
+        }
+
+        // ── Method R0: RECIPE — replicate request segment THẬT của player gốc ──
+        private fun viaRecipe(segUrl: String, output: java.io.OutputStream, crlf: String, t0: Long): Boolean {
+            val rec = segRecipe ?: return false
+            var url = segUrl
+            try {
+                if (rec.sampleUrl.substringBefore('?') == segUrl.substringBefore('?')) {
+                    url = rec.sampleUrl // đúng segment player đã fetch — dùng nguyên URL
+                } else if (rec.extraParams.isNotBlank()) {
+                    val missp = rec.extraParams.split('&').filter { p ->
+                        val n = p.substringBefore('=')
+                        n.isNotBlank() && !segUrl.contains(n + "=")
+                    }
+                    if (missp.isNotEmpty()) {
+                        url = segUrl + (if (segUrl.contains('?')) "&" else "?") + missp.joinToString("&")
+                    }
+                }
+            } catch (_: Throwable) {}
+            return try {
+                val rb = okhttp3.Request.Builder().url(url)
+                    .header("User-Agent", USER_AGENT)
+                    .header("Accept", "*/*")
+                    .header("Referer", primaryRef())
+                rec.headers.forEach { (k, v) -> try { rb.header(k, v) } catch (_: Throwable) {} }
+                cookieHeaderFor(url)?.let { rb.header("Cookie", it) }
+                callWithDnsRetry(rb.build()).use { r ->
+                    val ct = r.header("Content-Type")
+                    if (isBlockedResponse(r.code, ct)) {
+                        logFullUrlOnce(url)
+                        if (noteBlocked()) {
+                            nlog("[Seg] RECIPE ${r.code} ct=$ct url=...${url.takeLast(40)}")
+                            val peek = try { r.peekBody(200).string().replace("\n", " ").take(140) } catch (_: Throwable) { "?" }
+                            nlog("[Seg] RECIPE 403-BODY $peek")
+                            noteAuthFail(ct)
+                        }
+                        false
+                    } else {
+                        val sent = streamOkHttpBody(r, output, crlf)
+                        if (okLogCount.incrementAndGet() <= 40) {
+                            nlog("[Seg] RECIPE OK bytes=$sent ttfb=${System.currentTimeMillis() - t0}ms url=...${url.takeLast(26)}")
+                        }
+                        true
+                    }
+                }
+            } catch (e: Throwable) {
+                nlog("[Seg] RECIPE err ${e.message?.take(60)} url=...${segUrl.takeLast(30)}")
+                false
+            }
+        }
+
+        // ── Method R1: RELAY — fetch segment QUA WebView giữ lại (ngữ cảnh player:
+        //  cookie HttpOnly + UA + origin giống hệt lần fetch playlist thành công) ──
+        private fun viaRelay(segUrl: String, output: java.io.OutputStream, crlf: String, t0: Long): Boolean {
+            val hasWv = synchronized(relayLock) { relayWv != null }
+            if (!hasWv) return false
+            if (System.currentTimeMillis() < relayGateUntilMs) return false
+            val bytes = try {
+                relayFetchSegment(segUrl, segRecipe?.headers ?: emptyMap(), 12_000L)
+            } catch (_: Throwable) { null }
+            if (bytes == null || bytes.isEmpty()) {
+                relayGateUntilMs = System.currentTimeMillis() + 10_000
+                nlog("[Seg] RELAY fail — nghỉ 10s url=...${segUrl.takeLast(30)}")
+                return false
+            }
+            val head = StringBuilder("HTTP/1.1 200 OK").append(crlf)
+                .append("Content-Type: video/mp2t").append(crlf)
+                .append("Content-Length: ").append(bytes.size).append(crlf)
+                .append("Access-Control-Allow-Origin: *").append(crlf).append(crlf)
+            output.write(head.toString().toByteArray())
+            output.write(bytes)
+            if (okLogCount.incrementAndGet() <= 40) {
+                nlog("[Seg] RELAY OK bytes=${bytes.size} ttfb=${System.currentTimeMillis() - t0}ms url=...${segUrl.takeLast(26)}")
+            }
+            return true
         }
 
         private fun viaOkHttp(segUrl: String, output: java.io.OutputStream, crlf: String, t0: Long): Boolean {
