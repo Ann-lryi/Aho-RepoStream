@@ -182,7 +182,7 @@ class AnimeVsubProvider : MainAPI() {
     //  (5) avsHookJs forward thêm body chứa .m3u8 (JSON API của player trả m3u8
     //      bọc trong JSON — URL không có .m3u8 nên tiêu chí cũ bỏ sót).
     //  (6) bỏ genre Học Đường (site redirect /404).
-    private val AVS_BUILD = "v13"
+    private val AVS_BUILD = "v14"
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -2019,6 +2019,12 @@ class AnimeVsubProvider : MainAPI() {
                 webView = wv
                 wv.settings.javaScriptEnabled = true
                 wv.settings.domStorageEnabled = true
+                // v14: UA hook PHẢI TRÙNG UA mà proxy/ExoPlayer dùng lấy segment.
+                // Log 27-10 06:27: playlist do WebView (UA Android mặc định) lấy
+                // về OK, nhưng proxy lấy segment bằng USER_AGENT (Windows) -> CDN
+                // 403 TOÀN BỘ segment ("Video chỉ có thể phát trong iframe") dù
+                // playlist OK — token khả nghi bị gắn UA. Đồng bộ cả 2 về USER_AGENT.
+                wv.settings.userAgentString = USER_AGENT
                 wv.settings.allowFileAccess = false
                 wv.settings.allowContentAccess = false
                 wv.settings.mediaPlaybackRequiresUserGesture = false
@@ -2470,10 +2476,14 @@ class AnimeVsubProvider : MainAPI() {
         if (trim > 0) nlog("[Register] trim $trim segment đầu (probe chặn)")
 
         // ── Link TRỰC TIẾP: phát luôn URL gốc, ExoPlayer gửi UA+Referer ──
+        // v14: kèm Cookie của domain CDN (nếu WebView player đã để lại) — ExoPlayer
+        // sẽ gửi đúng ngữ cảnh như XHR gốc của player.
+        val ckDirect = try { android.webkit.CookieManager.getInstance().getCookie(m3u8Url) } catch (_: Throwable) { null }
+        val ckMap = if (ckDirect.isNullOrBlank()) emptyMap() else mapOf("Cookie" to ckDirect)
         try {
             callback(newExtractorLink(name, serverName, m3u8Url, ExtractorLinkType.M3U8) {
                 quality = Qualities.P1080.value
-                headers = mapOf("User-Agent" to USER_AGENT, "Referer" to ref)
+                headers = mapOf("User-Agent" to USER_AGENT, "Referer" to ref) + ckMap
             })
             nlog("[Register] direct '$serverName' ${m3u8Url.take(80)}")
         } catch (e: Throwable) {
@@ -2642,20 +2652,50 @@ class AnimeVsubProvider : MainAPI() {
         private fun isBlockedResponse(code: Int, ct: String?): Boolean =
             code !in 200..299 || (ct ?: "").contains("text/html", ignoreCase = true)
 
+        // v14: cookie của domain CDN do WebView player để lại — XHR gốc mang chúng
+        // còn proxy cũ không gửi. Đọc tại thời điểm fetch cho tươi mới.
+        private fun cookieHeaderFor(url: String): String? = try {
+            android.webkit.CookieManager.getInstance().getCookie(url)
+        } catch (_: Throwable) { null }
+
+        // v14: chống log-flood — chỉ 3 lần bị chặn ĐẦU TIÊN mỗi server mới in
+        // chi tiết (URL đầy đủ in đúng 1 lần + thân phản hồi 403 của CDN để biết
+        // lý do THẬT: token hết hạn / sai UA / sai referer...). Các lần sau im lặng.
+        private val blockedDetailLog = java.util.concurrent.atomic.AtomicInteger(0)
+        private val fullUrlLogged = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        private fun noteBlocked(): Boolean = blockedDetailLog.incrementAndGet() <= 3
+
+        private fun logFullUrlOnce(segUrl: String) {
+            if (fullUrlLogged.compareAndSet(false, true)) nlog("[Seg] URL-ĐẦY-ĐỦ $segUrl")
+        }
+
         private fun viaOkHttp(segUrl: String, output: java.io.OutputStream, crlf: String, t0: Long): Boolean {
             // v7: thử TỪNG referer trong chuỗi (site -> playlist URL -> ...)
+            // v14: thêm Cookie (CookieManager — context WebView player đã chạy)
+            // + Sec-Fetch-* giả lập XHR same-origin của player gốc.
+            val ck = cookieHeaderFor(segUrl)
             for (ref in referers) {
                 if (ref.isBlank()) continue
-                val req = okhttp3.Request.Builder().url(segUrl)
+                val rb = okhttp3.Request.Builder().url(segUrl)
                     .header("User-Agent", USER_AGENT)
                     .header("Referer", ref)
                     .header("Accept", "*/*")
-                    .build()
+                    .header("Sec-Fetch-Site", "same-origin")
+                    .header("Sec-Fetch-Mode", "cors")
+                    .header("Sec-Fetch-Dest", "empty")
+                if (!ck.isNullOrBlank()) rb.header("Cookie", ck)
+                val req = rb.build()
                 val ok = try {
                     segClient.newCall(req).execute().use { resp ->
                         val ct = resp.header("Content-Type")
                         if (isBlockedResponse(resp.code, ct)) {
-                            nlog("[Seg] OKHTTP ${resp.code} ct=$ct ref=${ref.take(30)} url=...${segUrl.takeLast(40)}")
+                            logFullUrlOnce(segUrl)
+                            if (noteBlocked()) {
+                                nlog("[Seg] OKHTTP ${resp.code} ct=$ct ref=${ref.take(30)} url=...${segUrl.takeLast(40)}")
+                                val peek = try { resp.peekBody(256).string().replace("\n", " ").take(160) } catch (_: Throwable) { "?" }
+                                nlog("[Seg] OKHTTP 403-BODY $peek")
+                            }
                             return@use false
                         }
                         val body = resp.body ?: return@use false
@@ -2693,16 +2733,26 @@ class AnimeVsubProvider : MainAPI() {
         }
 
         private fun viaOkHttpOrigin(segUrl: String, originRef: String, output: java.io.OutputStream, crlf: String, t0: Long): Boolean {
-            val req = okhttp3.Request.Builder().url(segUrl)
+            // v14: cookie + Sec-Fetch-* như viaOkHttp.
+            val rb = okhttp3.Request.Builder().url(segUrl)
                 .header("User-Agent", USER_AGENT)
                 .header("Referer", originRef)
                 .header("Accept", "*/*")
-                .build()
+                .header("Sec-Fetch-Site", "same-origin")
+                .header("Sec-Fetch-Mode", "cors")
+                .header("Sec-Fetch-Dest", "empty")
+            cookieHeaderFor(segUrl)?.let { rb.header("Cookie", it) }
+            val req = rb.build()
             return try {
                 segClient.newCall(req).execute().use { resp ->
                     val ct = resp.header("Content-Type")
                     if (isBlockedResponse(resp.code, ct)) {
-                        nlog("[Seg] OKHTTP-ORIGIN ${resp.code} ct=$ct url=...${segUrl.takeLast(40)}")
+                        logFullUrlOnce(segUrl)
+                        if (noteBlocked()) {
+                            nlog("[Seg] OKHTTP-ORIGIN ${resp.code} ct=$ct url=...${segUrl.takeLast(40)}")
+                            val peek = try { resp.peekBody(256).string().replace("\n", " ").take(160) } catch (_: Throwable) { "?" }
+                            nlog("[Seg] OKHTTP-ORIGIN 403-BODY $peek")
+                        }
                         return false
                     }
                     val body = resp.body ?: return false
@@ -2739,10 +2789,20 @@ class AnimeVsubProvider : MainAPI() {
                 conn.setRequestProperty("User-Agent", USER_AGENT)
                 conn.setRequestProperty("Referer", primaryRef())
                 conn.setRequestProperty("Accept", "*/*")
+                // v14: cookie + Sec-Fetch-* như 2 method okhttp.
+                conn.setRequestProperty("Sec-Fetch-Site", "same-origin")
+                conn.setRequestProperty("Sec-Fetch-Mode", "cors")
+                conn.setRequestProperty("Sec-Fetch-Dest", "empty")
+                cookieHeaderFor(segUrl)?.let { conn.setRequestProperty("Cookie", it) }
                 val code = conn.responseCode
                 val ct = conn.contentType
                 if (isBlockedResponse(code, ct)) {
-                    nlog("[Seg] URLCONN $code ct=$ct url=...${segUrl.takeLast(40)}")
+                    logFullUrlOnce(segUrl)
+                    if (noteBlocked()) {
+                        nlog("[Seg] URLCONN $code ct=$ct url=...${segUrl.takeLast(40)}")
+                        val peek = try { conn.errorStream?.bufferedReader()?.readLine() ?: "?" } catch (_: Throwable) { "?" }
+                        nlog("[Seg] URLCONN 403-BODY ${peek.take(160)}")
+                    }
                     try { conn.disconnect() } catch (_: Throwable) {}
                     return false
                 }
