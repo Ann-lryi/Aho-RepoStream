@@ -227,7 +227,25 @@ class AnimeVsubProvider : MainAPI() {
     //       video-state diag (readyState/paused/hls) để biết player đang thế nào.
     //       + PM-tap (postMessage) + API-tap (/api/*) trong hook JS — bằng chứng
     //       cho giả thuyết session từ trang cha (player là iframe trên trang xem).
-    private val AVS_BUILD = "v16"
+    // v17 = v16 + "TẦNG MẮT THỨ 3" theo diag 21:31 (bằng chứng kết thúc tranh cãi):
+    //  (S1) shouldInterceptRequest trên WebView HOOK — kênh DUY NHẤT nhìn thấy
+    //       request của WEB WORKER kèm ĐẦY ĐỦ header. Diag chứng minh: player chơi
+    //       t=5/7s (rs=4) NHƯNG hook JS không bắt được /chunks/ nào trong 8s đầu
+    //       (hls.js chạy XHR trong Worker — hook JS trang chỉ vá fetch/XHR của
+    //       main thread); request main-thread duy nhất (+23.5s) hdrs=RỖNG vẫn 403
+    //       "Missing segment token" -> token KHÔNG ở query (JWT+_t+_c đủ cả) mà là
+    //       HEADER Worker gắn. Recipe giờ học TRỰC TIẾP từ tầng network (đủ
+    //       token header), trả null để không bao giờ can thiệp player.
+    //  (S2) LỌC header khi replicate — Accept-Encoding (br/zstd: okhttp không giải
+    //       được -> dữ liệu hỏng), Range (stale của segment khác -> byte lệch),
+    //       Cookie/Host/Content-Length/Connection (proxy tự quản nguồn khác).
+    //  (S3) #EXT-X-KEY (seg-key) được rewrite qua proxy — ExoPlayer tự fetch KEY
+    //       trần (chỉ UA) thì CDN chặn y như segment; giờ KEY đi cùng chuỗi
+    //       recipe+cookie. IV giữ nguyên.
+    //  (S4) PL-RES log header ĐẦY ĐỦ (260->1500 ký tự) — nếu token nằm trong
+    //       response header (X-Envelope/X-Proxy-Digest — CDN tự expose cho JS
+    //       đọc) thì diag sau sẽ thấy tên header thật, không đoán.
+    private val AVS_BUILD = "v17"
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -2206,7 +2224,10 @@ class AnimeVsubProvider : MainAPI() {
                             }
                         },
                         plResHandler = { url, headers ->
-                            nlog("[Hook] PL-RES ${url.take(60)} hdrs=${headers.take(260)}")
+                            // v17 (S4): 260 ký tự bị cắt mất phần quan trọng nhất —
+                            // header response CDN expose X-* cho JS đọc (nghi vấn
+                            // nơi chứa segment token) + set-cookie. In đủ 1500.
+                            nlog("[Hook] PL-RES ${url.take(60)} hdrs=${headers.take(1500)}")
                         },
                         segResHandler = { url, status ->
                             // v16 (F3): KẾT QUẢ fetch segment của player — if 200 thì
@@ -2242,6 +2263,33 @@ class AnimeVsubProvider : MainAPI() {
                         view: WebView?, request: android.webkit.WebResourceRequest?, error: android.webkit.WebResourceError?
                     ) {
                         try { nlog("[Hook] WV error ${error?.errorCode} ${error?.description} ${request?.url}") } catch (_: Throwable) {}
+                    }
+                    // v17 (S1): tầng mắt thứ 3 — shouldInterceptRequest chạy ở tầng
+                    // network, thấy request của WEB WORKER (hook JS trang không với
+                    // tới) KÈM ĐẦY ĐỦ request headers. Đây là kênh học công thức
+                    // vàng đúng nghĩa: header token thật của player, học LIÊN TỤC
+                    // cho từng segment. Trả null = pass-through, không phá player.
+                    override fun shouldInterceptRequest(
+                        view: WebView?, request: android.webkit.WebResourceRequest?
+                    ): android.webkit.WebResourceResponse? {
+                        val u = request?.url?.toString() ?: return null
+                        if (!u.contains("/chunks/") && !u.contains("/playlist/") && !u.contains("/seg-key/")) return null
+                        val hdrs = try {
+                            request.requestHeaders?.entries?.joinToString("|") { "${it.key}=${it.value}" } ?: ""
+                        } catch (_: Throwable) { "" }
+                        if (u.contains("/chunks/")) {
+                            segObservedUrl = u
+                            segObservedHeaders = parseHdrPairs(hdrs)
+                            segRecipeUpdateAt = System.currentTimeMillis()
+                            buildSegRecipe()
+                        }
+                        val n = siReqCount.incrementAndGet()
+                        if (n <= 2 || n % 25 == 0) {
+                            // 2 capture đầu in trọn header (token thật nằm đây) rồi
+                            // lấy mẫu 25 lần/lần chống flood (worker fetch ~1 seg/s).
+                            nlog("[SI] #$n ${request.method} ${u.take(80)} hdrs=${hdrs.take(700)}")
+                        }
+                        return null
                     }
                 }
 
@@ -2708,6 +2756,8 @@ class AnimeVsubProvider : MainAPI() {
     private val segResCount = java.util.concurrent.atomic.AtomicInteger(0)
     private val pmLogCount = java.util.concurrent.atomic.AtomicInteger(0)
     private val apiLogCount = java.util.concurrent.atomic.AtomicInteger(0)
+    // v17 (S1): đếm request qua tầng interceptor (log 2 đầu + mỗi 25 lần).
+    private val siReqCount = java.util.concurrent.atomic.AtomicInteger(0)
 
     private class RelayBuf {
         val latch = java.util.concurrent.CountDownLatch(1)
@@ -2770,6 +2820,11 @@ class AnimeVsubProvider : MainAPI() {
      *  v16 (F1): gọi LẠI cho MỌI /chunks/ request (học liên tục) — log chỉ in khi
      *  công thức THAY ĐỔI (tránh flood vì player fetch ~1 seg/giây). */
     @Volatile private var lastRecipeSig: String = ""
+    // v17 (S2): header TỰ ĐỘNG KHÔNG ĐƯỢC replicate. Accept-Encoding br/zstd ->
+    //  okhttp không giải nén được -> byte rác; Range của segment khác -> lệch
+    //  byte; Cookie -> proxy tự gắn CookieManager tươi hơn; Host/Content-Length/
+    //  Connection -> okhttp tự quản, set tay sẽ ném IllegalArgumentException.
+    private val AVS_HDR_DROP = setOf("accept-encoding", "range", "cookie", "host", "content-length", "connection")
     private fun buildSegRecipe() {
         val obs = segObservedUrl ?: return
         try {
@@ -2779,11 +2834,13 @@ class AnimeVsubProvider : MainAPI() {
             val lineNames = (line?.substringAfter('?', "") ?: "")
                 .split('&').map { it.substringBefore('=') }.toSet()
             val extra = obsQ.split('&').filter { it.isNotBlank() && it.substringBefore('=') !in lineNames }
-            val sig = extra.joinToString("&") + "#" + segObservedHeaders.keys.joinToString(",") + "#" + obsPath
+            // v17 (S2): lọc header tự động trước khi lưu recipe.
+            val hdrs = segObservedHeaders.filterKeys { it.lowercase() !in AVS_HDR_DROP }
+            val sig = extra.joinToString("&") + "#" + hdrs.keys.joinToString(",") + "#" + obsPath
             if (sig == lastRecipeSig) return   // không đổi — bỏ qua im lặng
             lastRecipeSig = sig
-            segRecipe = SegRecipe(extra.joinToString("&"), segObservedHeaders, obs, System.currentTimeMillis())
-            nlog("[Hook] SEG-RECIPE pathMatch=${line != null} extra=[${extra.joinToString("&").take(90)}] hdrs=[${segObservedHeaders.keys.joinToString(",").take(90)}]")
+            segRecipe = SegRecipe(extra.joinToString("&"), hdrs, obs, System.currentTimeMillis())
+            nlog("[Hook] SEG-RECIPE pathMatch=${line != null} extra=[${extra.joinToString("&").take(90)}] hdrs=[${hdrs.keys.joinToString(",").take(90)}]")
         } catch (e: Throwable) {
             nlogE("[Hook] recipe", e)
         }
@@ -2921,7 +2978,25 @@ class AnimeVsubProvider : MainAPI() {
     private fun rewriteM3U8(m3u8: String, proxyBase: String, m3u8BaseUrl: String = ""): String {
         return m3u8.lines().joinToString("\n") { line ->
             val trimmed = line.trim()
-            if (trimmed.startsWith("#") || trimmed.isBlank()) {
+            if (trimmed.startsWith("#EXT-X-KEY")) {
+                // v17 (S3): KEY (seg-key) cũng phải qua proxy — ExoPlayer tự fetch
+                // KEY trần (chỉ UA, không cookie/recipe) thì CDN chặn y như segment.
+                // Chỉ đổi URI="...", giữ nguyên METHOD/IV.
+                // v17-fix: KHÔNG dùng raw string cho regex này — pattern kết thúc
+                // bằng dấu nháy (URI="...") khiến raw string 4-nháy cắt sai
+                // (lexer dừng ở """ đầu tiên -> mất nháy đóng + nháy thừa phá code).
+                // Dùng escaped string: pattern thực = URI="([^"]+)".
+                val m = Regex("URI=\"([^\"]+)\"").find(trimmed)
+                if (m != null) {
+                    val uri = m.groupValues[1]
+                    val abs = if (uri.contains("://")) uri
+                              else if (m3u8BaseUrl.isNotEmpty()) m3u8BaseUrl.trimEnd('/') + "/" + uri.trimStart('/')
+                              else ""
+                    if (abs.startsWith("http")) {
+                        trimmed.replaceRange(m.range, "URI=\"$proxyBase/seg/${URLEncoder.encode(abs, "UTF-8")}\"")
+                    } else line
+                } else line
+            } else if (trimmed.startsWith("#") || trimmed.isBlank()) {
                 line
             } else if (trimmed.startsWith("http")) {
                 "$proxyBase/seg/${URLEncoder.encode(trimmed, "UTF-8")}"
