@@ -140,7 +140,7 @@ import android.webkit.WebViewClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.channels.Channel
+// v20: bỏ import Channel — hook đổi sang ConcurrentLinkedQueue (không có close).
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -182,7 +182,7 @@ class AnimeVsubProvider : MainAPI() {
     //  (5) avsHookJs forward thêm body chứa .m3u8 (JSON API của player trả m3u8
     //      bọc trong JSON — URL không có .m3u8 nên tiêu chí cũ bỏ sót).
     //  (6) bỏ genre Học Đường (site redirect /404).
-    private val AVS_BUILD = "v19"
+    private val AVS_BUILD = "v20"
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -1357,7 +1357,10 @@ class AnimeVsubProvider : MainAPI() {
                 wv.loadUrl(watchUrl, mapOf("Referer" to "$mainUrl/"))
             }
             val body = withTimeoutOrNull(30_000L) { done.await() }
-            nlog("[Step0w] webview-ajax ${if (body == null) "TIMEOUT" else "len=" + body.length}")
+            // v20: log cả head khi body ngắn — diag 28-10 chỉ có "len=30" không biết
+            // nội dung (nghi "ERR TypeError: Failed to fetch" = đúng 30 ký tự).
+            nlog("[Step0w] webview-ajax ${if (body == null) "TIMEOUT" else "len=" + body.length}" +
+                (if (body != null && body.length <= 200) " head='${body.take(60)}'" else ""))
             return body
         } catch (e: Throwable) {
             if (isCancellation(e)) throw e
@@ -1522,13 +1525,27 @@ class AnimeVsubProvider : MainAPI() {
     private val mp4UrlRegex =
         Regex("""https?://[^"'\s<>\\]+?\.(?:mp4|m4v)(?:\?[^"'\s<>\\]*)?""", RegexOption.IGNORE_CASE)
 
-    /** Unescape "\/" từ JSON-embedded URL rồi harvest m3u8/mp4. */
+    // v20: player gốc hay nhúng source dạng PROTOCOL-RELATIVE ("//host/path.m3u8")
+    // — regex https?:// bỏ sót (evidence 28-10: HTML player 91KB mà m3u8=0 mp4=0).
+    private val m3u8RelRegex =
+        Regex("""(?:^|["'\s(=:])?(//[^"'\s<>\\]+?\.m3u[89](?:\?[^"'\s<>\\]*)?)""", RegexOption.IGNORE_CASE)
+    private val mp4RelRegex =
+        Regex("""(?:^|["'\s(=:])?(//[^"'\s<>\\]+?\.(?:mp4|m4v)(?:\?[^"'\s<>\\]*)?)""", RegexOption.IGNORE_CASE)
+
+    /** Unescape "\/" từ JSON-embedded URL rồi harvest m3u8/mp4.
+     *  v20: bắt thêm URL protocol-relative (//host/...m3u8) -> absolutize https:. */
     private fun harvestMediaUrls(html: String): Pair<List<String>, List<String>> {
         val unescaped = html.replace("\\/", "/")
-        val m3u8 = m3u8UrlRegex.findAll(unescaped)
-            .map { it.value }.distinct().toList()
-        val mp4 = mp4UrlRegex.findAll(unescaped)
-            .map { it.value }.distinct().toList()
+        val m3u8 = m3u8UrlRegex.findAll(unescaped).map { it.value }.distinct().toMutableList()
+        val mp4 = mp4UrlRegex.findAll(unescaped).map { it.value }.distinct().toMutableList()
+        for (m in m3u8RelRegex.findAll(unescaped)) {
+            val abs = "https:" + m.groupValues[1]
+            if (m3u8.none { it.equals(abs, ignoreCase = true) }) m3u8.add(abs)
+        }
+        for (m in mp4RelRegex.findAll(unescaped)) {
+            val abs = "https:" + m.groupValues[1]
+            if (mp4.none { it.equals(abs, ignoreCase = true) }) mp4.add(abs)
+        }
         return m3u8 to mp4
     }
 
@@ -1691,36 +1708,12 @@ class AnimeVsubProvider : MainAPI() {
                 stepNotes.add("S0f:${if (linkFound) "HIT" else "0"}")
             }
 
-            // ═══ STEP 0h (v19): ajax hụt (200-rỗng / 5xx / blocked) nhưng CÒN HASH
-            //  -> đào THẲNG embed player trên CDN (stream.googleapiscdn — KHÁC ORIGIN
-            //  với animevietsub nên không chịu 403/520/throttle của site). Evidence:
-            //  diag 28-10 ajax 200 len=0 + webview-ajax len=30 (site soft-throttle)
-            //  trong khi diag 27-10 chứng minh frame = stream.googleapiscdn.com/
-            //  player/{hash128} và hook bắt được playlist #EXTM3U 424KB. Kể cả khi
-            //  site đang 5xx vẫn chạy được (không đụng site) — storm chỉ thử 1 host. ═══
-            if (!linkFound && step0Weak && srvList.isNotEmpty()) {
-                val s0hList = if (siteDown()) srvList.take(1) else srvList.take(MAX_EMBEDS)
-                for (srv in s0hList) {
-                    if (linkFound) break
-                    if (srv.hash.isBlank()) continue
-                    val embedUrl = "https://stream.googleapiscdn.com/player/${srv.hash}"
-                    nlog("[S0h] embed-from-hash siteDown=${siteDown()} hashLen=${srv.hash.length} ${embedUrl.take(80)}")
-                    try {
-                        if (extractFromEmbed(embedUrl, watchUrl, callback)) {
-                            linkFound = true
-                            break
-                        }
-                    } catch (e: Throwable) {
-                        if (isCancellation(e)) throw e
-                        nlogE("[S0h]", e)
-                    }
-                }
-                stepNotes.add("S0h:${if (linkFound) "HIT" else "0"}")
-            }
-
-            // ═══ STEP 0w (v7): WebView same-origin fetch — POST OkHttp bị Cloudflare
-            //  chặn (clearance gắn TLS fingerprint WebView) thì fetch() trong WebView
-            //  vẫn mang cookie + TLS thật. Tối đa 2 máy chủ, mỗi lần 30s. ═══
+            // ═══ STEP 0w (v7, v20 nâng ưu tiên): WebView same-origin fetch — POST
+            //  OkHttp bị Cloudflare chặn (clearance gắn TLS fingerprint WebView) thì
+            //  fetch() trong WebView vẫn mang cookie + TLS thật. Tối đa 2 máy chủ,
+            //  mỗi lần 30s. Evidence 28-10 19:30-19:32: S0h hash-URL chết 404 đốt
+            //  ~90s/URL (WVDom 22s + gate 90s + proxy 9s + hook 60s) trong khi S0w
+            //  fail nhanh (len=30) — S0w phải chạy TRƯỚC S0h. ═══
             if (!linkFound && step0Weak && srvList.isNotEmpty() && !siteDown()) {
                 for (srv in srvList.take(2)) {
                     if (linkFound || siteDown()) break
@@ -1787,6 +1780,37 @@ class AnimeVsubProvider : MainAPI() {
                     nlogE("[Step1]", e)
                     stepNotes.add("S1:ERR")
                 }
+            }
+
+            // ═══ STEP 0h (v19 → v20 DỜI XUỐNG + probe chết): hash128 dựng embed
+            //  KHÔNG kèm query (nextName/nextUrl) → CDN trả 404 len=15, WebView trắng
+            //  (evidence 28-10: c7C7... + g-YET... đều chết, ~90s/URL), trong khi
+            //  iframe ĐÚNG (d6e89...?nextName=02&nextUrl=...) nằm SẴN trong HTML
+            //  trang xem — Step1 đã đào được. Nên: S0h chạy CUỐI + probe plain 1
+            //  request: 404/rỗng → bỏ qua trong ~2s thay vì đốt chuỗi nặng. ═══
+            if (!linkFound && step0Weak && srvList.isNotEmpty()) {
+                val s0hList = if (siteDown()) srvList.take(1) else srvList.take(MAX_EMBEDS)
+                for (srv in s0hList) {
+                    if (linkFound) break
+                    if (srv.hash.isBlank()) continue
+                    val embedUrl = "https://stream.googleapiscdn.com/player/${srv.hash}"
+                    nlog("[S0h] embed-from-hash siteDown=${siteDown()} hashLen=${srv.hash.length} ${embedUrl.take(80)}")
+                    try {
+                        val probe = fetchText(embedUrl, referer = watchUrl)
+                        if (probe == null || probe.length < 1000) {
+                            nlog("[S0h] probe chết len=${probe?.length ?: -1} — bỏ qua (URL hash không kèm query = 404)")
+                            continue
+                        }
+                        if (extractFromEmbed(embedUrl, watchUrl, callback)) {
+                            linkFound = true
+                            break
+                        }
+                    } catch (e: Throwable) {
+                        if (isCancellation(e)) throw e
+                        nlogE("[S0h]", e)
+                    }
+                }
+                stepNotes.add("S0h:${if (linkFound) "HIT" else "0"}")
             }
 
             // ═══ STEP 3: WebViewResolver broad trên trang xem ═══
@@ -1885,6 +1909,27 @@ class AnimeVsubProvider : MainAPI() {
         return linkFound
     }
 
+    /** v20: dump bằng chứng cô đọng khi trang player không có media tĩnh —
+     *  script-src, iframe, từ khoá player + ngữ cảnh 100 ký tự mỗi từ khoá. */
+    private fun embedDiagDump(html: String, embed: String) {
+        try {
+            val d = Jsoup.parse(html)
+            val scriptSrcs = d.select("script[src]").map { it.attr("src") }.filter { it.isNotBlank() }
+            val iframes = d.select("iframe").map { it.attr("src") }.filter { it.isNotBlank() }
+            nlog("[EmbedDiag] $embed len=${html.length} script-src=${scriptSrcs.take(5)} iframe=${iframes.take(3)}")
+            for (kw in listOf("m3u8", "mp4", "eval(", "sources", "playlist", "jwplayer", "videojs", "atob(")) {
+                val idx = html.indexOf(kw, ignoreCase = true)
+                if (idx >= 0) {
+                    val from = maxOf(0, idx - 40)
+                    val ctx = html.substring(from, minOf(html.length, idx + kw.length + 50)).replace("\n", " ")
+                    nlog("[EmbedDiag] kw='$kw' …${ctx.take(100)}")
+                }
+            }
+        } catch (e: Throwable) {
+            nlogE("[EmbedDiag]", e, embed.take(60))
+        }
+    }
+
     /** Đào 1 embed: HTML -> m3u8/mp4; nếu không thấy, đào iframe lồng thêm 1 cấp. */
     private suspend fun extractFromEmbed(
         embed: String, watchUrl: String, callback: (ExtractorLink) -> Unit
@@ -1905,6 +1950,10 @@ class AnimeVsubProvider : MainAPI() {
 
             val (m3u8s, mp4s) = harvestMediaUrls(html)
             nlog("[Embed] $embed -> m3u8=${m3u8s.size} mp4=${mp4s.size}")
+            // v20: trang player không có media tĩnh -> dump bằng chứng cô đọng
+            // (script-src, iframe, từ khoá player) để diag lần sau nói được TRONG
+            // TRANG CÓ GÌ thay vì chỉ "m3u8=0 mp4=0".
+            if (m3u8s.isEmpty() && mp4s.isEmpty()) embedDiagDump(html, embed)
 
             for (m3u8 in m3u8s) {
                 val content = fetchText(m3u8, referer = embedOrigin) ?: continue
@@ -2027,8 +2076,59 @@ class AnimeVsubProvider : MainAPI() {
       return os.apply(this, arguments);
     };
   } catch (e) {}
+  // v20: quét NGUỒN TRANG — fetch/XHR hook mù với source nằm SẴN trong HTML/JS
+  // (evidence 28-10: trang player 91KB render xong mà 0 capture). Quét lặp vì
+  // trang player gốc tự reload 2-3 lần rồi mới bơm source vào DOM.
+  function scanPage(){
+    try {
+      var h = document.documentElement.innerHTML;
+      if (!h || h.length < 16) return;
+      var res = h.match(/[^"'\s\\]*\.(?:m3u8|m3u9)[^"'\s\\]*/g);
+      if (res) { for (var i = 0; i < res.length && i < 8; i++) pass('page:' + res[i], res[i]); }
+      var res4 = h.match(/[^"'\s\\]*\.mp4[^"'\s\\]*/g);
+      if (res4) { for (var j = 0; j < res4.length && j < 4; j++) pass('page:' + res4[j], res4[j]); }
+    } catch (e) {}
+  }
+  scanPage();
+  var scanN = 0;
+  var scanTimer = setInterval(function(){
+    if (++scanN > 10) { try { clearInterval(scanTimer); } catch (e) {} return; }
+    scanPage();
+  }, 2500);
 })();
 """
+
+    /** v20: tự bấm nút play trong trang player (jwplayer/videojs/video) — một số
+     *  player chỉ nạp playlist SAU khi có lượt play đầu tiên, dù WebView được đặt
+     *  mediaPlaybackRequiresUserGesture=false. Gọi lặp 1.2s/3.5s/7s. */
+    private val avsAutoPlayJs = """
+(function(){
+  function go(){
+    try {
+      var v = document.querySelector('video');
+      if (v) { try { v.muted = true; } catch (e) {} var p = v.play(); if (p && p.catch) p.catch(function(){}); }
+    } catch (e) {}
+    try {
+      if (window.jwplayer) { var jj = window.jwplayer(); if (jj && jj.play) jj.play(true); }
+    } catch (e) {}
+    try {
+      var sels = ['.jw-icon-playback', '.vjs-big-play-button', 'button[class*="play"]', '.play-btn', '.btn-play', '[class*="playbutton"]'];
+      for (var i = 0; i < sels.length; i++) {
+        var el = document.querySelector(sels[i]);
+        if (el) { el.click(); break; }
+      }
+    } catch (e) {}
+  }
+  setTimeout(go, 1200); setTimeout(go, 3500); setTimeout(go, 7000);
+})();
+"""
+
+    /** v20: URL media trong shouldInterceptRequest — bắt MỌI request của player
+     *  bất kể cơ chế (<video src>, script động, MSE manifest, redirect...), không
+     *  phụ thuộc fetch/XHR monkey-patch. */
+    private val hookMediaUrlRegex =
+        Regex("""\.(?:m3u8|m3u9|mp4)(?:[?#]|$)""", RegexOption.IGNORE_CASE)
+
 
     /** JS -> Kotlin bridge. Kotlin handler không được trùng tên @JavascriptInterface
      *  (bài học NguonC v3: trùng tên -> StackOverflowError giết cả data path). */
@@ -2081,8 +2181,20 @@ class AnimeVsubProvider : MainAPI() {
                 return false
             }
 
-            val captures = Channel<Pair<String, String>>(Channel.UNLIMITED)
+            // v20: BỎ Channel — diag 28-10 19:32: ClosedReceiveChannelException giết
+            // vòng receive sau vài giây -> "0 capture" dù trang player vẫn chạy.
+            // ConcurrentLinkedQueue không có khái niệm close: bridge/WebViewClient
+            // đẩy thẳng vào hàng đợi, vòng xử lý poll + delay tới hết timeout.
+            val pendingBodies = java.util.concurrent.ConcurrentLinkedQueue<Pair<String, String>>()
+            val netMediaUrls = java.util.concurrent.ConcurrentLinkedQueue<String>()
+            val reqSample = java.util.concurrent.ConcurrentLinkedQueue<String>()
+            val seenNet = HashSet<String>()
             val captureCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+            // v20: dialog CHỈ dành cho trang site chính (gate Turnstile cần người
+            // dùng tick). Embed/CDN (stream.googleapiscdn) không cần gate — chạy
+            // headless: không chiếm focus, không bị dismiss oan khi player UI resume.
+            val needDialog = targetUrl.startsWith(mainUrl)
 
             withContext(Dispatchers.Main) {
                 val wv = WebView(ctx)
@@ -2103,12 +2215,26 @@ class AnimeVsubProvider : MainAPI() {
                     AvsCaptureBridge { url, body ->
                         captureCount.incrementAndGet()
                         nlog("[Hook] bridge +${System.currentTimeMillis() - flowT0}ms url=${url.take(60)} len=${body.length} head=${body.take(12)}")
-                        captures.trySend(url to body)
+                        pendingBodies.add(url to body)
                     },
                     "__avsBridge"
                 )
                 wv.webChromeClient = WebChromeClient()
                 wv.webViewClient = object : WebViewClient() {
+                    // v20: bắt MỌI request của player ở tầng native — không phụ thuộc
+                    // fetch/XHR monkey-patch (<video src>, script động, manifest MSE,
+                    // redirect đều đi qua đây).
+                    override fun shouldInterceptRequest(
+                        view: WebView?, request: android.webkit.WebResourceRequest?
+                    ): android.webkit.WebResourceResponse? {
+                        val u = try { request?.url?.toString() } catch (_: Throwable) { null } ?: return null
+                        if (reqSample.size < 48) reqSample.add(u)
+                        if (hookMediaUrlRegex.containsMatchIn(u)) {
+                            captureCount.incrementAndGet()
+                            netMediaUrls.add(u)
+                        }
+                        return null
+                    }
                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                         try { nlog("[Hook] page-start ${url?.take(90)}") } catch (_: Throwable) {}
                         view?.evaluateJavascript(avsHookJs, null)
@@ -2116,6 +2242,8 @@ class AnimeVsubProvider : MainAPI() {
                     override fun onPageFinished(view: WebView?, url: String?) {
                         try { nlog("[Hook] page-finish ${url?.take(90)}") } catch (_: Throwable) {}
                         view?.evaluateJavascript(avsHookJs, null)
+                        // v20: tự play — nhiều player chỉ nạp playlist sau lượt play đầu.
+                        try { view?.evaluateJavascript(avsAutoPlayJs, null) } catch (_: Throwable) {}
                     }
                     override fun onReceivedError(
                         view: WebView?, request: android.webkit.WebResourceRequest?, error: android.webkit.WebResourceError?
@@ -2125,7 +2253,7 @@ class AnimeVsubProvider : MainAPI() {
                 }
 
                 // Dialog full-screen khi có Activity: gate Turnstile có người dùng hỗ trợ tick.
-                if (ctx is android.app.Activity && !ctx.isFinishing) {
+                if (needDialog && ctx is android.app.Activity && !ctx.isFinishing) {
                     try {
                         val dlg = android.app.Dialog(ctx)
                         dlg.setContentView(
@@ -2140,7 +2268,6 @@ class AnimeVsubProvider : MainAPI() {
                             android.view.ViewGroup.LayoutParams.MATCH_PARENT
                         )
                         dlg.setCanceledOnTouchOutside(false)
-                        dlg.setOnDismissListener { captures.close() }
                         dlg.show()
                         dialog = dlg
                     } catch (e: Throwable) {
@@ -2153,42 +2280,65 @@ class AnimeVsubProvider : MainAPI() {
 
             var registered = false
             val hookResult = withTimeoutOrNull(HOOK_TIMEOUT_MS) {
-                var tries = 0
-                while (!registered && tries < 6) {
-                    tries++
-                    val recv = try { captures.receive() } catch (e: Throwable) { nlogE("[Hook] receive", e); null }
-                    if (recv == null) break
-                    val (capUrl, capBody) = recv
-
-                    // v12: xử lý capture TRƯỚC — chỉ dừng trang khi đăng ký THÀNH
-                    // CÔNG. Tiêu chí pass() rộng hơn (body chứa .m3u8 cũng forward)
-                    // nên có capture rác; dừng trang sớm trước đây giết luôn capture
-                    // thật đi sau.
-                    val body = capBody.trim()
-                    if (body.startsWith("#EXTM3U")) {
-                        val base = Regex("""^(https?://[^/]+/.*/)""").find(capUrl)?.groupValues?.get(1) ?: ""
-                        if (registerM3U8Link(body, capUrl, base, "Vietsub", callback, siteReferer = targetUrl)) {
+                while (!registered) {
+                    // 1) URL media bắt trực tiếp qua shouldInterceptRequest (mọi cơ chế).
+                    while (true) {
+                        val u = netMediaUrls.poll() ?: break
+                        if (!seenNet.add(u.substringBefore("#"))) continue
+                        val isM3u8 = u.contains(".m3u8", true) || u.contains(".m3u9", true)
+                        val origin = Regex("""^(https?://[^/]+)""").find(u)?.groupValues?.get(1) ?: ""
+                        if (isM3u8) {
+                            nlog("[Hook] net-m3u8 ${u.take(90)}")
+                            val content = fetchText(u, referer = targetUrl)
+                                ?: fetchText(u, referer = origin.ifBlank { targetUrl })
+                            if (content != null && content.contains("#EXTM3U") &&
+                                registerM3U8Link(content, u, u, "Vietsub", callback, siteReferer = targetUrl)) {
+                                registered = true
+                            }
+                        } else {
+                            nlog("[Hook] net-mp4 ${u.take(90)}")
+                            callback(newExtractorLink(name, "MP4", u, ExtractorLinkType.VIDEO) {
+                                quality = Qualities.P720.value
+                                headers = mapOf("User-Agent" to USER_AGENT, "Referer" to targetUrl)
+                            })
                             registered = true
                         }
-                    } else {
-                        val (m3u8s, mp4s) = harvestMediaUrls(body)
-                        val m3u8 = m3u8s.firstOrNull()
-                        when {
-                            m3u8 != null -> {
-                                val origin = Regex("""^(https?://[^/]+)""").find(m3u8)?.groupValues?.get(1) ?: ""
-                                val m3u8Dir = Regex("""^(https?://[^/]+/.*/)""").find(m3u8)?.groupValues?.get(1) ?: m3u8
-                                val content = fetchText(m3u8, referer = origin.ifBlank { targetUrl })
-                                if (content != null && content.contains("#EXTM3U") &&
-                                    registerM3U8Link(content, m3u8, m3u8Dir, "Vietsub", callback, siteReferer = targetUrl)) {
+                    }
+                    // 2) Body do JS hook (fetch/XHR/scanPage) forward qua bridge.
+                    while (true) {
+                        val recv = pendingBodies.poll() ?: break
+                        val (capUrl, capBody) = recv
+
+                        // v12: xử lý capture TRƯỚC — chỉ dừng trang khi đăng ký THÀNH
+                        // CÔNG. Tiêu chí pass() rộng hơn (body chứa .m3u8 cũng forward)
+                        // nên có capture rác; dừng trang sớm trước đây giết luôn capture
+                        // thật đi sau.
+                        val body = capBody.trim()
+                        if (body.startsWith("#EXTM3U")) {
+                            val base = Regex("""^(https?://[^/]+/.*/)""").find(capUrl)?.groupValues?.get(1) ?: ""
+                            if (registerM3U8Link(body, capUrl, base, "Vietsub", callback, siteReferer = targetUrl)) {
+                                registered = true
+                            }
+                        } else {
+                            val (m3u8s, mp4s) = harvestMediaUrls(body)
+                            val m3u8 = m3u8s.firstOrNull()
+                            when {
+                                m3u8 != null -> {
+                                    val origin = Regex("""^(https?://[^/]+)""").find(m3u8)?.groupValues?.get(1) ?: ""
+                                    val m3u8Dir = Regex("""^(https?://[^/]+/.*/)""").find(m3u8)?.groupValues?.get(1) ?: m3u8
+                                    val content = fetchText(m3u8, referer = origin.ifBlank { targetUrl })
+                                    if (content != null && content.contains("#EXTM3U") &&
+                                        registerM3U8Link(content, m3u8, m3u8Dir, "Vietsub", callback, siteReferer = targetUrl)) {
+                                        registered = true
+                                    }
+                                }
+                                mp4s.firstOrNull() != null -> {
+                                    callback(newExtractorLink(name, "MP4", mp4s.first(), ExtractorLinkType.VIDEO) {
+                                        quality = Qualities.P720.value
+                                        headers = mapOf("User-Agent" to USER_AGENT, "Referer" to targetUrl)
+                                    })
                                     registered = true
                                 }
-                            }
-                            mp4s.firstOrNull() != null -> {
-                                callback(newExtractorLink(name, "MP4", mp4s.first(), ExtractorLinkType.VIDEO) {
-                                    quality = Qualities.P720.value
-                                    headers = mapOf("User-Agent" to USER_AGENT, "Referer" to targetUrl)
-                                })
-                                registered = true
                             }
                         }
                     }
@@ -2200,7 +2350,9 @@ class AnimeVsubProvider : MainAPI() {
                                 webView?.loadUrl("about:blank")
                             }
                         } catch (_: Throwable) {}
+                        break
                     }
+                    kotlinx.coroutines.delay(350)
                 }
                 registered
             }
@@ -2221,10 +2373,22 @@ class AnimeVsubProvider : MainAPI() {
 
             if (registered) {
                 nlog("[Hook] OK trong +${System.currentTimeMillis() - flowT0}ms")
-            } else if (hookResult == null) {
-                nlog("[Hook] TIMEOUT ${HOOK_TIMEOUT_MS / 1000}s captures=${captureCount.get()} — có thể gate cần người dùng tick")
             } else {
-                nlog("[Hook] ${captureCount.get()} capture, không có playlist khả dụng")
+                if (hookResult == null) {
+                    nlog("[Hook] TIMEOUT ${HOOK_TIMEOUT_MS / 1000}s captures=${captureCount.get()} — có thể gate cần người dùng tick")
+                } else {
+                    nlog("[Hook] ${captureCount.get()} capture, không có playlist khả dụng")
+                }
+                // v20: mẫu request thật của trang (bỏ query) — nhìn diag biết player
+                // đã gọi API nào để lần sau không đoán mò.
+                if (reqSample.isNotEmpty()) {
+                    val sample = LinkedHashSet<String>()
+                    for (u in reqSample) {
+                        if (sample.size >= 10) break
+                        sample.add(u.substringBefore("?").take(70))
+                    }
+                    nlog("[Hook] req-sample(${reqSample.size}) ${sample.joinToString(" | ")}")
+                }
             }
             return registered
         } finally {
