@@ -1,4 +1,23 @@
 // AnimeVsub v7 (2026-10-25): CloudStream provider cho https://animevietsub.sale
+// v22 (29-10-2026, theo diag 05:52 + forensic trực tiếp trang player):
+//   * ROOT CAUSE mới (chứng minh bằng curl + code trang player): site đã đổi
+//     sang "G6 URL-cipher" — playlist trả về chứa PLACEHOLDER segment URL;
+//     URL THẬT được player web giải mã client-side AES-CTR bằng sessionKey
+//     nhúng trong "fake JWT" (window._avsSk = const avsToken). Gửi thẳng
+//     placeholder cho CDN -> Express 403 {"error":"Missing segment token"}
+//     (curl full-token vẫn 403 -> KHÔNG phải lỗi proxy/header/redirect).
+//   * v22 KHÔNG đoán cipher — dùng chính WebView của user làm oracle:
+//     shouldInterceptRequest (tầng native) + hook JS ghi lại URL segment THẬT
+//     mà player fetch sau khi giải mã, rồi REWRITE playlist placeholder
+//     theo URL thật (auto-learn) trước khi đăng ký link.
+//   * Giữ trang player sống thêm ~9s sau khi thấy playlist placeholder để
+//     player kịp giải mã + fetch segment (trước đây kill ngay -> mất bằng chứng).
+//   * jwplayer().getPlaylist() dump (2.5/5/8s) — nếu loader đưa playlist giải
+//     mã vào player thì bắt được URL m3u8 THẬT trực tiếp (đường thắng nhanh).
+//   * Đọc lại responseText XHR sau 700ms (site có thể giải mã trễ).
+//   * [Seg] cooldown 15s cho URL vừa bị CDN từ chối (chống retry-storm giết IP).
+//   * [G6] diag: avsToken/avsSid + 2 segment placeholder đầy đủ — nguyên liệu
+//     giải cipher offline cho v23 nếu auto-learn chưa đủ.
 // Kiến trúc battle-hardened kế thừa NguonC (Aho-Repo):
 //  - Lớp fetch Cloudflare-aware: doc cache -> plain HTTP + cookie clearance cache
 //    -> CORS proxy -> WebViewResolver fallback (serialized qua mutex, cookie re-captured).
@@ -182,7 +201,7 @@ class AnimeVsubProvider : MainAPI() {
     //  (5) avsHookJs forward thêm body chứa .m3u8 (JSON API của player trả m3u8
     //      bọc trong JSON — URL không có .m3u8 nên tiêu chí cũ bỏ sót).
     //  (6) bỏ genre Học Đường (site redirect /404).
-    private val AVS_BUILD = "v21"
+    private val AVS_BUILD = "v22"
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -194,6 +213,12 @@ class AnimeVsubProvider : MainAPI() {
 
     // Timeout cho WebView hook flow — trang gate Turnstile có thể cần user tương tác.
     private val HOOK_TIMEOUT_MS = 60_000L
+
+    // v22: thời gian giữ trang player sống sau khi thấy playlist PLACEHOLDER (G6)
+    // để player web kịp giải mã + fetch segment thật (auto-learn).
+    private val PLACEHOLDER_WAIT_MS = 9_000L
+    // v22: URL segment vừa bị CDN từ chối — không bấm lại trong khoảng này.
+    private val SEG_FAIL_COOLDOWN_MS = 15_000L
 
     // v4: timeout WebView DOM capture (silent) — đợi JS render danh sách phim.
     private val WV_SILENT_TIMEOUT_MS = 22_000L
@@ -1948,6 +1973,17 @@ class AnimeVsubProvider : MainAPI() {
             val html = doc.outerHtml()
             val embedOrigin = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: mainUrl
 
+            // v22: G6 — token "fake JWT" mang sessionKey AES-CTR + sid — nguyên liệu
+            // giải cipher offline nếu auto-learn chưa đủ (diag -> v23).
+            try {
+                Regex("""const avsToken\s*=\s*"([^"]+)""").find(html)?.groupValues?.get(1)?.let { tok ->
+                    nlog("[G6] avsToken len=${tok.length} $tok")
+                }
+                Regex("""const avsSid\s*=\s*"([^"]+)""").find(html)?.groupValues?.get(1)?.let { sid ->
+                    nlog("[G6] avsSid=$sid")
+                }
+            } catch (_: Throwable) {}
+
             val (m3u8s, mp4s) = harvestMediaUrls(html)
             nlog("[Embed] $embed -> m3u8=${m3u8s.size} mp4=${mp4s.size}")
             // v20: trang player không có media tĩnh -> dump bằng chứng cô đọng
@@ -2026,6 +2062,13 @@ class AnimeVsubProvider : MainAPI() {
     if (s.charAt(0) === '/') return location.origin + s;
     return location.origin + '/' + s;
   }
+  function isSeg(u){
+    var s = String(u);
+    return s.indexOf('/chunks/') >= 0 || s.indexOf('/hls/') >= 0 || /\.ts(?:\?|#|$)/.test(s);
+  }
+  function segReport(u){
+    try { if (isSeg(u)) window.__avsBridge.onCapture(abs(u), 'SEG ' + abs(u)); } catch (e) {}
+  }
   function pass(u, b){
     try {
       if (!b || b.length < 8) return;
@@ -2058,6 +2101,7 @@ class AnimeVsubProvider : MainAPI() {
       window.fetch = function(){
         var args = arguments;
         var u = (args[0] && args[0].url) ? String(args[0].url) : String(args[0]);
+        segReport(u);
         return of.apply(this, args).then(function(res){
           try { res.clone().text().then(function(t){ pass(u, t); }, function(){}); } catch (e) {}
           return res;
@@ -2067,15 +2111,40 @@ class AnimeVsubProvider : MainAPI() {
   } catch (e) {}
   try {
     var oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function(m, u){ this.__avsU = u; return oo.apply(this, arguments); };
+    XMLHttpRequest.prototype.open = function(m, u){ this.__avsU = u; segReport(u); return oo.apply(this, arguments); };
     XMLHttpRequest.prototype.send = function(){
       var self = this;
+      var firstText = null;
       this.addEventListener('load', function(){
-        try { var t = xhrText(self); if (t) { pass(self.__avsU, t); } } catch (e) {}
+        try { firstText = xhrText(self); if (firstText) { pass(self.__avsU, firstText); } } catch (e) {}
       });
+      // v22: đọc LẠI response sau 700ms — loader G6 có thể giải mã responseText trễ
+      setTimeout(function(){
+        try {
+          var t2 = xhrText(self);
+          if (t2 && t2 !== firstText) pass(String(self.__avsU) + '#delayed', t2);
+        } catch (e) {}
+      }, 700);
       return os.apply(this, arguments);
     };
   } catch (e) {}
+  // v22: hỏi thẳng jwplayer playlist THẬT sau khi loader G6 giải mã xong —
+  // nếu loader đưa playlist đã giải mã vào player thì đây là đường thắng nhanh.
+  function dumpJw(tag){
+    try {
+      if (!window.jwplayer) return;
+      var p = window.jwplayer();
+      if (!p || !p.getPlaylist) return;
+      var pl = p.getPlaylist();
+      if (pl && pl.length) {
+        var s = JSON.stringify(pl);
+        if (s && s.length > 16) window.__avsBridge.onCapture('jw-config-' + tag, s.substring(0, 400000));
+      }
+    } catch (e) {}
+  }
+  try { setTimeout(function(){ dumpJw('a'); }, 2500); } catch (e) {}
+  try { setTimeout(function(){ dumpJw('b'); }, 5000); } catch (e) {}
+  try { setTimeout(function(){ dumpJw('c'); }, 8000); } catch (e) {}
   // v20: quét NGUỒN TRANG — fetch/XHR hook mù với source nằm SẴN trong HTML/JS
   // (evidence 28-10: trang player 91KB render xong mà 0 capture). Quét lặp vì
   // trang player gốc tự reload 2-3 lần rồi mới bơm source vào DOM.
@@ -2128,6 +2197,123 @@ class AnimeVsubProvider : MainAPI() {
      *  phụ thuộc fetch/XHR monkey-patch. */
     private val hookMediaUrlRegex =
         Regex("""\.(?:m3u8|m3u9|mp4)(?:[?#]|$)""", RegexOption.IGNORE_CASE)
+
+    // v22: regex nhận diện URL segment .ts (regex riêng để tránh nhầm .ts giữa
+    // chừng tên file khác như .tsp/... — buộc kết thúc hoặc ?/# ngay sau)
+    private val segTsRegex = Regex("""\.ts(?:[?#]|$)""", RegexOption.IGNORE_CASE)
+
+    /** v22: playlist có phải PLACEHOLDER G6 không — segment URL mang token&_t&_c
+     *  (ciphertext AES-CTR). Playlist thật (đã giải mã) sẽ có segment thường. */
+    private fun isPlaceholderM3u8(content: String): Boolean {
+        val segLine = content.lines().firstOrNull { it.isNotBlank() && !it.startsWith("#") } ?: return false
+        return segLine.contains("_t=") || (segLine.contains("token=") && segLine.contains("&_c="))
+    }
+
+    /** v22: URL segment thật của player (nghi vấn) — tầng native nên tin được. */
+    private fun isRealSegUrl(u: String): Boolean {
+        if (u.startsWith("http://127.0.0.1")) return false   // proxy của chính plugin
+        return u.contains("/chunks/") || u.contains("/hls/") || segTsRegex.containsMatchIn(u)
+    }
+
+    /** v22 — AUTO-LEARN: thay URL placeholder trong playlist bằng URL THẬT player
+     *  vừa fetch (quan sát qua shouldInterceptRequest/hook JS).
+     *  Map theo số segN nếu cả 2 bên đều có; không thì map theo THỨ TỰ fetch
+     *  (VOD fetch tuần tự). Trả playlist đã rewrite, null nếu không map được. */
+    private fun tryAutoLearnRewrite(m3u8Body: String, realUrls: List<String>, m3u8Url: String): String? {
+        try {
+            val clean = realUrls.filter { it.startsWith("http") }.distinct()
+            if (clean.size < 2) return null
+            val base = Regex("""^(https?://[^/]+/.*/)""").find(m3u8Url)?.groupValues?.get(1) ?: ""
+            val lines = m3u8Body.lines()
+            data class Ent(val lineIdx: Int, val abs: String)
+            val ents = ArrayList<Ent>()
+            lines.forEachIndexed { i, raw ->
+                val t = raw.trim()
+                if (t.isNotEmpty() && !t.startsWith("#")) {
+                    val abs = when {
+                        t.startsWith("http") -> t
+                        base.isNotEmpty() -> base.trimEnd('/') + "/" + t.removePrefix("/")
+                        else -> t
+                    }
+                    ents.add(Ent(i, abs))
+                }
+            }
+            if (ents.isEmpty()) return null
+
+            val map = HashMap<String, String>()   // abs placeholder -> URL thật
+            val segNumRe = Regex("""seg(\d+)""")
+            val phAllNum = ents.all { segNumRe.containsMatchIn(it.abs) }
+            val rlAllNum = clean.all { segNumRe.containsMatchIn(it) }
+            if (phAllNum && rlAllNum) {
+                // map CHÍNH XÁC theo số segment (seg000 <-> seg000)
+                val byNum = LinkedHashMap<Int, String>()
+                for (u in clean) {
+                    segNumRe.find(u)?.groupValues?.get(1)?.toIntOrNull()?.let { n ->
+                        if (!byNum.containsKey(n)) byNum[n] = u
+                    }
+                }
+                for (e in ents) {
+                    segNumRe.find(e.abs)?.groupValues?.get(1)?.toIntOrNull()?.let { n ->
+                        byNum[n]?.let { u -> map[e.abs] = u }
+                    }
+                }
+                nlog("[Learn] map theo segN: ${map.size}/${ents.size} (real=${clean.size})")
+            } else if (clean.size <= ents.size) {
+                // fallback: theo THỨ TỰ fetch (player fetch tuần tự khi VOD)
+                for (i in clean.indices) map[ents[i].abs] = clean[i]
+                nlog("[Learn] map theo thứ tự: ${map.size}/${ents.size} (real=${clean.size})")
+            }
+            if (map.size < 2) return null
+
+            var replaced = 0
+            val out = lines.mapIndexed { i, raw ->
+                val ent = ents.firstOrNull { it.lineIdx == i }
+                if (ent != null && map.containsKey(ent.abs)) {
+                    replaced++
+                    map[ent.abs]
+                } else raw
+            }.joinToString("\n")
+            nlog("[Learn] replaced=$replaced ph0=${ents.first().abs.take(120)} rl0=${clean.first().take(120)}")
+            return if (replaced >= 2) out else null
+        } catch (e: Throwable) {
+            nlogE("[Learn]", e)
+            return null
+        }
+    }
+
+    /** v22: nguyên liệu giải cipher offline (v23) — in 2 segment placeholder đầy đủ
+     *  + token. Diag này + avsToken là đủ để tái lập AES-CTR ngoài máy. */
+    private fun logPlaceholderEvidence(body: String, url: String) {
+        try {
+            val segs = body.lines().filter { it.isNotBlank() && !it.startsWith("#") }
+            nlog("[G6] PLAYLIST placeholder segs=${segs.size} url=${url.take(140)}")
+            segs.getOrNull(0)?.let { nlog("[G6] seg#0 ${it.take(1700)}") }
+            segs.getOrNull(1)?.let { nlog("[G6] seg#1 ${it.take(220)}") }
+        } catch (e: Throwable) {
+            nlogE("[G6]", e)
+        }
+    }
+
+    /** v22: header tuỳ chỉnh (X-* và Authorization) mà player thật gửi cho segment —
+     *  proxy phải gửi y hệt nếu CDN kiểm tra header. */
+    private fun extraHeadersFromReal(
+        realUrls: List<String>, headers: Map<String, Map<String, String>>
+    ): Map<String, String> {
+        val out = LinkedHashMap<String, String>()
+        for (u in realUrls) {
+            val rh = headers[u] ?: continue
+            for ((k, v) in rh) {
+                if (k.equals("Range", true)) continue
+                if (k.startsWith("X-") || k.equals("Authorization", true)) out[k] = v
+            }
+            if (out.isNotEmpty()) break
+        }
+        return out
+    }
+
+    /** v22: header tuỳ chỉnh vừa học từ player thật, áp vào proxy server tiếp theo
+     *  được tạo trong registerM3U8Link (consume-once). */
+    @Volatile private var pendingSegExtraHeaders: Map<String, String> = emptyMap()
 
 
     /** JS -> Kotlin bridge. Kotlin handler không được trùng tên @JavascriptInterface
@@ -2285,6 +2471,14 @@ class AnimeVsubProvider : MainAPI() {
             val seenNet = HashSet<String>()
             val captureCount = java.util.concurrent.atomic.AtomicInteger(0)
 
+            // v22: URL segment THẬT mà player fetch sau khi giải mã G6 — quan sát
+            // ở tầng native (shouldInterceptRequest) và hook JS (open/fetch).
+            val realSegUrls = java.util.concurrent.ConcurrentLinkedQueue<String>()
+            val realSegSeen = java.util.Collections.newSetFromMap(
+                java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+            val realSegHeaders = java.util.concurrent.ConcurrentHashMap<String, Map<String, String>>()
+            val segNetLogged = java.util.concurrent.atomic.AtomicInteger(0)
+
             // v20: dialog CHỈ dành cho trang site chính (gate Turnstile cần người
             // dùng tick). Embed/CDN (stream.googleapiscdn) không cần gate — chạy
             // headless: không chiếm focus, không bị dismiss oan khi player UI resume.
@@ -2326,6 +2520,26 @@ class AnimeVsubProvider : MainAPI() {
                         if (hookMediaUrlRegex.containsMatchIn(u)) {
                             captureCount.incrementAndGet()
                             netMediaUrls.add(u)
+                        }
+                        // v22: URL segment THẬT (player đã giải mã G6) — tầng native,
+                        // JS site không thể che được. Log + collect để auto-learn.
+                        if (isRealSegUrl(u) && realSegSeen.add(u)) {
+                            realSegUrls.add(u)
+                            try {
+                                val rh: Map<String, String>? = request?.requestHeaders
+                                if (rh != null && rh.isNotEmpty()) realSegHeaders[u] = rh
+                            } catch (_: Throwable) {}
+                            val n = segNetLogged.incrementAndGet()
+                            if (n <= 6) {
+                                nlog("[Hook] seg-net#$n ${u.take(230)}")
+                                try {
+                                    val xh: Map<String, String> =
+                                        (request?.requestHeaders ?: emptyMap<String, String>()).filterKeys {
+                                            it.startsWith("X-") || it.equals("Authorization", true)
+                                        }
+                                    if (xh.isNotEmpty()) nlog("[Hook] seg-net-hdr#$n $xh")
+                                } catch (_: Throwable) {}
+                            }
                         }
                         return null
                     }
@@ -2373,6 +2587,14 @@ class AnimeVsubProvider : MainAPI() {
             }
 
             var registered = false
+            // v22: stash playlist PLACEHOLDER G6 — chờ player giải mã rồi học URL thật
+            var phStash: Pair<String, String>? = null   // (capUrl, m3u8 body)
+            var phSeenAt = 0L
+            var learnTried = false
+            var lastLearnSize = -1
+            var extendedOnce = false
+            var prevRealCount = 0
+            var lastRealArrival = 0L
             val hookResult = withTimeoutOrNull(HOOK_TIMEOUT_MS) {
                 while (!registered) {
                     // 1) URL media bắt trực tiếp qua shouldInterceptRequest (mọi cơ chế).
@@ -2385,10 +2607,18 @@ class AnimeVsubProvider : MainAPI() {
                             nlog("[Hook] net-m3u8 ${u.take(90)}")
                             val content = fetchText(u, referer = targetUrl)
                                 ?: fetchText(u, referer = origin.ifBlank { targetUrl })
-                            if (content != null && content.contains("#EXTM3U") &&
-                                registerM3U8Link(content, u, u, "Vietsub", callback, siteReferer = targetUrl)) {
-                                registered = true
-                                cap.fillM3u8(u, content, u)
+                            if (content != null && content.contains("#EXTM3U")) {
+                                if (isPlaceholderM3u8(content)) {
+                                    // v22: playlist G6 placeholder — KHÔNG đăng ký vội
+                                    if (phStash == null) {
+                                        phStash = u to content
+                                        phSeenAt = System.currentTimeMillis()
+                                        nlog("[Hook] net-m3u8 là PLACEHOLDER G6 — chờ player giải mã")
+                                    }
+                                } else if (registerM3U8Link(content, u, u, "Vietsub", callback, siteReferer = targetUrl)) {
+                                    registered = true
+                                    cap.fillM3u8(u, content, u)
+                                }
                             }
                         } else {
                             nlog("[Hook] net-mp4 ${u.take(90)}")
@@ -2400,10 +2630,21 @@ class AnimeVsubProvider : MainAPI() {
                             cap.fillMp4(u)
                         }
                     }
-                    // 2) Body do JS hook (fetch/XHR/scanPage) forward qua bridge.
+                    // 2) Body do JS hook (fetch/XHR/scanPage/jw-config) forward qua bridge.
                     while (true) {
                         val recv = pendingBodies.poll() ?: break
                         val (capUrl, capBody) = recv
+
+                        // v22: URL segment THẬT forward từ hook JS (patch open/fetch)
+                        if (capBody.startsWith("SEG ")) {
+                            val su = capBody.removePrefix("SEG ").trim()
+                            if (su.startsWith("http") && realSegSeen.add(su)) {
+                                realSegUrls.add(su)
+                                val n = segNetLogged.incrementAndGet()
+                                if (n <= 6) nlog("[Hook] seg-js#$n ${su.take(230)}")
+                            }
+                            continue
+                        }
 
                         // v12: xử lý capture TRƯỚC — chỉ dừng trang khi đăng ký THÀNH
                         // CÔNG. Tiêu chí pass() rộng hơn (body chứa .m3u8 cũng forward)
@@ -2412,7 +2653,14 @@ class AnimeVsubProvider : MainAPI() {
                         val body = capBody.trim()
                         if (body.startsWith("#EXTM3U")) {
                             val base = Regex("""^(https?://[^/]+/.*/)""").find(capUrl)?.groupValues?.get(1) ?: ""
-                            if (registerM3U8Link(body, capUrl, base, "Vietsub", callback, siteReferer = targetUrl)) {
+                            if (isPlaceholderM3u8(body)) {
+                                // v22: playlist G6 placeholder — KHÔNG đăng ký vội
+                                if (phStash == null) {
+                                    phStash = capUrl to body
+                                    phSeenAt = System.currentTimeMillis()
+                                    nlog("[Hook] bridge PLACEHOLDER G6 (${body.length}B) — chờ player giải mã ${capUrl.take(110)}")
+                                }
+                            } else if (registerM3U8Link(body, capUrl, base, "Vietsub", callback, siteReferer = targetUrl)) {
                                 registered = true
                                 cap.fillM3u8(capUrl, body, base)
                             }
@@ -2441,6 +2689,54 @@ class AnimeVsubProvider : MainAPI() {
                             }
                         }
                     }
+                    // v22: theo dõi tốc độ arrived segment thật (để gia hạn chờ)
+                    val rc = realSegUrls.size
+                    if (rc > prevRealCount) {
+                        lastRealArrival = System.currentTimeMillis()
+                        prevRealCount = rc
+                    }
+
+                    // 3) v22: PLACEHOLDER G6 — học URL thật rồi rewrite trước khi đăng ký.
+                    val stash = phStash
+                    if (stash != null && !registered) {
+                        val waited = System.currentTimeMillis() - phSeenAt
+                        val reals = realSegUrls.toList()
+                        // chỉ thử learn khi số URL thật vừa tăng (chống log-spam 350ms)
+                        if (!learnTried && reals.size >= 2 && reals.size != lastLearnSize) {
+                            lastLearnSize = reals.size
+                            val base = Regex("""^(https?://[^/]+/.*/)""").find(stash.first)?.groupValues?.get(1) ?: ""
+                            val rewritten = tryAutoLearnRewrite(stash.second, reals, stash.first)
+                            if (rewritten != null) {
+                                learnTried = true
+                                val extra = extraHeadersFromReal(reals, realSegHeaders)
+                                if (extra.isNotEmpty()) pendingSegExtraHeaders = extra
+                                if (registerM3U8Link(rewritten, stash.first, base, "Vietsub", callback, siteReferer = targetUrl)) {
+                                    registered = true
+                                    cap.fillM3u8(stash.first, rewritten, base)
+                                    nlog("[Hook] LEARN OK — playlist đã rewrite bằng ${reals.size} URL thật (extra-hdr=${extra.keys})")
+                                }
+                            }
+                        }
+                        if (!registered && waited > PLACEHOLDER_WAIT_MS) {
+                            if (!extendedOnce && reals.size >= 2 &&
+                                System.currentTimeMillis() - lastRealArrival < 1500) {
+                                // player vẫn đang fetch — gia hạn thêm 5s một lần
+                                extendedOnce = true
+                                phSeenAt = System.currentTimeMillis() - PLACEHOLDER_WAIT_MS + 5_000L
+                                nlog("[Learn] gia hạn chờ +5s (player vẫn fetch, real=${reals.size})")
+                            } else {
+                                learnTried = true
+                                logPlaceholderEvidence(stash.second, stash.first)
+                                nlog("[Learn] HẾT CHỜ real=${reals.size} — đăng ký playlist G6 gốc như v21 (fallback)")
+                                val base = Regex("""^(https?://[^/]+/.*/)""").find(stash.first)?.groupValues?.get(1) ?: ""
+                                if (registerM3U8Link(stash.second, stash.first, base, "Vietsub", callback, siteReferer = targetUrl)) {
+                                    registered = true
+                                    cap.fillM3u8(stash.first, stash.second, base)
+                                }
+                            }
+                        }
+                    }
+
                     if (registered) {
                         // Có playlist -> dừng trang để player không tải tiếp quảng cáo/segment.
                         try {
@@ -2843,6 +3139,13 @@ class AnimeVsubProvider : MainAPI() {
             try {
                 val server = AvsProxyServer(if (siteReferer.isNotBlank()) listOf(siteReferer, m3u8Url) else listOf(m3u8Url))
                 server.label = serverName
+                // v22: header tuỳ chỉnh học từ player thật (consume-once)
+                val eh = pendingSegExtraHeaders
+                if (eh.isNotEmpty()) {
+                    server.extraHeaders = eh
+                    pendingSegExtraHeaders = emptyMap()
+                    nlog("[Register] extra-headers ${eh.keys}")
+                }
                 server.start()
                 activeServers.add(server)
                 proxyBase = "http://127.0.0.1:${server.port}"
@@ -2901,6 +3204,14 @@ class AnimeVsubProvider : MainAPI() {
         @Volatile private var _m3u8: String = ""
         private val okLogCount = java.util.concurrent.atomic.AtomicInteger(0)
 
+        // v22: header tuỳ chỉnh học được từ player thật (X-* và Authorization) —
+        // áp cho MỌI request segment của server này.
+        @Volatile var extraHeaders: Map<String, String> = emptyMap()
+
+        // v22: cooldown chống retry-storm — URL vừa bị CDN từ chối thì không bấm lại
+        private val segFailMemo = java.util.concurrent.ConcurrentHashMap<String, Long>()
+        private val placeholderConfirmed = java.util.concurrent.atomic.AtomicBoolean(false)
+
         fun getM3U8(): String = _m3u8
         fun setM3U8(v: String) { _m3u8 = v }
 
@@ -2955,6 +3266,17 @@ class AnimeVsubProvider : MainAPI() {
                         val segUrl = try {
                             java.net.URLDecoder.decode(path.removePrefix("/seg/"), "UTF-8")
                         } catch (_: Throwable) { return }
+                        // v22: cooldown — CDN vừa từ chối URL này (<15s) thì trả 502 ngay,
+                        // không bấm lại (403 JSON lỗi deterministic, retry chỉ làm hại IP).
+                        val nowMs = System.currentTimeMillis()
+                        val lastFail = segFailMemo[segUrl]
+                        if (lastFail != null && nowMs - lastFail < SEG_FAIL_COOLDOWN_MS) {
+                            val body = "502 upstream blocked (cooldown)".toByteArray(Charsets.UTF_8)
+                            output.write(("HTTP/1.1 502 Bad Gateway${crlf}Content-Length: ${body.size}${crlf}$crlf").toByteArray())
+                            output.write(body)
+                            output.flush()
+                            return
+                        }
                         val t0 = System.currentTimeMillis()
                         var ok = false
 
@@ -2972,6 +3294,8 @@ class AnimeVsubProvider : MainAPI() {
                             val body = "502 upstream blocked".toByteArray(Charsets.UTF_8)
                             output.write(("HTTP/1.1 502 Bad Gateway${crlf}Content-Length: ${body.size}${crlf}$crlf").toByteArray())
                             output.write(body)
+                            segFailMemo[segUrl] = System.currentTimeMillis()
+                            if (segFailMemo.size > 128) segFailMemo.clear()
                             nlog("[Seg] ALL-METHODS-FAILED url=...${segUrl.takeLast(40)}")
                         }
                     }
@@ -3025,6 +3349,11 @@ class AnimeVsubProvider : MainAPI() {
                     .header("Sec-Fetch-Mode", "cors")
                     .header("Sec-Fetch-Dest", "empty")
                 if (!ck.isNullOrBlank()) rb.header("Cookie", ck)
+                // v22: header tuỳ chỉnh học từ player thật (nếu có)
+                for ((hk, hv) in extraHeaders) {
+                    if (hk.equals("Cookie", true) || hk.equals("User-Agent", true) || hk.equals("Referer", true)) continue
+                    try { rb.header(hk, hv) } catch (_: Throwable) {}
+                }
                 val req = rb.build()
                 val ok = try {
                     segClient.newCall(req).execute().use { resp ->
@@ -3035,6 +3364,11 @@ class AnimeVsubProvider : MainAPI() {
                                 nlog("[Seg] OKHTTP ${resp.code} ct=$ct ref=${ref.take(30)} url=...${segUrl.takeLast(40)}")
                                 val peek = try { resp.peekBody(256).string().replace("\n", " ").take(160) } catch (_: Throwable) { "?" }
                                 nlog("[Seg] OKHTTP 403-BODY $peek")
+                                // v22: tự nhận diện cơ chế G6 từ chính phản hồi của CDN
+                                if (peek.contains("Missing segment token") && placeholderConfirmed.compareAndSet(false, true)) {
+                                    nlog("[Seg] PLACEHOLDER-CONFIRMED — URL segment là placeholder G6 (AES-CTR). " +
+                                        "v22 sẽ học URL thật từ player ([Hook] seg-net/[Learn]); nếu vẫn lỗi -> gửi diag cho v23")
+                                }
                             }
                             return@use false
                         }
@@ -3082,6 +3416,11 @@ class AnimeVsubProvider : MainAPI() {
                 .header("Sec-Fetch-Mode", "cors")
                 .header("Sec-Fetch-Dest", "empty")
             cookieHeaderFor(segUrl)?.let { rb.header("Cookie", it) }
+            // v22: header tuỳ chỉnh học từ player thật (nếu có)
+            for ((hk, hv) in extraHeaders) {
+                if (hk.equals("Cookie", true) || hk.equals("User-Agent", true) || hk.equals("Referer", true)) continue
+                try { rb.header(hk, hv) } catch (_: Throwable) {}
+            }
             val req = rb.build()
             return try {
                 segClient.newCall(req).execute().use { resp ->
@@ -3134,6 +3473,11 @@ class AnimeVsubProvider : MainAPI() {
                 conn.setRequestProperty("Sec-Fetch-Mode", "cors")
                 conn.setRequestProperty("Sec-Fetch-Dest", "empty")
                 cookieHeaderFor(segUrl)?.let { conn.setRequestProperty("Cookie", it) }
+                // v22: header tuỳ chỉnh học từ player thật (nếu có)
+                for ((hk, hv) in extraHeaders) {
+                    if (hk.equals("Cookie", true) || hk.equals("User-Agent", true) || hk.equals("Referer", true)) continue
+                    try { conn.setRequestProperty(hk, hv) } catch (_: Throwable) {}
+                }
                 val code = conn.responseCode
                 val ct = conn.contentType
                 if (isBlockedResponse(code, ct)) {
