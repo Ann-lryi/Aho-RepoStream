@@ -182,7 +182,7 @@ class AnimeVsubProvider : MainAPI() {
     //  (5) avsHookJs forward thêm body chứa .m3u8 (JSON API của player trả m3u8
     //      bọc trong JSON — URL không có .m3u8 nên tiêu chí cũ bỏ sót).
     //  (6) bỏ genre Học Đường (site redirect /404).
-    private val AVS_BUILD = "v14"
+    private val AVS_BUILD = "v19"
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -541,6 +541,39 @@ class AnimeVsubProvider : MainAPI() {
         val h = hostOf(url)
         if (h.isBlank()) return true
         return junkHosts.any { h.contains(it) }
+    }
+
+    // ═══ v19: MEMO trang xem — load() đã fetch + parse trang xem thì loadLinks
+    //  tái dùng trong TTL, tiết kiệm 1 request site mỗi lần phát lại (evidence
+    //  diag 28-10: load() fetch 55.055 -> loadLinks re-fetch 55.539 cùng URL —
+    //  đốt thừa 1 request ngay trước lúc bấm phát; dồn request = thức ăn của
+    //  cơ chế 5xx). Cap 6 trang, TTL 5 phút. ═══
+    private val watchDocMemo = HashMap<String, Pair<Long, Document>>()
+    private val watchDocMemoLock = Any()
+    private val WATCH_DOC_MEMO_TTL_MS = 5 * 60 * 1000L
+
+    private fun watchDocMemoGet(url: String): Document? = synchronized(watchDocMemoLock) {
+        val now = System.currentTimeMillis()
+        val itr = watchDocMemo.entries.iterator()
+        while (itr.hasNext()) {
+            val en = itr.next()
+            if (now - en.value.first > WATCH_DOC_MEMO_TTL_MS) itr.remove()
+        }
+        watchDocMemo[url]?.second
+    }
+
+    private fun watchDocMemoPut(url: String, doc: Document) {
+        synchronized(watchDocMemoLock) {
+            if (watchDocMemo.size >= 6) {
+                var oldestKey: String? = null
+                var oldest = Long.MAX_VALUE
+                for ((k, v) in watchDocMemo) {
+                    if (v.first < oldest) { oldest = v.first; oldestKey = k }
+                }
+                oldestKey?.let { watchDocMemo.remove(it) }
+            }
+            watchDocMemo[url] = Pair(System.currentTimeMillis(), doc)
+        }
     }
 
     private suspend fun tryPlainDoc(url: String, cookies: Map<String, String>?): Document? {
@@ -1428,6 +1461,7 @@ class AnimeVsubProvider : MainAPI() {
             try {
                 val wdoc = fetchDoc(watchGuess, useCache = false, mode = MODE_EPISODES)
                 val addedWatch = parseOphimEpisodes(wdoc, detail, epOrder, epMeta)
+                if (addedWatch > 0) watchDocMemoPut(watchGuess, wdoc) // v19: loadLinks tái dùng
                 nlog("[Load] watch-page eps=+$addedWatch total=${epOrder.size} meta=${epMeta.size} $watchGuess")
             } catch (e: Throwable) {
                 if (isCancellation(e)) throw e
@@ -1561,13 +1595,22 @@ class AnimeVsubProvider : MainAPI() {
             var watchDoc: Document? = null
             if (!siteDown()) {
                 try {
+                    // v19: MEMO-HIT trước — load() vừa parse trang xem này (TTL 5 phút)
+                    // thì khỏi đốt thêm 1 request site ngay trước lúc phát. Memo-hit
+                    // KHÔNG noteSiteOk() (không phải bằng chứng site vừa hồi phục).
+                    val memoDoc = watchDocMemoGet(watchUrl)
+                    if (memoDoc != null) {
+                        watchDoc = memoDoc
+                        nlog("[Step1p] watch MEMO hit len=${memoDoc.outerHtml().length} $watchUrl")
+                    }
                     // v12: tôn trọng plain-breaker — đừng đốt thêm 2 request 403 vô ích
-                    if (System.currentTimeMillis() >= plainHtmlDeadUntilMs) {
+                    if (watchDoc == null && System.currentTimeMillis() >= plainHtmlDeadUntilMs) {
                         val ck = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
                         watchDoc = (if (ck != null) tryPlainDoc(watchUrl, ck) else null)
                             ?: tryPlainDoc(watchUrl, null)
+                        if (watchDoc != null) watchDocMemoPut(watchUrl, watchDoc!!)
                     }
-                    if (watchDoc != null) {
+                    if (memoDoc == null && watchDoc != null) {
                         noteSiteOk()
                         nlog("[Step1p] watch plain OK len=${watchDoc!!.outerHtml().length} $watchUrl")
                     }
@@ -1646,6 +1689,33 @@ class AnimeVsubProvider : MainAPI() {
                     if (extractFromEmbed(fr, watchUrl, callback)) { linkFound = true; break }
                 }
                 stepNotes.add("S0f:${if (linkFound) "HIT" else "0"}")
+            }
+
+            // ═══ STEP 0h (v19): ajax hụt (200-rỗng / 5xx / blocked) nhưng CÒN HASH
+            //  -> đào THẲNG embed player trên CDN (stream.googleapiscdn — KHÁC ORIGIN
+            //  với animevietsub nên không chịu 403/520/throttle của site). Evidence:
+            //  diag 28-10 ajax 200 len=0 + webview-ajax len=30 (site soft-throttle)
+            //  trong khi diag 27-10 chứng minh frame = stream.googleapiscdn.com/
+            //  player/{hash128} và hook bắt được playlist #EXTM3U 424KB. Kể cả khi
+            //  site đang 5xx vẫn chạy được (không đụng site) — storm chỉ thử 1 host. ═══
+            if (!linkFound && step0Weak && srvList.isNotEmpty()) {
+                val s0hList = if (siteDown()) srvList.take(1) else srvList.take(MAX_EMBEDS)
+                for (srv in s0hList) {
+                    if (linkFound) break
+                    if (srv.hash.isBlank()) continue
+                    val embedUrl = "https://stream.googleapiscdn.com/player/${srv.hash}"
+                    nlog("[S0h] embed-from-hash siteDown=${siteDown()} hashLen=${srv.hash.length} ${embedUrl.take(80)}")
+                    try {
+                        if (extractFromEmbed(embedUrl, watchUrl, callback)) {
+                            linkFound = true
+                            break
+                        }
+                    } catch (e: Throwable) {
+                        if (isCancellation(e)) throw e
+                        nlogE("[S0h]", e)
+                    }
+                }
+                stepNotes.add("S0h:${if (linkFound) "HIT" else "0"}")
             }
 
             // ═══ STEP 0w (v7): WebView same-origin fetch — POST OkHttp bị Cloudflare
