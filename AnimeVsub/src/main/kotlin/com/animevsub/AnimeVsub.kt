@@ -182,7 +182,7 @@ class AnimeVsubProvider : MainAPI() {
     //  (5) avsHookJs forward thêm body chứa .m3u8 (JSON API của player trả m3u8
     //      bọc trong JSON — URL không có .m3u8 nên tiêu chí cũ bỏ sót).
     //  (6) bỏ genre Học Đường (site redirect /404).
-    private val AVS_BUILD = "v20"
+    private val AVS_BUILD = "v21"
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -2170,10 +2170,104 @@ class AnimeVsubProvider : MainAPI() {
         return null
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  v21 DEDUPE HOOK THEO URL PLAYER — evidence diag 28-10 20:54-20:56
+    //  (Thám Tử Đã Chết 2): CloudStream gọi loadLinks 2 lần song song
+    //  (id 116014/116382) -> 2 tryHookFlow mở 2 WebView trên CÙNG trang player.
+    //  WebView 1 capture playlist 384KB trong 5.3s (result=true, 257 segments);
+    //  WebView 2 jwplayer KHÔNG BAO GIỜ nạp playlist (req-sample timeout 60s
+    //  không có /playlist/ — chỉ player + ads + /status/) -> TIMEOUT 60s
+    //  captures=0 -> S0h probe 404 -> loadLinks trả RỖNG -> player báo
+    //  "không tìm thấy liên kết". Fix: caller sau JOIN caller đang chạy (cùng
+    //  URL) hoặc ăn CACHE kết quả, rồi REPLAY link cho callback của MÌNH (link
+    //  đã emit cho caller trước không tự đến được caller sau — mỗi callback
+    //  phải nhận ExtractorLink riêng).
+    // ═══════════════════════════════════════════════════════════════════════
+    private class HookCapture {
+        val done = kotlinx.coroutines.CompletableDeferred<Boolean>()
+        @Volatile var ok = false
+        @Volatile var savedMs = 0L
+        @Volatile var replayUrl: String? = null   // playlist hoặc mp4 URL gốc
+        @Volatile var replayBody: String? = null  // nội dung #EXTM3U (null với mp4)
+        @Volatile var replayBase = ""             // base giải URL segment tương đối
+        @Volatile var replayIsMp4 = false
+        fun fillM3u8(url: String, body: String, base: String) {
+            replayUrl = url; replayBody = body; replayBase = base; replayIsMp4 = false
+        }
+        fun fillMp4(url: String) {
+            replayUrl = url; replayBody = null; replayIsMp4 = true
+        }
+    }
+    private val hookInflight = java.util.concurrent.ConcurrentHashMap<String, HookCapture>()
+    private val hookDoneCache = java.util.concurrent.ConcurrentHashMap<String, HookCapture>()
+    private val HOOK_CACHE_TTL_MS = 15 * 60 * 1000L
+    private val HOOK_CACHE_MAX = 4
+
+    private fun hookCachePut(key: String, cap: HookCapture) {
+        cap.savedMs = System.currentTimeMillis()
+        hookDoneCache[key] = cap
+        val now = cap.savedMs
+        for ((k, v) in hookDoneCache) {
+            if (now - v.savedMs > HOOK_CACHE_TTL_MS) hookDoneCache.remove(k)
+        }
+        while (hookDoneCache.size > HOOK_CACHE_MAX) {
+            val oldest = hookDoneCache.entries.minByOrNull { it.value.savedMs } ?: break
+            hookDoneCache.remove(oldest.key)
+        }
+    }
+
+    /** v21: phát LẠI link từ kết quả capture đã có cho callback của caller hiện tại. */
+    private suspend fun replayHookCapture(
+        cap: HookCapture, targetUrl: String, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val url = cap.replayUrl ?: return false
+        return try {
+            if (cap.replayIsMp4) {
+                callback(newExtractorLink(name, "MP4", url, ExtractorLinkType.VIDEO) {
+                    quality = Qualities.P720.value
+                    headers = mapOf("User-Agent" to USER_AGENT, "Referer" to targetUrl)
+                })
+                true
+            } else {
+                val body = cap.replayBody
+                if (body != null && body.contains("#EXTM3U")) {
+                    registerM3U8Link(body, url, cap.replayBase.ifBlank { url }, "Vietsub", callback, siteReferer = targetUrl)
+                } else false
+            }
+        } catch (e: Throwable) {
+            if (isCancellation(e)) throw e
+            nlogE("[Hook] replay", e)
+            false
+        }
+    }
+
     private suspend fun tryHookFlow(targetUrl: String, callback: (ExtractorLink) -> Unit): Boolean {
         val flowT0 = System.currentTimeMillis()
         var webView: WebView? = null
         var dialog: android.app.Dialog? = null
+
+        // v21: cache-hit — URL player này vừa capture thành công (< 15 phút).
+        val hookKey = targetUrl.substringBefore("#")
+        hookDoneCache[hookKey]?.let { cached ->
+            if (cached.ok && cached.savedMs > 0 &&
+                System.currentTimeMillis() - cached.savedMs <= HOOK_CACHE_TTL_MS) {
+                nlog("[Hook] cache-hit +${System.currentTimeMillis() - cached.savedMs}ms ${targetUrl.take(70)}")
+                if (replayHookCapture(cached, targetUrl, callback)) return true
+                nlog("[Hook] cache replay hụt — chạy flow thường")
+            }
+        }
+        // v21: join in-flight — caller song song cùng URL player ĐỢI kết quả thay
+        // vì mở WebView thứ 2 (2 WebView cùng load 1 player -> jwplayer bản 2
+        // không nạp playlist — evidence diag 28-10 20:56).
+        val inflight = hookInflight[hookKey]
+        if (inflight != null) {
+            nlog("[Hook] join in-flight ${targetUrl.take(70)}")
+            val joined = withTimeoutOrNull(HOOK_TIMEOUT_MS) { inflight.done.await() } ?: false
+            if (joined && inflight.ok && replayHookCapture(inflight, targetUrl, callback)) return true
+            nlog("[Hook] join xong ok=${inflight.ok} — mở flow riêng (tuần tự)")
+        }
+        val cap = HookCapture()
+        hookInflight[hookKey] = cap
         try {
             val ctx = appContext()
             if (ctx == null) {
@@ -2294,6 +2388,7 @@ class AnimeVsubProvider : MainAPI() {
                             if (content != null && content.contains("#EXTM3U") &&
                                 registerM3U8Link(content, u, u, "Vietsub", callback, siteReferer = targetUrl)) {
                                 registered = true
+                                cap.fillM3u8(u, content, u)
                             }
                         } else {
                             nlog("[Hook] net-mp4 ${u.take(90)}")
@@ -2302,6 +2397,7 @@ class AnimeVsubProvider : MainAPI() {
                                 headers = mapOf("User-Agent" to USER_AGENT, "Referer" to targetUrl)
                             })
                             registered = true
+                            cap.fillMp4(u)
                         }
                     }
                     // 2) Body do JS hook (fetch/XHR/scanPage) forward qua bridge.
@@ -2318,6 +2414,7 @@ class AnimeVsubProvider : MainAPI() {
                             val base = Regex("""^(https?://[^/]+/.*/)""").find(capUrl)?.groupValues?.get(1) ?: ""
                             if (registerM3U8Link(body, capUrl, base, "Vietsub", callback, siteReferer = targetUrl)) {
                                 registered = true
+                                cap.fillM3u8(capUrl, body, base)
                             }
                         } else {
                             val (m3u8s, mp4s) = harvestMediaUrls(body)
@@ -2330,6 +2427,7 @@ class AnimeVsubProvider : MainAPI() {
                                     if (content != null && content.contains("#EXTM3U") &&
                                         registerM3U8Link(content, m3u8, m3u8Dir, "Vietsub", callback, siteReferer = targetUrl)) {
                                         registered = true
+                                        cap.fillM3u8(m3u8, content, m3u8Dir)
                                     }
                                 }
                                 mp4s.firstOrNull() != null -> {
@@ -2338,6 +2436,7 @@ class AnimeVsubProvider : MainAPI() {
                                         headers = mapOf("User-Agent" to USER_AGENT, "Referer" to targetUrl)
                                     })
                                     registered = true
+                                    cap.fillMp4(mp4s.first())
                                 }
                             }
                         }
@@ -2390,8 +2489,15 @@ class AnimeVsubProvider : MainAPI() {
                     nlog("[Hook] req-sample(${reqSample.size}) ${sample.joinToString(" | ")}")
                 }
             }
+            // v21: chốt kết quả cho caller join + cache replay
+            cap.ok = registered
+            if (!cap.done.isCompleted) cap.done.complete(registered)
+            if (registered && cap.replayUrl != null) hookCachePut(hookKey, cap)
             return registered
         } finally {
+            // v21: an-toàn hủy/exception — caller đang join phải được nhả ra
+            try { if (!cap.done.isCompleted) cap.done.complete(cap.ok) } catch (_: Throwable) {}
+            hookInflight.remove(hookKey, cap)
             try { withContext(Dispatchers.Main) { dialog?.dismiss() } } catch (_: Throwable) {}
             try { withContext(Dispatchers.Main) { webView?.destroy() } } catch (_: Throwable) {}
         }
