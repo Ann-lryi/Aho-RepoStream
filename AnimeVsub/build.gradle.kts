@@ -1,5 +1,5 @@
-// use an integer for version numbers
-version = 27
+// use an integer for version numbers — v28: chặn raw playlist (_t=) hết 2004 + cứu phim iframes=0
+version = 28
 
 
 cloudstream {
