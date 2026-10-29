@@ -1,13 +1,18 @@
 {
   "name": "AnimeVsub",
   "pluginClassName": "com.animevsub.AnimeVsubPlugin",
-  "version": 23,
+  "version": "25",
   "requiresResources": false,
-  "description": "Anime vietsub - lồng tiếng từ animevietsub.sale",
-  "authors": ["Aho-Repo"],
+  "description": "Anime vietsub - l\u1ed3ng ti\u1ebfng t\u1eeb animevietsub.sale",
+  "authors": [
+    "Aho-Repo"
+  ],
   "repositoryUrl": "https://github.com/dah215/Aho-Repo",
   "status": 3,
-  "tvTypes": ["Anime", "AnimeMovie"],
+  "tvTypes": [
+    "Anime",
+    "AnimeMovie"
+  ],
   "language": "vi",
   "iconUrl": "https://animevietsub.sale/favicon.ico"
 }
