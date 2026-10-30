@@ -1,3 +1,24 @@
+// AnimeVsub v30 (2026-10-30): CloudStream provider cho https://animevietsub.sale
+//  v30 — SỬA HỒI QUY v29 + giảm chi phí khởi động (diag animevsub_diag_1.txt 11:21-11:53):
+//    * R1 (hồi quy v29 L3): Step0w dùng location.origin -> fetch() TREO tới trần 30s thay vì
+//      lỗi nhanh như v28 (11:44:25.16 -> 11:44:55.16 và 11:51:45.7 -> 11:52:13.9 "TIMEOUT";
+//      SUMMARY ms=45941 / 36335). Nay: Step0 trả 2xx + body rỗng (S0 "200 len=0" ở 9/9 lần,
+//      S0w HIT 0/6) = trả lời dứt khoát -> KHÔNG leo thang Step0w; trần Step0w 30s -> 6s.
+//    * R2 (hồi quy v29 S1/S2/warm-prefetch): 2/2 lần phát với đăng ký sớm đều treo ở segment
+//      đầu (11:45:12.9 -> 11:45:36.0 Broken pipe; 11:52:20.2 -> 11:52:34.7 "timeout") rồi 404.
+//      NHƯNG header CDN `x-degraded-mode: PLAYLIST-FAST` có ở mọi phiên 11:22+ và không có ở
+//      diag 06:32 -> chưa tách được lỗi do đăng ký sớm hay do CDN. AVS_FAST_PLAY = false
+//      (khôi phục thời gian v28); thay bằng bỏ chờ recipe SAU KHI CDN đã phục vụ 1 segment lớn
+//      (servedBig). Log mới: "[Seg] REQ sinceReg=" và "OKHTTP OK ... sinceReg=" để đo mốc thật.
+//    * C1 (khởi động): plain HTTP 0 lần OK trong toàn bộ log (0/31); phiên 11:43 và 11:51 mất
+//      ~12.7s / ~9.6s tới danh sách đầu (plain TIMEOUT 4s x2 trước khi vào WebView). Nay: breaker
+//      lưu SharedPreferences qua phiên (cooldown 2h), TIMEOUT cũng bật breaker, trần 2.5s.
+//    * C2 (host chuẩn): mọi WVDom page-start đều ở animevietsub.news dù mainUrl = .sale;
+//      WVDom ms median v27 (.news trực tiếp) 862ms vs v28 (.sale) 1376ms; phiên 11:51 còn thêm
+//      hop apply-cookie.php. Học host chuẩn từ DOM hợp lệ, lưu lại, loadUrl thẳng host đó;
+//      thất bại -> tắt + thử lại URL gốc 1 lần.
+//    * C3 (cache trang xem): load() nạp trang xem với useCache=true; loadLinks Step1/prefetch
+//      dùng lại DOM (TTL 5 phút) -> bỏ 1 lần WebView (~2s) khi bấm tập; R5 xoá cache bẩn.
 // AnimeVsub v29 (2026-10-30): CloudStream provider cho https://animevietsub.sale
 //  v29 — TỐI ƯU TỐC ĐỘ theo diag v28 06:31-06:32 (mỗi mục đối chiếu dòng log + dòng code):
 //    * S1 (proxy, ~5s/request): realPlaylistSeen chỉ được GHI, không nơi nào ĐỌC ->
@@ -322,14 +343,17 @@ class AnimeVsubProvider : MainAPI() {
     //  (S4) PL-RES log header ĐẦY ĐỦ (260->1500 ký tự) — nếu token nằm trong
     //       response header (X-Envelope/X-Proxy-Digest — CDN tự expose cho JS
     //       đọc) thì diag sau sẽ thấy tên header thật, không đoán.
-    private val AVS_BUILD = "v29"
+    private val AVS_BUILD = "v30"
 
-    // v29: true = bỏ các khoảng chờ recipe vô ích khi manifest KHÔNG chứa '/chunks/'
-    // (hook 8s + proxy 5s/request) — xem header v29 S1-S3. false = hành vi v28.
-    private val AVS_FAST_PLAY = true
+    // v30: true = đăng ký link NGAY khi có manifest thật + bỏ cửa sổ chờ recipe 8s + warm-
+    // prefetch. Thử ở v29: segment đầu treo 2/2 lần (xem header R2) -> mặc định false (= v28).
+    private val AVS_FAST_PLAY = false
 
-    // v29 (F1): trần thời gian 1 request plain HTML.
-    private val PLAIN_TIMEOUT_MS = 4_000L
+    // v30 (C1): trần thời gian 1 request plain HTML (v29: 4s; 0/31 plain OK trong diag).
+    private val PLAIN_TIMEOUT_MS = 2_500L
+
+    // v30 (C2): loadUrl thẳng host chuẩn (animevietsub.news) thay vì đi qua .sale + apply-cookie.
+    private val AVS_DIRECT_CANONICAL = true
 
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
@@ -388,7 +412,67 @@ class AnimeVsubProvider : MainAPI() {
     private val plainDeadStreak = java.util.concurrent.atomic.AtomicInteger(0)
     @Volatile private var plainHtmlDeadUntilMs = 0L
     private val PLAIN_DEAD_THRESHOLD = 3
-    private val PLAIN_DEAD_COOLDOWN_MS = 10 * 60 * 1000L
+    // v30 (C1): 10 phút -> 2 giờ + lưu qua phiên (0/31 request plain OK trong toàn bộ diag).
+    private val PLAIN_DEAD_COOLDOWN_MS = 2 * 60 * 60 * 1000L
+
+    // v30: trạng thái lưu qua phiên (breaker plain + host chuẩn).
+    private val stateRestored = java.util.concurrent.atomic.AtomicBoolean(false)
+    @Volatile private var canonicalHost: String? = null
+    @Volatile private var canonicalConfirmed = false
+    @Volatile private var canonicalOff = false
+
+    private fun statePrefs(): android.content.SharedPreferences? = try {
+        (diagContext() ?: appContext())
+            ?.getSharedPreferences("avs_provider_state", android.content.Context.MODE_PRIVATE)
+    } catch (_: Throwable) { null }
+
+    private fun restoreStateOnce() {
+        if (!stateRestored.compareAndSet(false, true)) return
+        try {
+            val p = statePrefs()
+            if (p == null) { stateRestored.set(false); return }
+            val now = System.currentTimeMillis()
+            val until = p.getLong("plainDeadUntil", 0L)
+            if (until > now && until > plainHtmlDeadUntilMs) {
+                plainHtmlDeadUntilMs = until
+                plainDeadStreak.set(PLAIN_DEAD_THRESHOLD)
+                nlog("[Fetch] plain TẮT khôi phục từ phiên trước — còn ${(until - now) / 60000} phút (v30 C1)")
+            }
+            if (AVS_DIRECT_CANONICAL) {
+                val ch = p.getString("canonicalHost", null)
+                if (!ch.isNullOrBlank() && ch.contains("animevietsub") && ch != hostOf(mainUrl)) {
+                    canonicalHost = ch
+                    nlog("[Fetch] host chuẩn khôi phục: $ch (v30 C2)")
+                }
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun setPlainDead(untilMs: Long) {
+        plainHtmlDeadUntilMs = untilMs
+        try { statePrefs()?.edit()?.putLong("plainDeadUntil", untilMs)?.apply() } catch (_: Throwable) {}
+    }
+
+    /** v30 (C2): học host chuẩn từ trang đã render dữ liệu hợp lệ. */
+    private fun learnCanonical(pageUrl: String) {
+        if (!AVS_DIRECT_CANONICAL || canonicalOff) return
+        val h = hostOf(pageUrl)
+        if (h.isEmpty() || h == hostOf(mainUrl) || !h.contains("animevietsub")) return
+        if (canonicalHost != h) {
+            canonicalHost = h
+            nlog("[Fetch] học host chuẩn: $h (mainUrl=${hostOf(mainUrl)}) (v30 C2)")
+            try { statePrefs()?.edit()?.putString("canonicalHost", h)?.apply() } catch (_: Throwable) {}
+        }
+        canonicalConfirmed = true
+    }
+
+    private fun toCanonical(url: String): String {
+        val ch = canonicalHost ?: return url
+        if (!AVS_DIRECT_CANONICAL || canonicalOff) return url
+        val h = hostOf(url)
+        if (h.isEmpty() || h != hostOf(mainUrl)) return url
+        return url.replaceFirst(h, ch)
+    }
 
     // v12: tối đa 2 WebView DOM capture song song — log 27-10 05:34 thấy 3 WVDom
     // spawn trong 100ms; dội hàng loạt WebView cùng lúc là thứ khiến origin
@@ -714,6 +798,13 @@ class AnimeVsubProvider : MainAPI() {
             }
             if (resp == null) {
                 nlog("[Fetch] plain $tag TIMEOUT ${PLAIN_TIMEOUT_MS}ms (v29 F1) $url")
+                // v30 (C1): TIMEOUT = plain chết (diag 11:43:51 / 11:51:18: ck=3 TIMEOUT rồi
+                // no-ck TIMEOUT, 3 URL song song -> ~8s) -> bật breaker NGAY, đừng thử lại.
+                if (hostOf(url) == hostOf(mainUrl) && System.currentTimeMillis() >= plainHtmlDeadUntilMs) {
+                    plainDeadStreak.set(PLAIN_DEAD_THRESHOLD)
+                    setPlainDead(System.currentTimeMillis() + PLAIN_DEAD_COOLDOWN_MS)
+                    nlog("[Fetch] plain TẮT ${PLAIN_DEAD_COOLDOWN_MS / 60000} phút (TIMEOUT, v30 C1)")
+                }
                 return null
             }
             val html = resp.text
@@ -730,7 +821,7 @@ class AnimeVsubProvider : MainAPI() {
                     hostOf(url) == hostOf(mainUrl) &&
                     System.currentTimeMillis() >= plainHtmlDeadUntilMs) {
                     plainDeadStreak.set(PLAIN_DEAD_THRESHOLD)
-                    plainHtmlDeadUntilMs = System.currentTimeMillis() + PLAIN_DEAD_COOLDOWN_MS
+                    setPlainDead(System.currentTimeMillis() + PLAIN_DEAD_COOLDOWN_MS)
                     nlog("[Fetch] plain 403 challenge-page (len=${html.length}) — tắt plain ${PLAIN_DEAD_COOLDOWN_MS / 60000} phút NGAY (v26 P5)")
                 }
                 nlog("[Fetch] plain $tag ${resp.code} REJECT len=${html.length} ms=${System.currentTimeMillis() - t0} $url")
@@ -850,6 +941,7 @@ class AnimeVsubProvider : MainAPI() {
         // v13 FIX: cachedCookies phải nằm ở SCOPE HÀM (trước breaker if) — v12 khai
         // trong else nên cụm "fresh != cachedCookies" ở cfMutex.withLock mất tham
         // chiếu -> CI: Unresolved reference 'cachedCookies' (732:43).
+        restoreStateOnce()   // v30: breaker plain + host chuẩn từ phiên trước
         val cachedCookies = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
         if (System.currentTimeMillis() < plainHtmlDeadUntilMs) {
             nlog("[Fetch] plain TẮT (breaker 403 liên tục) — vào WebView luôn $url")
@@ -870,7 +962,7 @@ class AnimeVsubProvider : MainAPI() {
                 if (doc != null) {
                     if (hostOf(url) == hostOf(mainUrl)) {
                         plainDeadStreak.set(0)
-                        plainHtmlDeadUntilMs = 0L
+                        setPlainDead(0L)
                     }
                     if (useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
                     return doc
@@ -879,7 +971,7 @@ class AnimeVsubProvider : MainAPI() {
                     val n = plainDeadStreak.incrementAndGet()
                     val nowMs = System.currentTimeMillis()
                     if (n >= PLAIN_DEAD_THRESHOLD && nowMs >= plainHtmlDeadUntilMs) {
-                        plainHtmlDeadUntilMs = nowMs + PLAIN_DEAD_COOLDOWN_MS
+                        setPlainDead(nowMs + PLAIN_DEAD_COOLDOWN_MS)
                         nlog("[Fetch] plain TẮT ${PLAIN_DEAD_COOLDOWN_MS / 60000} phút (streak=$n lần 403/challenge liên tục) — vào WebView ngay")
                     }
                 }
@@ -926,7 +1018,21 @@ class AnimeVsubProvider : MainAPI() {
             }
 
             nlog("[Fetch] webview-dom fallback mode=$mode $url")
-            val doc = webviewDocCapture(url, mode, WV_SILENT_TIMEOUT_MS, interactive = false)
+            // v30 (C2): host chuẩn chưa xác nhận trong phiên này -> trần ngắn 9s để thất bại thì
+            // quay lại URL gốc nhanh; đã xác nhận (có DOM hợp lệ) -> trần thường.
+            val viaCanon = toCanonical(url) != url
+            var doc = webviewDocCapture(
+                url, mode,
+                if (viaCanon && !canonicalConfirmed) 9_000L else WV_SILENT_TIMEOUT_MS,
+                interactive = false
+            )
+            if (doc == null && viaCanon) {
+                nlog("[Fetch] canonical-direct thất bại -> tắt, thử lại URL gốc (v30 C2) $url")
+                canonicalOff = true
+                canonicalHost = null
+                try { statePrefs()?.edit()?.remove("canonicalHost")?.apply() } catch (_: Throwable) {}
+                doc = webviewDocCapture(url, mode, WV_SILENT_TIMEOUT_MS, interactive = false)
+            }
             if (doc != null && useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
             doc
         }
@@ -1509,7 +1615,8 @@ class AnimeVsubProvider : MainAPI() {
                 }
                 wv.loadUrl(watchUrl, mapOf("Referer" to "$mainUrl/"))
             }
-            val body = withTimeoutOrNull(30_000L) { done.await() }
+            // v30 (R1): 30s -> 6s. v29 (location.origin) làm fetch() treo hẳn tới trần này.
+            val body = withTimeoutOrNull(6_000L) { done.await() }
             nlog("[Step0w] webview-ajax ${if (body == null) "TIMEOUT" else "len=" + body.length}")
             return body
         } catch (e: Throwable) {
@@ -1536,7 +1643,9 @@ class AnimeVsubProvider : MainAPI() {
         val watchGuess = detail.trimEnd('/') + "/xem-phim.html"
         val watchJob = async {
             try {
-                fetchDoc(watchGuess, useCache = false, mode = MODE_EPISODES)
+                // v30 (C3): useCache=true -> loadLinks Step1 dùng lại DOM (TTL 5 phút), bỏ 1 lần
+                // WebView (~2s) khi bấm tập; load() lặp lại (preview trang chủ) cũng trúng cache.
+                fetchDoc(watchGuess, useCache = true, mode = MODE_EPISODES)
             } catch (e: Throwable) {
                 if (isCancellation(e)) throw e
                 nlogE("[Load] watch-page", e, watchGuess)
@@ -1795,7 +1904,7 @@ class AnimeVsubProvider : MainAPI() {
             val watchPrefetch: kotlinx.coroutines.Deferred<Document?>? =
                 if (watchDoc == null && !siteDown()) async {
                     try {
-                        fetchDoc(watchUrl, useCache = false, mode = MODE_DETAIL)
+                        fetchDoc(watchUrl, useCache = true, mode = MODE_DETAIL)   // v30 (C3)
                     } catch (e: Throwable) {
                         if (isCancellation(e)) throw e
                         nlogE("[Step1pre]", e, watchUrl)
@@ -1841,6 +1950,9 @@ class AnimeVsubProvider : MainAPI() {
                                 break
                             }
                             if (media.isEmpty() && frames.isEmpty()) step0Weak = true
+                        } else if (resp.code in 200..299 && body.isBlank()) {
+                            // v30 (R1): 2xx + body rỗng = API trả lời dứt khoát (diag: S0 "200 len=0"
+                            // 9/9 lần, S0w HIT 0/6) -> KHÔNG leo thang sang Step0w.
                         } else {
                             step0Weak = true
                         }
@@ -1933,6 +2045,7 @@ class AnimeVsubProvider : MainAPI() {
                         // bằng WVDom mode=3 (R4 đợi iframe) trước khi rơi xuống Step3.
                         if (embeds.isEmpty() && watchUrl.contains("xem-phim")) {
                             nlog("[Step1] iframes=0 — nạp lại trang xem (WVDom đợi iframe, v28 R5)")
+                            docCache.remove(watchUrl)   // v30 (C3): DOM cache thiếu iframe -> bỏ
                             try {
                                 val doc2 = fetchDoc(watchUrl, useCache = false, mode = MODE_EPISODES)
                                 val embeds2 = harvestIframes(doc2)
@@ -2863,7 +2976,7 @@ class AnimeVsubProvider : MainAPI() {
                         if (!done.isCompleted) done.complete(null)
                         return@AvsGateBridge
                     }
-                    if (cards > 0 || xem > 0) noteSiteOk()
+                    if (cards > 0 || xem > 0) { noteSiteOk(); if (!blocked) learnCanonical(u) }
                     lastHtml = html
                     lastBlocked = blocked
                     lastCards = cards
@@ -2916,7 +3029,7 @@ class AnimeVsubProvider : MainAPI() {
                     }
                 }
 
-                wv.loadUrl(url, mapOf("Referer" to "$mainUrl/"))
+                wv.loadUrl(toCanonical(url), mapOf("Referer" to "$mainUrl/"))
             }
 
             val t0 = System.currentTimeMillis()
@@ -3514,6 +3627,10 @@ class AnimeVsubProvider : MainAPI() {
         // v29 (S1): true = manifest có segment '/chunks/' (recipe học được) -> proxy mới
         // đợi recipe. Mặc định true (an toàn) tới khi setM3U8 đọc được manifest.
         @Volatile private var recipeNeeded = true
+        // v30: CDN đã phục vụ 1 segment lớn (>=4KB, không phải khoá 16B) -> bỏ chờ recipe sau đó.
+        @Volatile private var servedBig = false
+        private val bornAt = System.currentTimeMillis()
+        private val segReqLog = java.util.concurrent.atomic.AtomicInteger(0)
         private val okLogCount = java.util.concurrent.atomic.AtomicInteger(0)
         // v16 (F4): cửa sổ lạnh chuyển TOÀN CỤC (segAuthBackoffGlobalUntil /
         // dnsCooldownUntil ở scope provider) — 2 video chạy cùng lúc không phá
@@ -3679,6 +3796,9 @@ class AnimeVsubProvider : MainAPI() {
                         } catch (_: Throwable) { return }
                         val t0 = System.currentTimeMillis()
                         var ok = false
+                        if (segReqLog.incrementAndGet() <= 8) {
+                            nlog("[Seg] REQ sinceReg=${t0 - bornAt}ms range=${curReqRange ?: "-"} servedBig=$servedBig url=...${segUrl.takeLast(26)}")
+                        }
 
                         // v26 (P3): segment đã prefetch -> trả ngay từ cache (0ms
                         // network), buffer ExoPlayer luôn dày, hết stall.
@@ -3701,6 +3821,7 @@ class AnimeVsubProvider : MainAPI() {
                                 }
                             } else cacheHit0
                         if (cacheHit != null && cacheHit.third.isNotEmpty()) {
+                            servedBig = true
                             val head = StringBuilder(
                                 if (cacheHit.first == 206) "HTTP/1.1 206 Partial Content" else "HTTP/1.1 200 OK"
                             ).append(crlf)
@@ -3733,7 +3854,7 @@ class AnimeVsubProvider : MainAPI() {
                             // liên tục từ F1; diag 20:41: player fetch ở +16.7s, muộn
                             // hơn cửa sổ 8s cũ). KHÔNG dội 4 method mù khi chưa học.
                             // v29 (S1): chỉ đợi khi manifest có '/chunks/' (recipe học được)
-                            if (segRecipe == null && recipeNeeded) waitForRecipe()
+                            if (segRecipe == null && recipeNeeded && !servedBig) waitForRecipe()
                             // ── v26 (P1): thứ tự mới theo diag v25 20:18 —
                             // OKHTTP (URL thật từ manifest giải mã, forward Range)
                             // ra quyết định nhanh và ĐÚNG (ttfb 6.6s, 1.1MB OK);
@@ -4034,8 +4155,9 @@ class AnimeVsubProvider : MainAPI() {
                                 sent += n
                             }
                         }
+                        if (sent >= 4096L) servedBig = true
                         if (okLogCount.incrementAndGet() <= 40) {
-                            nlog("[Seg] OKHTTP OK bytes=$sent ttfb=${System.currentTimeMillis() - t0}ms url=...${segUrl.takeLast(26)}")
+                            nlog("[Seg] OKHTTP OK bytes=$sent ttfb=${System.currentTimeMillis() - t0}ms sinceReg=${System.currentTimeMillis() - bornAt}ms url=...${segUrl.takeLast(26)}")
                         }
                         true
                     }
