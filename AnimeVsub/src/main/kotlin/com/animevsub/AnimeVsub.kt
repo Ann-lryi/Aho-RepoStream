@@ -1,33 +1,39 @@
 // AnimeVsub v29 (2026-10-30): CloudStream provider cho https://animevietsub.sale
-//  v29 — vá theo diag v28 06:31 (PHÁT ĐƯỢC rồi, nhưng load siêu chậm trở lại).
-//  Bằng chứng -> 7 bản vá tốc độ (KHÔNG đụng cơ chế phát v25/v28: raw-block,
-//  hook decrypt, proxy-only, F6 đợi recipe — mọi luồng đó giữ nguyên):
-//    * T1 (video -8s): hook ĐĂNG KÝ NGAY khi có manifest giải mã, không chờ 8s
-//      cho player fetch segment trước. diag v28: "dùng manifest THẬT" 06:32:01
-//      -> [Register] 06:32:09 = 8s chờ = 53% thời gian loadLinks (ms=15071).
-//      OKHTTP+referer đã chứng minh phát được seg e= ngay (bytes=2435552) nên
-//      recipe giờ HỌC NỀN trong 8s (kick vẫn gửi), không chặn đăng ký nữa.
-//    * T2 (danh mục + video, xử lý treo 60s): WVDom poller — điều kiện sig ==
-//      lastSig return TRƯỚC phép đánh giá ready -> trang xem DOM tĩnh không có
-//      iframe bị POLL MÃI (diag v28: poll#77 sau 65s, giữ cfMutex chặn mọi
-//      fetch WebView khác). Giờ ready được đánh giá MỖI poll (kể cả DOM không
-//      đổi), chỉ log khi DOM đổi + cap cứng 60 poll.
-//    * T3 (TTFB seg đầu 5.5-6s -> ~0ms): proxy prefetch 2 segment đầu NGAY sau
-//      đăng ký (player vào là có sẵn trong cache) + AvsDnsCache sắp IPv4 trước
-//      IPv6 (diag v27: connect treo trên [2606:4700:20…]).
-//    * T4 (seg rác): viaOkHttp/viaOkHttpOrigin/viaRecipe thêm check body rác
-//      (<1KB) — diag v28: 'OKHTTP OK bytes=16' (JSON lỗi CDN) bị đem làm video,
-//      ExoPlayer stall rồi fetch lại = mất thời gian gấp đôi (RELAY đã có check).
-//    * T5 (2 luồng loadLinks song song): single-flight loadLinks theo watchUrl —
-//      diag v28: 2 SUMMARY ms≈15071/14824 chạy chèo chéo -> 2 hook -> 2 proxy
-//      (port 44155 + 41385) -> segment fetch trùng nhau. Luồng sau JOIN luồng
-//      trước.
-//    * T6 (proxy trùng): registerM3U8Link tái DÙNG proxy sống cùng playlist
-//      (key = host+path segment đầu) — setM3U8 nội dung mới (token mới), không
-//      mở port thứ hai, không double fetch.
-//    * T7 (danh mục): plain probe có trần 8s + kiểm tra lại breaker trước biến
-//      thể no-ck — diag v28: 'plain ck=3 403 REJECT ms=10471' đốt 10.5s cho
-//      request chắc chắn 403 (breaker bật giữa chừng nhưng probe đã bay).
+//  v29 — TỐI ƯU TỐC ĐỘ theo diag v28 06:31-06:32 (mỗi mục đối chiếu dòng log + dòng code):
+//    * S1 (proxy, ~5s/request): realPlaylistSeen chỉ được GHI, không nơi nào ĐỌC ->
+//      proxy luôn waitForRecipe() tối đa 5s cho mọi request chưa nằm trong cache, mà
+//      recipe chỉ học từ URL '/chunks/' còn manifest giải mã dùng '/hls/*.ts?e='.
+//      Diag: 0 dòng SEG-RECIPE / SEG-REQ / "recipe sẵn sàng"; "ttfb" trong log đo từ
+//      đầu request (gồm cả chờ) tới hết body: 5576ms (16 byte), 6016ms (2.4MB).
+//      Fix: proxy tự biết manifest có '/chunks/' hay không (recipeNeeded), không thì bỏ chờ.
+//    * S2 (hook, 8s): cửa sổ quan sát '/chunks/' 8s trong tryHookFlow cũng chỉ chờ URL
+//      '/chunks/' -> diag 06:32:01.124 -> 06:32:09.135 = 8.0s rồi "player chưa fetch
+//      segment trong 8s". Fix: manifest không có '/chunks/' -> đăng ký ngay.
+//    * S3: prefetch đang chạy đúng segment ExoPlayer vừa hỏi -> proxy ĐỢI nó (tối đa
+//      4s) thay vì bắn request thứ 2; warm-prefetch 3 segment đầu ngay khi có manifest.
+//    * W1 (WVDom treo tới timeout): handler bỏ poll khi DOM không đổi TRƯỚC khi xét
+//      điều kiện "đủ poll" -> trang xem ổn định sớm thì không bao giờ được nhận (diag
+//      06:31:26-06:31:43: watch meitantei chỉ có poll#1-#3, giữ cfMutex ~17s; poll#77
+//      vẫn chạy lúc 06:32:28). Fix: luôn xét lại điều kiện sau mỗi poll.
+//    * W2: hasPlayerFrame = html.contains("googleapiscdn") khớp chuỗi BẤT KỲ trong DOM
+//      -> nhận ở poll#1 nhưng Step1 iframes=0 (06:31:56.348 -> .358) -> nạp lại R5
+//      1.6s. Fix: yêu cầu thẻ <iframe> thật có src/data-src chứa googleapiscdn.
+//    * W3 (rò rỉ WebView): finally dùng withContext(Main) không NonCancellable -> coroutine
+//      đã huỷ thì destroy() không chạy, WebView + vòng poll JS sống tiếp (poll#77 ở
+//      trên). Fix: NonCancellable ở webviewDocCapture / tryHookFlow / ajaxPlayerViaWebView.
+//    * W4 (hàng đợi): bỏ cfMutex (ép 1 WebView/lần); wvGate(2) vẫn giới hạn 2 song song.
+//      Diag 06:31:18-06:31:54: 3 load() + search xếp hàng nối đuôi sau 1 capture treo.
+//    * F1 (plain): timeout cứng 4s/lần (diag: plain ck=3 ms=10471 trên "/"); kiểm tra lại
+//      breaker SAU khi lấy gate (diag 06:31:09-10: 2 URL vẫn bắn ck+no-ck sau khi breaker
+//      bật lúc 06:31:08.68); bỏ no-ck khi 403-gate vừa tắt plain.
+//    * L1 (load): nạp trang xem SONG SONG với trang chi tiết (diag: 6/6 trang chi tiết
+//      "list-server eps=+0" -> luôn phải nạp trang xem nối tiếp).
+//    * L2 (loadLinks): nạp trang xem SONG SONG với Step0/Step0w (diag: S0:0 | S0w:0).
+//    * L3 (Step0w): fetch() dùng location.origin — WVDom page-start cho thấy trang chạy ở
+//      animevietsub.news còn mainUrl = animevietsub.sale -> khác origin (nguyên nhân khả dĩ
+//      của Step0w len=30; nội dung body: không đủ dữ liệu để xác minh).
+//    * Cờ AVS_FAST_PLAY = false khôi phục đúng hành vi đợi recipe của v28 (S1+S2+S3).
+// AnimeVsub v28 (2026-10-30): CloudStream provider cho https://animevietsub.sale
 //  v28 — vá theo diag v27 05:40 (load NHANH được giữ nguyên, phát video gãy lại):
 //    * R1 (2004): CHẶN RAW playlist ở MỌI cửa đăng ký. Raw = body có '_t=' —
 //      quy ước của chính loader site (AVS_REAL_PL_JS chỉ nhận output giải mã
@@ -213,7 +219,6 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
@@ -319,6 +324,13 @@ class AnimeVsubProvider : MainAPI() {
     //       đọc) thì diag sau sẽ thấy tên header thật, không đoán.
     private val AVS_BUILD = "v29"
 
+    // v29: true = bỏ các khoảng chờ recipe vô ích khi manifest KHÔNG chứa '/chunks/'
+    // (hook 8s + proxy 5s/request) — xem header v29 S1-S3. false = hành vi v28.
+    private val AVS_FAST_PLAY = true
+
+    // v29 (F1): trần thời gian 1 request plain HTML.
+    private val PLAIN_TIMEOUT_MS = 4_000L
+
     // Preflight probe segment đầu rồi trim playlist (kỹ thuật NguonC v9) — để OFF
     // vì chưa biết CDN của site có chặn segment đầu kiểu streamaaa0000.png không.
     // Khi bật: probe 3 segment đầu, nếu 0 OK và >0 OK từ segment sau -> trim.
@@ -377,10 +389,6 @@ class AnimeVsubProvider : MainAPI() {
     @Volatile private var plainHtmlDeadUntilMs = 0L
     private val PLAIN_DEAD_THRESHOLD = 3
     private val PLAIN_DEAD_COOLDOWN_MS = 10 * 60 * 1000L
-    // v29 (T7): trần mỗi probe plain — diag v28 06:31:17: 'plain ck=3 403 REJECT
-    // ms=10471' (server treo 10.5s rồi mới trả 403) đốt trọn 1/3 thời gian màn
-    // hình chủ. Trần 8s đủ cho phản hồi thật (200/403 nhanh), chặn treo lâu.
-    private val PLAIN_PROBE_TIMEOUT_MS = 8_000L
 
     // v12: tối đa 2 WebView DOM capture song song — log 27-10 05:34 thấy 3 WVDom
     // spawn trong 100ms; dội hàng loạt WebView cùng lúc là thứ khiến origin
@@ -388,12 +396,6 @@ class AnimeVsubProvider : MainAPI() {
     private val wvGate = java.util.concurrent.Semaphore(2)
     private val inflightLock = Any()
     private val inflightDocs = HashMap<String, kotlinx.coroutines.CompletableDeferred<Document>>()
-
-    // v29 (T5): khóa single-flight loadLinks theo watchUrl — CloudStream đôi khi
-    // gọi loadLinks 2 luồng chèo chéo cho cùng trang xem (diag v28 06:31: hai
-    // SUMMARY ms≈15071/14824 song song -> 2 hook -> 2 proxy -> fetch trùng).
-    private val loadLinksInflight =
-        java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Boolean>>()
 
     // Host rác không bao giờ là embed player.
     private val junkHosts = listOf(
@@ -650,6 +652,15 @@ class AnimeVsubProvider : MainAPI() {
         return try { Regex("""data-id=""").findAll(html).count() } catch (_: Throwable) { 0 }
     }
 
+    // v29 (W2): iframe player THẬT trong DOM — không phải chuỗi "googleapiscdn" xuất
+    // hiện ở bất kỳ đâu (script/link). Diag 06:31:56: poll#1 khớp chuỗi, iframes=0.
+    private val playerIframeRegex = Regex(
+        """<iframe[^>]+(?:src|data-src)\s*=\s*["']?[^"'>\s]*googleapiscdn""",
+        RegexOption.IGNORE_CASE
+    )
+    private fun hasPlayerIframe(html: String): Boolean =
+        html.contains("googleapiscdn") && playerIframeRegex.containsMatchIn(html)
+
     /** Lưu cookie từ CookieManager (clearance của WebView) vào cfCookieCache
      *  để plain HTTP dùng lại. LƯU Ý: cf_clearance gắn với UA của WebView —
      *  webviewDocCapture đặt UA trùng USER_AGENT để plain HTTP tái sử dụng được. */
@@ -692,10 +703,18 @@ class AnimeVsubProvider : MainAPI() {
         val t0 = System.currentTimeMillis()
         val tag = if (cookies != null) "ck=${cookies.size}" else "no-ck"
         try {
-            val resp = if (cookies != null) {
-                app.get(url, headers = commonHeaders, cookies = cookies)
-            } else {
-                app.get(url, headers = commonHeaders)
+            // v29 (F1): trần 4s — diag v28 06:31:07: plain ck=3 trên "/" mất 10471ms
+            // rồi vẫn 403; WebView lấy cùng trang trong ~1s.
+            val resp = withTimeoutOrNull(PLAIN_TIMEOUT_MS) {
+                if (cookies != null) {
+                    app.get(url, headers = commonHeaders, cookies = cookies)
+                } else {
+                    app.get(url, headers = commonHeaders)
+                }
+            }
+            if (resp == null) {
+                nlog("[Fetch] plain $tag TIMEOUT ${PLAIN_TIMEOUT_MS}ms (v29 F1) $url")
+                return null
             }
             val html = resp.text
             // v3: CHỈ nhận 2xx — log thật: Cloudflare trả 403/520 kèm trang challenge
@@ -838,19 +857,16 @@ class AnimeVsubProvider : MainAPI() {
             // GATE TOÀN CỤC — tối đa 3 chuỗi plain song song + jitter 150-450ms.
             while (!fetchGate.tryAcquire()) kotlinx.coroutines.delay(60)
             try {
-                kotlinx.coroutines.delay(fetchRand.nextLong(150, 450))
-                // v29 (T7): probe plain có trần 8s + kiểm tra lại breaker trước
-                // biến thể no-ck (diag v28: probe đầu treo 10.5s trong lúc breaker
-                // bật giữa chừng -> biến thể no-ck vẫn bay tiếp vô ích).
-                var doc: Document? = if (cachedCookies != null)
-                    withTimeoutOrNull(PLAIN_PROBE_TIMEOUT_MS) { tryPlainDoc(url, cachedCookies) } else null
-                if (doc == null) {
-                    if (System.currentTimeMillis() >= plainHtmlDeadUntilMs) {
-                        doc = withTimeoutOrNull(PLAIN_PROBE_TIMEOUT_MS) { tryPlainDoc(url, null) }
-                    } else {
-                        nlog("[Fetch] plain no-ck bỏ (breaker vừa bật giữa chừng) $url")
-                    }
-                }
+                // v29 (F1): breaker có thể vừa bật trong lúc đợi gate (diag v28
+                // 06:31:09-10: hai URL vẫn bắn ck + no-ck sau khi breaker bật lúc
+                // 06:31:08.68) -> kiểm tra lại, bỏ jitter + plain nếu đã tắt.
+                val deadNow = System.currentTimeMillis() < plainHtmlDeadUntilMs
+                if (!deadNow) kotlinx.coroutines.delay(fetchRand.nextLong(150, 450))
+                val viaCk = if (!deadNow && cachedCookies != null) tryPlainDoc(url, cachedCookies) else null
+                // v29: 403-gate trên request có cookie vừa tắt plain -> request không
+                // cookie chắc chắn 403 (diag: 'ck=3 403' luôn kèm 'no-ck 403').
+                val doc = viaCk ?: if (deadNow || System.currentTimeMillis() < plainHtmlDeadUntilMs) null
+                                   else tryPlainDoc(url, null)
                 if (doc != null) {
                     if (hostOf(url) == hostOf(mainUrl)) {
                         plainDeadStreak.set(0)
@@ -859,7 +875,7 @@ class AnimeVsubProvider : MainAPI() {
                     if (useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
                     return doc
                 }
-                if (hostOf(url) == hostOf(mainUrl)) {
+                if (!deadNow && hostOf(url) == hostOf(mainUrl)) {
                     val n = plainDeadStreak.incrementAndGet()
                     val nowMs = System.currentTimeMillis()
                     if (n >= PLAIN_DEAD_THRESHOLD && nowMs >= plainHtmlDeadUntilMs) {
@@ -876,11 +892,12 @@ class AnimeVsubProvider : MainAPI() {
         //    bị HẠ xuống cuối chuỗi; breaker không còn quyền chặn tầng WebView. ──
         nlog("[Fetch] plain dead (403/520) -> webview-first mode=$mode $url")
 
-        // ── 3. WebView DOM capture im lặng (serialized qua cfMutex) ──
+        // ── 3. WebView DOM capture im lặng (v29 W4: KHÔNG còn serialize qua cfMutex —
+        //    wvGate giới hạn 2 WebView song song; dedupe in-flight lo trùng URL) ──
         //    v4: WebViewResolver cũ trả RAW HTML TRƯỚC KHI JS render — log 25-10
         //    11:09: webview "OK" nhưng 0 link /phim/ -> 0 items mọi danh mục.
         //    Giờ: WebView tự quản, poll DOM mỗi 0.8s, chỉ nhận khi có dữ liệu phim.
-        val silent = cfMutex.withLock {
+        val silent = run {
             // Ai đó có thể đã fetch xong trong lúc ta chờ lock.
             if (useCache) {
                 docCache[url]?.let { cached ->
@@ -890,7 +907,7 @@ class AnimeVsubProvider : MainAPI() {
                             docCache.remove(url)
                             nlog("[Fetch] cache-drop (trang lỗi 5xx) $url")
                         } else {
-                            return@withLock cached.doc
+                            return@run cached.doc
                         }
                     }
                 }
@@ -904,7 +921,7 @@ class AnimeVsubProvider : MainAPI() {
                 fresh != null && fresh != cachedCookies) {
                 tryPlainDoc(url, fresh)?.let {
                     if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
-                    return@withLock it
+                    return@run it
                 }
             }
 
@@ -1468,7 +1485,7 @@ class AnimeVsubProvider : MainAPI() {
                           p.append('play', '${jsq(srv.play)}');
                           p.append('link', '${jsq(srv.hash)}');
                           p.append('backuplinks', '1');
-                          fetch('$mainUrl/ajax/player', {
+                          fetch(location.origin + '/ajax/player', {
                             method: 'POST',
                             credentials: 'include',
                             headers: {'X-Requested-With': 'XMLHttpRequest'},
@@ -1500,7 +1517,7 @@ class AnimeVsubProvider : MainAPI() {
             nlogE("[Step0w]", e)
             return null
         } finally {
-            try { withContext(Dispatchers.Main) { webView?.destroy() } } catch (_: Throwable) {}
+            try { withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) { webView?.destroy() } } catch (_: Throwable) {}
         }
     }
 
@@ -1511,8 +1528,21 @@ class AnimeVsubProvider : MainAPI() {
     //  Nếu trang chi tiết không có link tập, fallback dựng từ "Số tập" info.
     // ═══════════════════════════════════════════════════════════════════════════
 
-    override suspend fun load(url: String): LoadResponse {
+    override suspend fun load(url: String): LoadResponse = coroutineScope {
         val detail = detailUrl(url) ?: url
+        // v29 (L1): nạp TRANG XEM song song với trang chi tiết. Diag v28: 6/6 trang chi
+        // tiết "list-server eps=+0" -> luôn phải nạp trang xem NỐI TIẾP (+0.75-1.8s/phim).
+        // Chi tiết đã có tập (hiếm) -> huỷ job bên dưới.
+        val watchGuess = detail.trimEnd('/') + "/xem-phim.html"
+        val watchJob = async {
+            try {
+                fetchDoc(watchGuess, useCache = false, mode = MODE_EPISODES)
+            } catch (e: Throwable) {
+                if (isCancellation(e)) throw e
+                nlogE("[Load] watch-page", e, watchGuess)
+                null
+            }
+        }
         val doc = try {
             fetchDoc(detail, mode = MODE_DETAIL)
         } catch (e: Throwable) {
@@ -1593,15 +1623,18 @@ class AnimeVsubProvider : MainAPI() {
         // v7: trang chi tiết không có danh sách tập — site render tập ở TRANG XEM.
         // Nạp trang xem (MODE_EPISODES: WVDom đợi #list-server render tập) rồi parse.
         if (epOrder.isEmpty()) {
-            val watchGuess = detail.trimEnd('/') + "/xem-phim.html"
             try {
-                val wdoc = fetchDoc(watchGuess, useCache = false, mode = MODE_EPISODES)
-                val addedWatch = parseOphimEpisodes(wdoc, detail, epOrder, epMeta)
-                nlog("[Load] watch-page eps=+$addedWatch total=${epOrder.size} meta=${epMeta.size} $watchGuess")
+                val wdoc = watchJob.await()
+                if (wdoc != null) {
+                    val addedWatch = parseOphimEpisodes(wdoc, detail, epOrder, epMeta)
+                    nlog("[Load] watch-page eps=+$addedWatch total=${epOrder.size} meta=${epMeta.size} $watchGuess")
+                }
             } catch (e: Throwable) {
                 if (isCancellation(e)) throw e
                 nlogE("[Load] watch-page", e, watchGuess)
             }
+        } else {
+            watchJob.cancel()
         }
 
         nlog("[Load] $detail title='$title' tags=${tags.size} eps=${epOrder.size} totalEps=$totalEps")
@@ -1631,7 +1664,7 @@ class AnimeVsubProvider : MainAPI() {
             }
         }.sortedBy { it.episode ?: Int.MAX_VALUE }
 
-        return newTvSeriesLoadResponse(title, detail, TvType.Anime, episodes) {
+        newTvSeriesLoadResponse(title, detail, TvType.Anime, episodes) {
             this.posterUrl = poster.takeIf { it.isNotBlank() }
             this.plot      = plot.takeIf { it.isNotBlank() }
             this.tags      = tags
@@ -1712,28 +1745,6 @@ class AnimeVsubProvider : MainAPI() {
             watchUrl = watchUrl.trimEnd('/') + "/xem-phim.html"
         }
         nlog("[loadLinks] watch=$watchUrl")
-
-        // v29 (T5): single-flight loadLinks theo watchUrl — CloudStream đôi khi
-        // gọi 2 luồng chèo chéo cho CÙNG trang xem (diag v28: 2 SUMMARY ms≈15071
-        // + 14824 song song -> 2 hook WebView -> 2 proxy port 44155/41385 -> 2
-        // luồng fetch cùng segment). Luồng sau JOIN luồng trước, trả cùng kết
-        // quả; luồng trước xong thì thoát ngay không chạy lại gì cả.
-        val llKey = watchUrl.substringBefore("#avs=").trim()
-        val llExisting: kotlinx.coroutines.CompletableDeferred<Boolean>? =
-            synchronized(loadLinksInflight) { loadLinksInflight[llKey] }
-        if (llExisting != null) {
-            nlog("[loadLinks] join in-flight (v29 T5) watch=$watchUrl")
-            val r = try { llExisting.await() } catch (e: Throwable) {
-                if (isCancellation(e)) throw e
-                false
-            }
-            nlog("[loadLinks] join xong result=$r watch=$watchUrl")
-            return r
-        }
-        val llMine = kotlinx.coroutines.CompletableDeferred<Boolean>()
-        synchronized(loadLinksInflight) { loadLinksInflight[llKey] = llMine }
-
-        try {
         ntoastV("AnimeVsub $AVS_BUILD: đang lấy link…")
 
         // v5: site đang chết (breaker bật) — đừng đốt 4 step ~120s khiến player
@@ -1755,10 +1766,8 @@ class AnimeVsubProvider : MainAPI() {
                     // v12: tôn trọng plain-breaker — đừng đốt thêm 2 request 403 vô ích
                     if (System.currentTimeMillis() >= plainHtmlDeadUntilMs) {
                         val ck = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
-                        // v29 (T7): trần 8s/probe như fetchDocChain (diag v28: probe
-                        // treo 10.5s chặn toàn loadLinks trước cả Step0).
-                        watchDoc = (if (ck != null) withTimeoutOrNull(PLAIN_PROBE_TIMEOUT_MS) { tryPlainDoc(watchUrl, ck) } else null)
-                            ?: withTimeoutOrNull(PLAIN_PROBE_TIMEOUT_MS) { tryPlainDoc(watchUrl, null) }
+                        watchDoc = (if (ck != null) tryPlainDoc(watchUrl, ck) else null)
+                            ?: tryPlainDoc(watchUrl, null)
                     }
                     if (watchDoc != null) {
                         noteSiteOk()
@@ -1780,6 +1789,19 @@ class AnimeVsubProvider : MainAPI() {
                     if (srvList.isNotEmpty()) nlog("[Step1p] watch-page meta servers=${srvList.size} eps=${tmpOrder.size}")
                 }
             }
+
+            // v29 (L2): nạp TRANG XEM song song với Step0/Step0w. Diag v28: S0:0 | S0w:0
+            // (2.1s) rồi mới bắt đầu nạp trang xem. Step0/0f/0w thành công -> huỷ bên dưới.
+            val watchPrefetch: kotlinx.coroutines.Deferred<Document?>? =
+                if (watchDoc == null && !siteDown()) async {
+                    try {
+                        fetchDoc(watchUrl, useCache = false, mode = MODE_DETAIL)
+                    } catch (e: Throwable) {
+                        if (isCancellation(e)) throw e
+                        nlogE("[Step1pre]", e, watchUrl)
+                        null
+                    }
+                } else null
 
             // ═══ STEP 0: POST ajax/player — API chính chủ CMS OPhim. Thử TỪNG MÁY
             //  CHỦ trong metadata (fragment #avs= hoặc trang xem pre-fetch); thành
@@ -1865,11 +1887,18 @@ class AnimeVsubProvider : MainAPI() {
                 stepNotes.add("S0w:${if (linkFound) "HIT" else "0"}")
             }
 
+            if (linkFound) watchPrefetch?.cancel()   // v29 (L2)
+
             // ═══ STEP 1: HTML trang xem (pre-fetch ở trên; hụt thì fetchDoc đầy
             //  đủ chain: proxy -> WVDom -> gate) ═══
             if (!linkFound) {
                 try {
-                    val doc = watchDoc ?: fetchDoc(watchUrl, useCache = false, mode = MODE_DETAIL).also { watchDoc = it }
+                    // v29 (L2): dùng kết quả nạp song song nếu có (null = lỗi đã log ở Step1pre).
+                    val doc = watchDoc
+                        ?: (if (watchPrefetch != null) watchPrefetch.await()
+                            else fetchDoc(watchUrl, useCache = false, mode = MODE_DETAIL))
+                            ?.also { watchDoc = it }
+                        ?: throw ErrorLoadingException("AnimeVsub: không nạp được trang xem")
                     val html = doc.outerHtml()
 
                     val (m3u8s, mp4s) = harvestMediaUrls(html)
@@ -2038,12 +2067,6 @@ class AnimeVsubProvider : MainAPI() {
             ntoast("AnimeVsub $AVS_BUILD: không lấy được link — xem animevsub_diag.txt")
         }
         return linkFound
-        } finally {
-            // v29 (T5): báo kết quả cho luồng JOIN + giải phóng khóa in-flight
-            // (finally chạy cả khi return sớm/exception — luồng join không treo).
-            if (!llMine.isCompleted) llMine.complete(linkFound)
-            synchronized(loadLinksInflight) { if (loadLinksInflight[llKey] === llMine) loadLinksInflight.remove(llKey) }
-        }
     }
 
     /** Đào 1 embed: HTML -> m3u8/mp4; nếu không thấy, đào iframe lồng thêm 1 cấp. */
@@ -2537,7 +2560,7 @@ class AnimeVsubProvider : MainAPI() {
                     val t0Real = System.currentTimeMillis()
                     var chosen = recv
                     while (System.currentTimeMillis() - t0Real < 6_000) {
-                        kotlinx.coroutines.delay(300)
+                        kotlinx.coroutines.delay(100)
                         val maybe = try { captures.tryReceive().getOrNull() } catch (_: Throwable) { null }
                         if (maybe != null) {
                             val (u2, b2) = maybe
@@ -2606,13 +2629,37 @@ class AnimeVsubProvider : MainAPI() {
                         lastKickAtMs = System.currentTimeMillis()
                         withContext(Dispatchers.Main) { webView?.evaluateJavascript(AVS_KICK_JS, null) }
                     } catch (_: Throwable) {}
-                    // (2) v29 (T1): ĐĂNG KÝ NGAY khi có manifest giải mã — diag
-                    // v28: chờ player fetch segment 8s TRƯỚC đăng ký = 8s trên
-                    // loadLinks ms=15071 (dùng manifest THẬT 06:32:01 -> Register
-                    // 06:32:09). Manifest giải mã mang đủ e= token, OKHTTP +
-                    // referer phát được ngay (diag: OKHTTP OK bytes=2435552) nên
-                    // recipe chuyển sang HỌC NỀN (3) — không chặn link; F6
-                    // (waitForRecipe khi fetch seg) vẫn là lưới an toàn.
+                    // (2) chờ request /chunks/ (tối đa 8s — v16: recipe học liên tục
+                    // nên kể cả tới muộn hơn, proxy vẫn chờ recipe ở F6)
+                    // v29 (S2): recipe chỉ học được từ URL '/chunks/'. Manifest giải mã dùng
+                    // '/hls/*.ts?e=' -> chờ 8s là vô ích (diag 06:32:01.124 -> 06:32:09.135).
+                    val obsMaxMs = if (AVS_FAST_PLAY && !capBodyP.contains("/chunks/")) 0L else 8_000L
+                    val obsT0 = System.currentTimeMillis()
+                    var kicks = 1
+                    while (segObservedUrl == null && System.currentTimeMillis() - obsT0 < obsMaxMs) {
+                        kotlinx.coroutines.delay(400)
+                        // đá lại mỗi ~3s — lần play() đầu có thể race với init hls
+                        if (kicks < 4 && System.currentTimeMillis() - obsT0 > 3_000L * kicks) {
+                            kicks++
+                            try {
+                                withContext(Dispatchers.Main) { webView?.evaluateJavascript(AVS_KICK_JS, null) }
+                            } catch (_: Throwable) {}
+                        }
+                    }
+                    if (segObservedUrl != null) buildSegRecipe()
+                    else if (obsMaxMs == 0L) {
+                        nlog("[Hook] manifest không có '/chunks/' — bỏ cửa sổ chờ recipe 8s, đăng ký ngay (v29 S2)")
+                    } else {
+                        nlog("[Hook] player chưa fetch segment trong 8s — proxy sẽ ĐỢI recipe (F6), không dội method mù")
+                        try {
+                            withContext(Dispatchers.Main) {
+                                webView?.evaluateJavascript(AVS_VIDEO_STATE_JS) { r ->
+                                    nlog("[Hook] video-state ${r?.take(180)}")
+                                }
+                            }
+                        } catch (_: Throwable) {}
+                    }
+                    // (3) đăng ký playlist (recipe sẵn sàng cho direct + proxy)
                     val baseP = Regex("""^(https?://[^/]+/.*/)""").find(capUrlP)?.groupValues?.get(1) ?: ""
                     if (registerM3U8Link(capBodyP, capUrlP, baseP, "Vietsub", callback, siteReferer = targetUrl)) {
                         registered = true
@@ -2628,41 +2675,6 @@ class AnimeVsubProvider : MainAPI() {
                                     webView?.loadUrl("about:blank")
                                 }
                             } catch (_: Throwable) {}
-                        }
-                    }
-                    // (3) v29 (T1): recipe HỌC NỀN — quan sát player tối đa 8s
-                    // (fire-and-forget, không chặn tryHookFlow), đá nhẹ mỗi ~3s;
-                    // học được -> buildSegRecipe cho các seg sau.
-                    // (CoroutineScope riêng — hàm suspend không có receiver scope,
-                    // và fire-and-forget KHÔNG được gắn vào scope của loadLinks:
-                    // loadLinks có thể kết thúc trước khi recipe học xong.)
-                    kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-                        val obsT0 = System.currentTimeMillis()
-                        var kicks = 1
-                        try {
-                            while (segObservedUrl == null && System.currentTimeMillis() - obsT0 < 8_000) {
-                                kotlinx.coroutines.delay(400)
-                                // đá lại mỗi ~3s — lần play() đầu có thể race với init hls
-                                if (kicks < 4 && System.currentTimeMillis() - obsT0 > 3_000L * kicks) {
-                                    kicks++
-                                    try {
-                                        withContext(Dispatchers.Main) { webView?.evaluateJavascript(AVS_KICK_JS, null) }
-                                    } catch (_: Throwable) {}
-                                }
-                            }
-                            if (segObservedUrl != null) buildSegRecipe()
-                            else {
-                                nlog("[Hook] recipe nền: player chưa fetch segment trong 8s — F6 sẽ đợi recipe khi seg")
-                                try {
-                                    withContext(Dispatchers.Main) {
-                                        webView?.evaluateJavascript(AVS_VIDEO_STATE_JS) { r ->
-                                            nlog("[Hook] video-state ${r?.take(180)}")
-                                        }
-                                    }
-                                } catch (_: Throwable) {}
-                            }
-                        } catch (e: Throwable) {
-                            if (!isCancellation(e)) nlogE("[Hook] recipe nền", e)
                         }
                     }
                 }
@@ -2695,8 +2707,9 @@ class AnimeVsubProvider : MainAPI() {
             // v15: WebView đã nhận nuôi làm relay thì KHÔNG hủy — ngữ cảnh player
             // là tài nguyên fetch segment; dọn bởi idle-check 14 phút.
             if (!adoptedRelay) {
-                try { withContext(Dispatchers.Main) { dialog?.dismiss() } } catch (_: Throwable) {}
-                try { withContext(Dispatchers.Main) { webView?.destroy() } } catch (_: Throwable) {}
+                // v29 (W3): NonCancellable — xem webviewDocCapture.
+                try { withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) { dialog?.dismiss() } } catch (_: Throwable) {}
+                try { withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) { webView?.destroy() } } catch (_: Throwable) {}
             }
         }
     }
@@ -2788,31 +2801,53 @@ class AnimeVsubProvider : MainAPI() {
 
                 var lastSig = ""
                 var pollIdx = 0
+                var lastCards = 0
+                var lastXem = 0
+                var lastEps = 0
+                // v28 (R4): trang XEM — iframe player thường do JS inject SAU khi list
+                // tập render (diag v27 05:40:27: poll#1 eps=4 nhận sớm -> DOM cache
+                // KHÔNG có iframe -> Step1 iframes=0 -> 2004). Đợi tối đa ~3 poll (~2.4s)
+                // cho iframe player vào DOM; có iframe hoặc đủ 4 poll là nhận.
+                // v29 (W1+W2): tách thành hàm để xét lại CẢ khi DOM không đổi, và dùng
+                // iframe THẬT thay vì khớp chuỗi.
+                fun domReady(u: String, html: String, blocked: Boolean, cards: Int, xem: Int, eps: Int): Boolean {
+                    val isWatchPage = u.contains("xem-phim")
+                    val hasPlayerFrame = hasPlayerIframe(html)
+                    return !blocked && when (mode) {
+                        MODE_LISTING -> cards > 0
+                        MODE_DETAIL  -> if (isWatchPage) {
+                            (xem > 0 && (hasPlayerFrame || pollIdx >= 4)) || pollIdx >= 10
+                        } else xem > 0 || cards > 0 || pollIdx >= 8
+                        MODE_EPISODES -> (eps > 0 && (hasPlayerFrame || pollIdx >= 4)) || pollIdx >= 10
+                        else         -> pollIdx >= 4 || cards > 0 || xem > 0
+                    }
+                }
                 wv.addJavascriptInterface(AvsGateBridge { u, html ->
                     if (done.isCompleted) return@AvsGateBridge
                     pollIdx++
                     val sig = html.length.toString() + ":" + html.take(120).hashCode()
-                    // v29 (T2): DOM KHÔNG ĐỔI không còn bị skip nguyên cụm — v28
-                    // return ngay tại sig == lastSig nên phép đánh giá `ready`
-                    // không bao giờ chạy lại: trang xem DOM tĩnh thiếu iframe
-                    // (pollIdx >= 4 không bao giờ được xét) treo tới timeout ~60s
-                    // (diag v28: poll#77) và giữ cfMutex chặn mọi fetch WebView
-                    // khác. Giờ: tính chỉ số + xét ready MỖI poll, chỉ LOG khi
-                    // DOM đổi (chống tràn diag).
-                    val domChanged = sig != lastSig
-                    if (domChanged) lastSig = sig
+                    if (sig == lastSig) {
+                        // v29 (W1): DOM không đổi nhưng pollIdx vẫn tăng — v28 return ở đây
+                        // nên điều kiện "đủ poll" không bao giờ được xét lại -> treo tới
+                        // timeout (diag: watch meitantei dừng ở poll#3 rồi im).
+                        val lh = lastHtml
+                        if (lh != null && domReady(u, lh, lastBlocked, lastCards, lastXem, lastEps)) {
+                            saveCfCookiesFromManager("WVDom")
+                            try { wv.stopLoading() } catch (_: Throwable) {}
+                            done.complete(Jsoup.parse(lh, u))
+                        }
+                        return@AvsGateBridge
+                    }
+                    lastSig = sig
                     val blocked = looksBlocked(html)
                     val srvErr = looksServerError(html)
                     val cards = countPhimAnchors(html)
                     val xem = countXemPhim(html)
                     val eps = countEpisodeAnchors(html)
-                    if (domChanged) {
-                        nlog("[WVDom] poll#$pollIdx len=${html.length} blocked=$blocked srvErr=$srvErr cards=$cards xem=$xem eps=$eps ${u.take(70)}")
-                    }
+                    nlog("[WVDom] poll#$pollIdx len=${html.length} blocked=$blocked srvErr=$srvErr cards=$cards xem=$xem eps=$eps ${u.take(70)}")
                     // v5: trang lỗi 5xx — dừng capture NGAY, không bao giờ trả/cache
                     // DOM lỗi (trước đây: TIMEOUT "DOM sạch" len=888812 = trang lỗi -> cache).
-                    // v29 (T2): chỉ xét khi DOM đổi — poll lặp không đếm lại breaker.
-                    if (domChanged && srvErr) {
+                    if (srvErr) {
                         noteServerError("WVDom", u)
                         sawSrvErr = true
                         try { wv.stopLoading() } catch (_: Throwable) {}
@@ -2822,46 +2857,23 @@ class AnimeVsubProvider : MainAPI() {
                     // v12: trang 404 / "Tên miền tạm thời bị chặn" — site tự redirect
                     // slug chết sang /404 (evidence 27-10 05:34:22, đợi nguyên timeout
                     // 22s vô ích). Trả null NGAY để caller thử candidate kế.
-                    if (domChanged && (u.endsWith("/404") || html.contains("Tên miền tạm thời bị chặn"))) {
+                    if (u.endsWith("/404") || html.contains("Tên miền tạm thời bị chặn")) {
                         nlog("[WVDom] 404/tên-miền-bị-chặn — trả null ngay $u")
                         try { wv.stopLoading() } catch (_: Throwable) {}
                         if (!done.isCompleted) done.complete(null)
                         return@AvsGateBridge
                     }
-                    if (domChanged && (cards > 0 || xem > 0)) noteSiteOk()
-                    if (domChanged) {
-                        lastHtml = html
-                        lastBlocked = blocked
-                    }
-                    // v28 (R4): trang XEM — iframe player thường do JS inject SAU
-                    // khi list tập render (diag v27 05:40:27: poll#1 eps=4 nhận sớm
-                    // -> DOM cache KHÔNG có iframe -> Step1 iframes=0 -> chỉ bắt
-                    // được raw playlist -> 403 -> 2004). Trang xem giờ đợi thêm
-                    // tối đa ~3 poll (~2.4s) cho iframe player vào DOM; có iframe
-                    // hoặc đủ 4 poll là nhận — không treo quá 10 poll như cũ.
-                    val isWatchPage = u.contains("xem-phim")
-                    val hasPlayerFrame = html.contains("googleapiscdn")
-                    val ready = !blocked && when (mode) {
-                        MODE_LISTING -> cards > 0
-                        MODE_DETAIL  -> if (isWatchPage) {
-                            (xem > 0 && (hasPlayerFrame || pollIdx >= 4)) || pollIdx >= 10
-                        } else xem > 0 || cards > 0 || pollIdx >= 8
-                        MODE_EPISODES -> (eps > 0 && (hasPlayerFrame || pollIdx >= 4)) || pollIdx >= 10
-                        else         -> pollIdx >= 4 || cards > 0 || xem > 0
-                    }
+                    if (cards > 0 || xem > 0) noteSiteOk()
+                    lastHtml = html
+                    lastBlocked = blocked
+                    lastCards = cards
+                    lastXem = xem
+                    lastEps = eps
+                    val ready = domReady(u, html, blocked, cards, xem, eps)
                     if (ready) {
                         saveCfCookiesFromManager("WVDom")
                         try { wv.stopLoading() } catch (_: Throwable) {}
                         done.complete(Jsoup.parse(html, u))
-                        return@AvsGateBridge
-                    }
-                    // v29 (T2): cap cứng 60 poll (~50s) — chưa ready thì trả DOM
-                    // sạch cuối cùng (nếu có), tuyệt đối không giữ cfMutex vô hạn.
-                    if (!done.isCompleted && pollIdx >= 60) {
-                        val lh = lastHtml
-                        nlog("[WVDom] CAP 60 poll — trả DOM cuối (ready chưa đạt) $u")
-                        try { wv.stopLoading() } catch (_: Throwable) {}
-                        if (lh != null && !lastBlocked) done.complete(Jsoup.parse(lh, u)) else done.complete(null)
                     }
                 }, "__avsGate")
 
@@ -2928,8 +2940,11 @@ class AnimeVsubProvider : MainAPI() {
             }
             return doc
         } finally {
-            try { withContext(Dispatchers.Main) { dialog?.dismiss() } } catch (_: Throwable) {}
-            try { withContext(Dispatchers.Main) { webView?.destroy() } } catch (_: Throwable) {}
+            // v29 (W3): NonCancellable — coroutine đã huỷ thì withContext thường ném
+            // CancellationException NGAY (bị catch nuốt) => destroy() không chạy, WebView
+            // + vòng poll JS sống tiếp (diag: poll#77 sau 61s của capture đã huỷ).
+            try { withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) { dialog?.dismiss() } } catch (_: Throwable) {}
+            try { withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) { webView?.destroy() } } catch (_: Throwable) {}
             wvGate.release()
         }
     }
@@ -3404,52 +3419,20 @@ class AnimeVsubProvider : MainAPI() {
         //  synchronized (critical section). Lock CHỈ quản lý vòng đời server;
         //  phát link thực hiện sau khi đã thoát lock.
         var proxyBase: String? = null
-        // v29 (T6): key nhận dạng playlist từ segment đầu (host + thư mục, bỏ
-        // query vì e= token đổi mỗi lần giải mã manifest).
-        val plKeyNew = (segUrls.firstOrNull() ?: m3u8Url).let { segFirst ->
-            try {
-                val m = Regex("""^(https?://[^/]+/[^?#]*/)""").find(segFirst)
-                if (m != null) m.groupValues[1] else segFirst
-            } catch (_: Throwable) { segFirst }
-        }
         synchronized(activeServers) {
-            // v29 (T6): proxy sống cùng playlist (< 5 phút) -> TÁI DÙNG, cập nhật
-            // m3u8 mới (token e= mới) thay vì mở port thứ hai (diag v28: 2 proxy
-            // 44155/41385 fetch trùng segment — bytes=16 x2 cùng thời điểm).
-            val reuse = activeServers.firstOrNull { s ->
-                s.isAlive() && s.plKey == plKeyNew &&
-                    System.currentTimeMillis() - s.createdAtMs < 5 * 60_000L
+            while (activeServers.size >= 8) {
+                try { activeServers.removeAt(0).stop() } catch (_: Throwable) {}
             }
-            if (reuse != null) {
-                try {
-                    reuse.setM3U8(rewriteM3U8(trimLeadingSegments(m3u8Content, trim), "http://127.0.0.1:${reuse.port}", m3u8BaseUrl))
-                    proxyBase = "http://127.0.0.1:${reuse.port}"
-                    nlog("[Register] tái dùng proxy port=${reuse.port} cho cùng playlist (v29 T6)")
-                } catch (e: Throwable) {
-                    proxyBase = null
-                    nlogE("[Register] reuse-set", e)
-                }
-            }
-            if (proxyBase == null) {
-                while (activeServers.size >= 8) {
-                    try { activeServers.removeAt(0).stop() } catch (_: Throwable) {}
-                }
-                try {
-                    val server = AvsProxyServer(if (siteReferer.isNotBlank()) listOf(siteReferer, m3u8Url) else listOf(m3u8Url))
-                    server.label = serverName
-                    server.plKey = plKeyNew
-                    server.start()
-                    activeServers.add(server)
-                    proxyBase = "http://127.0.0.1:${server.port}"
-                    server.setM3U8(rewriteM3U8(trimLeadingSegments(m3u8Content, trim), "http://127.0.0.1:${server.port}", m3u8BaseUrl))
-                    // v29 (T3): khởi động nóng — prefetch 2 segment đầu + ấm TLS
-                    // trước khi ExoPlayer vào (TTFB seg đầu 5.5-6s -> ~0ms nếu
-                    // player vào trong ~6s đầu).
-                    try { server.prefetchFirst(2) } catch (_: Throwable) {}
-                } catch (e: Throwable) {
-                    proxyBase = null
-                    nlogE("[Register] bind", e, "không mở được port cục bộ — chỉ dùng link direct")
-                }
+            try {
+                val server = AvsProxyServer(if (siteReferer.isNotBlank()) listOf(siteReferer, m3u8Url) else listOf(m3u8Url))
+                server.label = serverName
+                server.start()
+                activeServers.add(server)
+                proxyBase = "http://127.0.0.1:${server.port}"
+                server.setM3U8(rewriteM3U8(trimLeadingSegments(m3u8Content, trim), "http://127.0.0.1:${server.port}", m3u8BaseUrl))
+            } catch (e: Throwable) {
+                proxyBase = null
+                nlogE("[Register] bind", e, "không mở được port cục bộ — chỉ dùng link direct")
             }
         }
         val proxyEmitBase = proxyBase ?: return true
@@ -3499,14 +3482,8 @@ class AnimeVsubProvider : MainAPI() {
             cache[hostname]?.let { (ts, ips) -> if (now - ts < ttlMs && ips.isNotEmpty()) return ips }
             return try {
                 val ips = okhttp3.Dns.SYSTEM.lookup(hostname)
-                // v29 (T3): IPv4 TRƯỚC IPv6 — diag v27 05:41: connect treo trên
-                // [2606:4700:20…] (IPv6 hỏng trên nhiều mạng VN) đội TTFB seg
-                // thêm ~2s; sắp IPv4 lên trước bỏ được phần treo đó.
-                val sorted = try {
-                    ips.sortedBy { if (it is java.net.Inet4Address) 0 else 1 }
-                } catch (_: Throwable) { ips }
-                if (sorted.isNotEmpty()) cache[hostname] = now to sorted
-                sorted
+                if (ips.isNotEmpty()) cache[hostname] = now to ips
+                ips
             } catch (e: Throwable) {
                 val stale = cache[hostname]?.second
                 if (!stale.isNullOrEmpty()) {
@@ -3531,16 +3508,12 @@ class AnimeVsubProvider : MainAPI() {
         @Volatile var port: Int = -1
             private set
 
-        // v29 (T6): nhận dạng playlist — key = host + thư mục của segment đầu.
-        // 2 đăng ký cùng playlist phải tái dùng CÙNG proxy (diag v28: 2 proxy
-        // port 44155 + 41385 fetch trùng segment cùng lúc).
-        @Volatile var plKey: String = ""
-        val createdAtMs: Long = System.currentTimeMillis()
-        fun isAlive(): Boolean = try { serverSocket?.isClosed == false } catch (_: Throwable) { false }
-
         private var serverSocket: java.net.ServerSocket? = null
         private val threadPool = java.util.concurrent.Executors.newCachedThreadPool()
         @Volatile private var _m3u8: String = ""
+        // v29 (S1): true = manifest có segment '/chunks/' (recipe học được) -> proxy mới
+        // đợi recipe. Mặc định true (an toàn) tới khi setM3U8 đọc được manifest.
+        @Volatile private var recipeNeeded = true
         private val okLogCount = java.util.concurrent.atomic.AtomicInteger(0)
         // v16 (F4): cửa sổ lạnh chuyển TOÀN CỤC (segAuthBackoffGlobalUntil /
         // dnsCooldownUntil ở scope provider) — 2 video chạy cùng lúc không phá
@@ -3584,7 +3557,13 @@ class AnimeVsubProvider : MainAPI() {
                         pendingRange = null
                     }
                 }
-                if (segOrder.isNotEmpty()) nlog("[Proxy] prefetch-map ${segOrder.size} segment (port=$port)")
+                recipeNeeded = !AVS_FAST_PLAY || synchronized(segOrder) {
+                    segOrder.isEmpty() || segOrder.any { it.first.contains("/chunks/") }
+                }
+                if (segOrder.isNotEmpty()) nlog("[Proxy] prefetch-map ${segOrder.size} segment (port=$port) recipeNeeded=$recipeNeeded")
+                // v29 (S3): warm-prefetch 3 segment đầu ngay khi có manifest — không cần
+                // đợi segment đầu xong rồi mới prefetch (v26 chỉ prefetch SAU khi ok).
+                if (!recipeNeeded && segOrder.isNotEmpty()) maybePrefetchSegment(-1, warm = true)
             } catch (e: Throwable) {
                 nlogE("[Proxy] prefetch-map", e)
             }
@@ -3596,64 +3575,48 @@ class AnimeVsubProvider : MainAPI() {
                 segOrder.indexOfFirst { it.first == segUrl && (it.second ?: "") == (curReqRange ?: "") }
             }
 
-        // v29 (T3): lõi prefetch dùng chung — tái dùng cho maybePrefetchSegment
-        // (đuôi playlist) và prefetchFirst (đầu playlist).
-        private fun launchSegPrefetch(u: String, rg: String?) {
-            val key = u + "|" + (rg ?: "")
-            val have = synchronized(segCacheLock) { segCache.containsKey(key) }
-            if (have) return
-            if (!segPrefetchInflight.add(key)) return
-            threadPool.execute {
-                try {
-                    val nowMs = System.currentTimeMillis()
-                    if (nowMs < segAuthBackoffGlobalUntil || nowMs < dnsCooldownUntil) return@execute
-                    val rb = okhttp3.Request.Builder().url(u)
-                        .header("User-Agent", USER_AGENT)
-                        .header("Referer", primaryRef())
-                        .header("Accept", "*/*")
-                        .header("Sec-Fetch-Site", "same-origin")
-                        .header("Sec-Fetch-Mode", "cors")
-                        .header("Sec-Fetch-Dest", "empty")
-                    rg?.let { try { rb.header("Range", it) } catch (_: Throwable) {} }
-                    cookieHeaderFor(u)?.let { rb.header("Cookie", it) }
-                    segClient.newCall(rb.build()).execute().use { resp ->
-                        val ct = resp.header("Content-Type")
-                        if (resp.code in 200..299 && !isBlockedResponse(resp.code, ct)) {
-                            val b = try { resp.body?.bytes() } catch (_: Throwable) { null }
-                            if (b != null && b.isNotEmpty()) {
-                                synchronized(segCacheLock) {
-                                    segCache[key] = Triple(resp.code, resp.header("Content-Range"), b)
-                                    while (segCache.size > 6) {
-                                        val first = segCache.keys.firstOrNull() ?: break
-                                        segCache.remove(first)
+        private fun maybePrefetchSegment(fromIdx: Int, warm: Boolean = false) {
+            if (fromIdx < 0 && !warm) return
+            for (n in 1..3) {
+                val entry = synchronized(segOrder) { segOrder.getOrNull(fromIdx + n) } ?: break
+                val (u, rg) = entry
+                val key = u + "|" + (rg ?: "")
+                val have = synchronized(segCacheLock) { segCache.containsKey(key) }
+                if (have) continue
+                if (!segPrefetchInflight.add(key)) continue
+                threadPool.execute {
+                    try {
+                        val nowMs = System.currentTimeMillis()
+                        if (nowMs < segAuthBackoffGlobalUntil || nowMs < dnsCooldownUntil) return@execute
+                        val rb = okhttp3.Request.Builder().url(u)
+                            .header("User-Agent", USER_AGENT)
+                            .header("Referer", primaryRef())
+                            .header("Accept", "*/*")
+                            .header("Sec-Fetch-Site", "same-origin")
+                            .header("Sec-Fetch-Mode", "cors")
+                            .header("Sec-Fetch-Dest", "empty")
+                        rg?.let { try { rb.header("Range", it) } catch (_: Throwable) {} }
+                        cookieHeaderFor(u)?.let { rb.header("Cookie", it) }
+                        segClient.newCall(rb.build()).execute().use { resp ->
+                            val ct = resp.header("Content-Type")
+                            if (resp.code in 200..299 && !isBlockedResponse(resp.code, ct)) {
+                                val b = try { resp.body?.bytes() } catch (_: Throwable) { null }
+                                if (b != null && b.isNotEmpty()) {
+                                    synchronized(segCacheLock) {
+                                        segCache[key] = Triple(resp.code, resp.header("Content-Range"), b)
+                                        while (segCache.size > 6) {
+                                            val first = segCache.keys.firstOrNull() ?: break
+                                            segCache.remove(first)
+                                        }
                                     }
                                 }
                             }
                         }
+                    } catch (_: Throwable) {
+                    } finally {
+                        segPrefetchInflight.remove(key)
                     }
-                } catch (_: Throwable) {
-                } finally {
-                    segPrefetchInflight.remove(key)
                 }
-            }
-        }
-
-        private fun maybePrefetchSegment(fromIdx: Int) {
-            if (fromIdx < 0) return
-            for (n in 1..3) {
-                val entry = synchronized(segOrder) { segOrder.getOrNull(fromIdx + n) } ?: break
-                launchSegPrefetch(entry.first, entry.second)
-            }
-        }
-
-        // v29 (T3): khởi động nóng ngay sau đăng ký — prefetch 2 segment ĐẦU
-        // playlist để ExoPlayer vào là có sẵn trong cache (TTFB ~0ms thay vì
-        // 5.5-6.6s cold-conn — diag v28 06:32:17 'ttfb=5576ms'), đồng thời ấm
-        // pool TLS của segClient trước khi player bắt đầu.
-        fun prefetchFirst(n: Int) {
-            for (i in 0 until n) {
-                val entry = synchronized(segOrder) { segOrder.getOrNull(i) } ?: break
-                launchSegPrefetch(entry.first, entry.second)
             }
         }
 
@@ -3720,9 +3683,23 @@ class AnimeVsubProvider : MainAPI() {
                         // v26 (P3): segment đã prefetch -> trả ngay từ cache (0ms
                         // network), buffer ExoPlayer luôn dày, hết stall.
                         val cacheKey = segUrl + "|" + (curReqRange ?: "")
-                        val cacheHit: Triple<Int, String?, ByteArray>? = synchronized(segCacheLock) {
+                        val cacheHit0: Triple<Int, String?, ByteArray>? = synchronized(segCacheLock) {
                             segCache[cacheKey]?.let { Triple(it.first, it.second, it.third) }
                         }
+                        // v29 (S3): prefetch ĐÚNG segment này đang chạy -> đợi nó (tối đa
+                        // 4s) thay vì bắn request thứ 2 cùng URL+Range (tốn băng thông,
+                        // và diag 06:32:28 có 404 trên URL segment bị lặp request).
+                        val cacheHit: Triple<Int, String?, ByteArray>? =
+                            if (cacheHit0 == null && segPrefetchInflight.contains(cacheKey)) {
+                                val tw = System.currentTimeMillis()
+                                while (segPrefetchInflight.contains(cacheKey) &&
+                                    System.currentTimeMillis() - tw < 4_000L) {
+                                    try { Thread.sleep(40) } catch (_: Throwable) { break }
+                                }
+                                synchronized(segCacheLock) {
+                                    segCache[cacheKey]?.let { Triple(it.first, it.second, it.third) }
+                                }
+                            } else cacheHit0
                         if (cacheHit != null && cacheHit.third.isNotEmpty()) {
                             val head = StringBuilder(
                                 if (cacheHit.first == 206) "HTTP/1.1 206 Partial Content" else "HTTP/1.1 200 OK"
@@ -3755,7 +3732,8 @@ class AnimeVsubProvider : MainAPI() {
                             // v16 (F6): chưa có recipe -> ĐỢI tối đa 5s (recipe học
                             // liên tục từ F1; diag 20:41: player fetch ở +16.7s, muộn
                             // hơn cửa sổ 8s cũ). KHÔNG dội 4 method mù khi chưa học.
-                            if (segRecipe == null) waitForRecipe()
+                            // v29 (S1): chỉ đợi khi manifest có '/chunks/' (recipe học được)
+                            if (segRecipe == null && recipeNeeded) waitForRecipe()
                             // ── v26 (P1): thứ tự mới theo diag v25 20:18 —
                             // OKHTTP (URL thật từ manifest giải mã, forward Range)
                             // ra quyết định nhanh và ĐÚNG (ttfb 6.6s, 1.1MB OK);
@@ -3946,21 +3924,11 @@ class AnimeVsubProvider : MainAPI() {
                         }
                         false
                     } else {
-                        // v29 (T4): chặn body rác JSON lỗi của CDN (<1KB — diag v28:
-                        // 'OKHTTP OK bytes=16' bị đem làm video, ExoPlayer stall rồi
-                        // phải fetch lại = mất thời gian gấp đôi).
-                        val gLen = try { r.body?.contentLength() ?: -1L } catch (_: Throwable) { -1L }
-                        if (gLen in 1L until 1024L) {
-                            nlog("[Seg] RECIPE body rác ${gLen}B (lỗi CDN, không phải video) — bỏ url=...${url.takeLast(30)}")
-                            noteAuthFail(ct)
-                            false
-                        } else {
-                            val sent = streamOkHttpBody(r, output, crlf)
-                            if (okLogCount.incrementAndGet() <= 40) {
-                                nlog("[Seg] RECIPE OK bytes=$sent ttfb=${System.currentTimeMillis() - t0}ms url=...${url.takeLast(26)}")
-                            }
-                            true
+                        val sent = streamOkHttpBody(r, output, crlf)
+                        if (okLogCount.incrementAndGet() <= 40) {
+                            nlog("[Seg] RECIPE OK bytes=$sent ttfb=${System.currentTimeMillis() - t0}ms url=...${url.takeLast(26)}")
                         }
+                        true
                     }
                 }
             } catch (e: Throwable) {
@@ -4047,15 +4015,6 @@ class AnimeVsubProvider : MainAPI() {
                             return@use false
                         }
                         val body = resp.body ?: return@use false
-                        // v29 (T4): chặn body rác JSON lỗi của CDN (<1KB) — RELAY đã
-                        // có check từ v26 P1b, viaOkHttp thiếu nên 16B rác lọt
-                        // thành video (diag v28 06:32:17 bytes=16).
-                        val gLen = body.contentLength()
-                        if (gLen in 1L until 1024L) {
-                            nlog("[Seg] OKHTTP body rác ${gLen}B (lỗi CDN, không phải video) — bỏ url=...${segUrl.takeLast(30)}")
-                            noteAuthFail(ct)
-                            return@use false
-                        }
                         val head = StringBuilder("HTTP/1.1 200 OK").append(crlf)
                             .append("Content-Type: video/mp2t").append(crlf)
                             .append("Access-Control-Allow-Origin: *").append(crlf)
@@ -4117,13 +4076,6 @@ class AnimeVsubProvider : MainAPI() {
                         return false
                     }
                     val body = resp.body ?: return false
-                    // v29 (T4): chặn body rác như viaOkHttp.
-                    val gLen = body.contentLength()
-                    if (gLen in 1L until 1024L) {
-                        nlog("[Seg] OKHTTP-ORIGIN body rác ${gLen}B (lỗi CDN, không phải video) — bỏ url=...${segUrl.takeLast(30)}")
-                        noteAuthFail(ct)
-                        return false
-                    }
                     val head = StringBuilder("HTTP/1.1 200 OK").append(crlf)
                         .append("Content-Type: video/mp2t").append(crlf)
                         .append("Access-Control-Allow-Origin: *").append(crlf)
