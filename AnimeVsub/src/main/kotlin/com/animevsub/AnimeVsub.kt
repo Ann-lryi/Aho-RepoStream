@@ -43,7 +43,7 @@ class AnimeVsubProvider : MainAPI() {
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 
-    private val AVS_BUILD = "v31"
+    private val AVS_BUILD = "v32"
 
     private val AVS_FAST_REAL_PLAY = true
     private val REAL_STARTUP_GRACE_MS = 1_200L
@@ -64,6 +64,7 @@ class AnimeVsubProvider : MainAPI() {
     private val MODE_DETAIL = 1
     private val MODE_LOOSE = 2
     private val MODE_EPISODES = 3
+    private val MODE_PLAY = 4
 
     private val commonHeaders = mapOf(
         "User-Agent"      to USER_AGENT,
@@ -147,6 +148,7 @@ class AnimeVsubProvider : MainAPI() {
     }
 
     private val wvGate = java.util.concurrent.Semaphore(2)
+    private val playWvGate = java.util.concurrent.Semaphore(1)
     private val inflightLock = Any()
     private val inflightDocs = HashMap<String, kotlinx.coroutines.CompletableDeferred<Document>>()
 
@@ -187,8 +189,19 @@ class AnimeVsubProvider : MainAPI() {
         } catch (_: Throwable) {}
     }
 
+    private val diagUrlQuery = Regex("""(?i)(https?://[^\s|"'<>?#]+)\?[^\s|"'<>]*""")
+    private val diagHeaders = Regex("""(?i)\b(cookie|authorization|x-envelope|set-cookie)\s*[:=]\s*[^\r\n|]+""")
+    private val diagFields = Regex("""(?i)(["']?(?:token|access_token|cf_clearance|__cf_bm)["']?\s*[:=]\s*["']?)[^"'\s,|}]+""")
+
+    private fun redactDiag(msg: String): String {
+        val noQueries = diagUrlQuery.replace(msg) { it.groupValues[1] + "?[redacted]" }
+        val noHeaders = diagHeaders.replace(noQueries) { it.groupValues[1] + "=[redacted]" }
+        return diagFields.replace(noHeaders) { it.groupValues[1] + "[redacted]" }
+    }
+
     private fun nlog(msg: String) {
-        try { android.util.Log.d("AnimeVsub", msg) } catch (_: Throwable) {}
+        val safeMessage = try { redactDiag(msg) } catch (_: Throwable) { "[redacted log]" }
+        try { android.util.Log.d("AnimeVsub", safeMessage) } catch (_: Throwable) {}
         try {
             val ctx = diagContext() ?: return
             synchronized(diagLock) {
@@ -209,7 +222,7 @@ class AnimeVsubProvider : MainAPI() {
                     f.writeText(f.readText().takeLast(128 * 1024))
                 }
                 val ts = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US).format(java.util.Date())
-                f.appendText("$ts $AVS_BUILD $msg\n")
+                f.appendText("$ts $AVS_BUILD $safeMessage\n")
             }
         } catch (_: Throwable) {}
     }
@@ -405,6 +418,14 @@ class AnimeVsubProvider : MainAPI() {
 
     private fun hostOf(url: String): String =
         Regex("""^https?://([^/?#]+)""").find(url)?.groupValues?.get(1)?.lowercase() ?: ""
+
+    private fun isBackgroundPlayerUrl(url: String): Boolean = try {
+        val uri = java.net.URI(url)
+        val host = uri.host?.lowercase(java.util.Locale.ROOT) ?: ""
+        (uri.scheme.equals("http", true) || uri.scheme.equals("https", true)) &&
+            (host == "googleapiscdn.com" || host.endsWith(".googleapiscdn.com")) &&
+            (uri.path ?: "").startsWith("/player/")
+    } catch (_: Throwable) { false }
 
     private fun isJunkUrl(url: String): Boolean {
         val h = hostOf(url)
@@ -1384,7 +1405,7 @@ class AnimeVsubProvider : MainAPI() {
             val watchPrefetch: kotlinx.coroutines.Deferred<Document?>? =
                 if (watchDoc == null && !siteDown()) async {
                     try {
-                        fetchDoc(watchUrl, useCache = true, mode = MODE_DETAIL)
+                        fetchDoc(watchUrl, useCache = true, mode = MODE_PLAY)
                     } catch (e: Throwable) {
                         if (isCancellation(e)) throw e
                         nlogE("[Step1pre]", e, watchUrl)
@@ -1485,7 +1506,7 @@ class AnimeVsubProvider : MainAPI() {
 
                     val doc = watchDoc
                         ?: (if (watchPrefetch != null) watchPrefetch.await()
-                            else fetchDoc(watchUrl, useCache = false, mode = MODE_DETAIL))
+                            else fetchDoc(watchUrl, useCache = false, mode = MODE_PLAY))
                             ?.also { watchDoc = it }
                         ?: throw ErrorLoadingException("AnimeVsub: không nạp được trang xem")
                     val html = doc.outerHtml()
@@ -1601,7 +1622,7 @@ class AnimeVsubProvider : MainAPI() {
 
             if (!linkFound && !siteDown()) {
                 try {
-                    val embeds = harvestIframes(fetchDoc(watchUrl, useCache = false, mode = MODE_DETAIL)).take(MAX_EMBEDS)
+                    val embeds = harvestIframes(fetchDoc(watchUrl, useCache = false, mode = MODE_PLAY)).take(MAX_EMBEDS)
                     nlog("[Step4] embeds=${embeds.size} ${embeds.joinToString(" | ") { it.take(60) }}")
                     for (embed in embeds) {
                         try {
@@ -1727,16 +1748,48 @@ class AnimeVsubProvider : MainAPI() {
     if (s.charAt(0) === '/') return location.origin + s;
     return location.origin + '/' + s;
   }
-  function pass(u, b){
+  function isVideo(u){
+    var s = String(u || '').split('?')[0].toLowerCase();
+    var hostMatch = abs(s).match(/^https?:\/\/([^\/?:#]+)(?::\d+)?/);
+    var host = hostMatch ? hostMatch[1] : '';
+    if (host !== 'googleapiscdn.com' && !/\.googleapiscdn\.com$/.test(host)) return false;
+    if (s.indexOf('/playlist/') >= 0 || /\.m3u8?$|\.m3u9$/.test(s)) return false;
+    return s.indexOf('/hls/') >= 0 || s.indexOf('/chunks/') >= 0;
+  }
+  function isBinary(u){ return isVideo(u) || String(u || '').indexOf('/seg-key/') >= 0; }
+  function removeActive(list, item){
+    var i = list.indexOf(item); if (i >= 0) list.splice(i, 1);
+  }
+  window.__avsActiveVideoXHR = window.__avsActiveVideoXHR || [];
+  window.__avsActiveVideoFetch = window.__avsActiveVideoFetch || [];
+  function maybeDecrypt(u, b, headers){
     try {
-      if (!b || b.length < 8) return;
+      if (window.__avsRealSent || window.__avsDecrypting || String(u).indexOf('/playlist/') < 0 ||
+          b.indexOf('#EXTM3U') !== 0 || b.indexOf('_t=') < 0) return;
+      var dec = window._avsDecryptM3u8;
+      if (typeof dec !== 'function') return;
+      window.__avsDecrypting = Date.now();
+      Promise.resolve().then(function(){ return dec.call(window, b, headers || {}); })
+        .then(function(out){
+          window.__avsDecrypting = 0;
+          if (!window.__avsRealSent && typeof out === 'string' &&
+              out.indexOf('#EXTM3U') === 0 && out.indexOf('_t=') < 0) {
+            window.__avsRealSent = true;
+            try { window.__avsBridge.onPlaylistReal(out); } catch (e) {}
+          }
+        }, function(){ window.__avsDecrypting = 0; });
+    } catch (e) { window.__avsDecrypting = 0; }
+  }
+  function pass(u, b, headers){
+    try {
+      if (!b || b.length < 8 || b.length > 2000000) return;
+      maybeDecrypt(u, b, headers);
       var sig = (String(u).length + ':' + b.length + ':' + b.substring(0, 24));
       window.__avsSeen = window.__avsSeen || {};
       if (window.__avsSeen[sig]) return;
       if (Object.keys(window.__avsSeen).length > 64) window.__avsSeen = {};
       window.__avsSeen[sig] = 1;
       var s = String(u);
-      if (b.length > 2000000) return;
       var isPlaylist = b.indexOf('#EXTM3U') >= 0;
       var isMediaUrl = s.indexOf('.m3u8') >= 0 || s.indexOf('.m3u9') >= 0 || s.indexOf('.mp4') >= 0;
       var bodyHasMedia = b.indexOf('.m3u8') >= 0 || b.indexOf('.m3u9') >= 0 || b.indexOf('.mp4') >= 0;
@@ -1768,25 +1821,55 @@ class AnimeVsubProvider : MainAPI() {
   try {
     var of = window.fetch;
     if (of) {
+      window.__avsBaseFetch = window.__avsBaseFetch || of;
       window.fetch = function(){
         var args = arguments;
         var u = (args[0] && args[0].url) ? String(args[0].url) : String(args[0]);
-        var init = args[1];
+        var init = args[1], controller = null;
+        if (isVideo(u)) {
+          if (window.__avsPausePlayerMedia) return Promise.reject(new Error('AVS player suspended'));
+          if (typeof AbortController !== 'undefined') {
+            try {
+              controller = new AbortController();
+              var nextInit = Object.assign({}, init || {});
+              var oldSignal = nextInit.signal || (args[0] && args[0].signal);
+              if (oldSignal) {
+                if (oldSignal.aborted) controller.abort();
+                else if (oldSignal.addEventListener) oldSignal.addEventListener('abort', function(){ controller.abort(); }, {once:true});
+              }
+              nextInit.signal = controller.signal;
+              args = [args[0], nextInit];
+              var active = window.__avsActiveVideoFetch;
+              active.push(controller);
+              if (active.length > 32) active.shift();
+              (function(c){ setTimeout(function(){ removeActive(active, c); }, 60000); })(controller);
+            } catch (e) { controller = null; }
+          }
+        }
         try { rec(u, init ? init.headers : null, init ? init.method : 'GET', init ? init.credentials : ''); } catch (e0) {}
         return of.apply(this, args).then(function(res){
+          var headerMap = {};
           try {
             var su = String(u);
             if (su.indexOf('/playlist/') >= 0) {
               var hs = [];
-              res.headers.forEach(function(v, k){ hs.push(k + '=' + v); });
+              res.headers.forEach(function(v, k){ hs.push(k + '=' + v); headerMap[k] = v; });
               window.__avsBridge.onPlRes(abs(u), hs.join('|'));
             }
             if (su.indexOf('/chunks/') >= 0) {
               window.__avsBridge.onSegRes(abs(su), String(res.status));
             }
           } catch (e1) {}
-          try { res.clone().text().then(function(t){ pass(u, t); }, function(){}); } catch (e) {}
+          if (!isBinary(u)) try {
+            var ct = String(res.headers.get('content-type') || '').toLowerCase();
+            var len = parseInt(res.headers.get('content-length') || '0', 10) || 0;
+            if ((!/^(image|video|audio)\//.test(ct) || /mpegurl|m3u8/.test(ct)) && len <= 2000000)
+              res.clone().text().then(function(t){ pass(u, t, headerMap); }, function(){});
+          } catch (e) {}
           return res;
+        }, function(err){
+          if (controller) removeActive(window.__avsActiveVideoFetch, controller);
+          throw err;
         });
       };
     }
@@ -1797,14 +1880,35 @@ class AnimeVsubProvider : MainAPI() {
     XMLHttpRequest.prototype.setRequestHeader = function(k, v){ try { if (this.__avsH) { this.__avsH[k] = v; } } catch (e) {} return osh.apply(this, arguments); };
     XMLHttpRequest.prototype.send = function(){
       var self = this;
+      if (isVideo(self.__avsU)) {
+        if (window.__avsPausePlayerMedia) { try { self.abort(); } catch (e) {} return; }
+        var active = window.__avsActiveVideoXHR;
+        active.push(self);
+        if (active.length > 32) active.shift();
+        this.addEventListener('loadend', function(){ removeActive(active, self); });
+      }
       try { rec(self.__avsU, self.__avsH, self.__avsM, String(self.withCredentials)); } catch (e0) {}
       this.addEventListener('load', function(){
+        var headerMap = {};
         try {
           var su = String(self.__avsU || '');
-          if (su.indexOf('/playlist/') >= 0) { window.__avsBridge.onPlRes(abs(su), self.getAllResponseHeaders() || ''); }
+          if (su.indexOf('/playlist/') >= 0) {
+            var rawHeaders = self.getAllResponseHeaders() || '';
+            window.__avsBridge.onPlRes(abs(su), rawHeaders);
+            rawHeaders.split(/\r?\n/).forEach(function(line){
+              var p = line.indexOf(':');
+              if (p > 0) headerMap[line.substring(0, p).trim().toLowerCase()] = line.substring(p + 1).trim();
+            });
+          }
           if (su.indexOf('/chunks/') >= 0) { window.__avsBridge.onSegRes(abs(su), String(self.status)); }
         } catch (e1) {}
-        try { var t = xhrText(self); if (t) { pass(self.__avsU, t); } } catch (e) {}
+        if (!isBinary(self.__avsU)) try {
+          var ct = String(self.getResponseHeader('content-type') || '').toLowerCase();
+          var len = parseInt(self.getResponseHeader('content-length') || '0', 10) || 0;
+          if ((!/^(image|video|audio)\//.test(ct) || /mpegurl|m3u8/.test(ct)) && len <= 2000000) {
+            var t = xhrText(self); if (t) { pass(self.__avsU, t, headerMap); }
+          }
+        } catch (e) {}
       });
       return os.apply(this, arguments);
     };
@@ -2204,7 +2308,7 @@ class AnimeVsubProvider : MainAPI() {
                         registered = true
                         if (!targetUrl.startsWith(mainUrl)) {
 
-                            adoptRelayWebView(webView, dialog)
+                            adoptRelayWebView(webView, dialog, fastReal)
                             adoptedRelay = true
                         } else {
                             try {
@@ -2310,7 +2414,8 @@ class AnimeVsubProvider : MainAPI() {
         }
         if (interactive && (ctx !is android.app.Activity || ctx.isFinishing)) return null
 
-        while (!wvGate.tryAcquire()) kotlinx.coroutines.delay(60)
+        val gate = if (mode == MODE_PLAY) playWvGate else wvGate
+        while (!gate.tryAcquire()) kotlinx.coroutines.delay(40)
 
         val done = kotlinx.coroutines.CompletableDeferred<Document?>()
         var webView: WebView? = null
@@ -2338,6 +2443,7 @@ class AnimeVsubProvider : MainAPI() {
                 var lastEps = 0
                 var lastPageUrl = ""
                 var firstPagePollMs = 0L
+                val blockedPlayerFrames = java.util.concurrent.atomic.AtomicInteger(0)
 
                 fun domReady(u: String, html: String, blocked: Boolean, cards: Int, xem: Int, eps: Int, ageMs: Long): Boolean {
                     val isWatchPage = isWatchPageUrl(u)
@@ -2345,7 +2451,7 @@ class AnimeVsubProvider : MainAPI() {
 
                     return !blocked && when (mode) {
                         MODE_LISTING -> cards > 0
-                        MODE_DETAIL  -> if (isWatchPage) {
+                        MODE_DETAIL, MODE_PLAY -> if (isWatchPage) {
                             hasPlayerFrame || (xem > 0 && ageMs >= 2_400L) || ageMs >= 7_200L
                         } else xem > 0 || cards > 0 || ageMs >= 5_600L
                         MODE_EPISODES -> (eps > 0 && (hasPlayerFrame || ageMs >= 2_400L)) || ageMs >= 7_200L
@@ -2368,6 +2474,10 @@ class AnimeVsubProvider : MainAPI() {
 
                         val lh = lastHtml
                         if (lh != null && domReady(u, lh, lastBlocked, lastCards, lastXem, lastEps, pageAgeMs)) {
+                            if (!lastBlocked && (lastCards > 0 || lastXem > 0 || lastEps > 0 || hasPlayerIframe(lh))) {
+                                noteSiteOk()
+                                learnCanonical(u)
+                            }
                             saveCfCookiesFromManager("WVDom")
                             try { wv.post { try { wv.stopLoading() } catch (_: Throwable) {} } } catch (_: Throwable) {}
                             done.complete(Jsoup.parse(lh, u))
@@ -2396,7 +2506,6 @@ class AnimeVsubProvider : MainAPI() {
                         if (!done.isCompleted) done.complete(null)
                         return@AvsGateBridge
                     }
-                    if (cards > 0 || xem > 0) { noteSiteOk(); if (!blocked) learnCanonical(u) }
                     lastHtml = html
                     lastBlocked = blocked
                     lastCards = cards
@@ -2404,6 +2513,10 @@ class AnimeVsubProvider : MainAPI() {
                     lastEps = eps
                     val ready = domReady(u, html, blocked, cards, xem, eps, pageAgeMs)
                     if (ready) {
+                        if (!blocked && (cards > 0 || xem > 0 || eps > 0 || hasPlayerIframe(html))) {
+                            noteSiteOk()
+                            learnCanonical(u)
+                        }
                         saveCfCookiesFromManager("WVDom")
                         try { wv.post { try { wv.stopLoading() } catch (_: Throwable) {} } } catch (_: Throwable) {}
                         done.complete(Jsoup.parse(html, u))
@@ -2419,6 +2532,19 @@ class AnimeVsubProvider : MainAPI() {
                     override fun onPageFinished(view: WebView?, u: String?) {
                         try { nlog("[WVDom] page-finish ${u?.take(90)}") } catch (_: Throwable) {}
                         view?.evaluateJavascript(domPollJs, null)
+                    }
+                    override fun shouldInterceptRequest(
+                        view: WebView?, request: android.webkit.WebResourceRequest?
+                    ): android.webkit.WebResourceResponse? {
+                        val req = request ?: return null
+                        if ((mode == MODE_PLAY || mode == MODE_EPISODES) && !req.isForMainFrame &&
+                            isBackgroundPlayerUrl(req.url.toString())) {
+                            if (blockedPlayerFrames.incrementAndGet() == 1)
+                                nlog("[WVDom] giữ iframe, tắt player phụ trong trang xem")
+                            val body = "<!doctype html><html><body></body></html>".toByteArray(Charsets.UTF_8)
+                            return android.webkit.WebResourceResponse("text/html", "UTF-8", java.io.ByteArrayInputStream(body))
+                        }
+                        return null
                     }
                 }
 
@@ -2475,7 +2601,7 @@ class AnimeVsubProvider : MainAPI() {
 
             try { withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) { dialog?.dismiss() } } catch (_: Throwable) {}
             try { withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) { webView?.destroy() } } catch (_: Throwable) {}
-            wvGate.release()
+            gate.release()
         }
     }
 
@@ -2563,13 +2689,15 @@ class AnimeVsubProvider : MainAPI() {
     private val relaySeq = java.util.concurrent.atomic.AtomicInteger(0)
     @Volatile private var relayLastUseMs = 0L
 
-    private val AVS_KICK_JS = "(function(){try{var vs=document.querySelectorAll('video');for(var i=0;i<vs.length;i++){vs[i].muted=true;var p=vs[i].play();if(p&&p.catch)p.catch(function(){});}}catch(e){}})();"
+    private val AVS_KICK_JS = "(function(){try{window.__avsPausePlayerMedia=false;var vs=document.querySelectorAll('video');for(var i=0;i<vs.length;i++){vs[i].muted=true;var p=vs[i].play();if(p&&p.catch)p.catch(function(){});}}catch(e){}})();"
 
     private val AVS_REAL_PL_JS = """
 (function(){
   if (window.__avsRealPlRunning) return; window.__avsRealPlRunning = true;
   var tries = 0;
   function go() {
+    if (window.__avsRealSent) return;
+    if (window.__avsDecrypting && Date.now() - window.__avsDecrypting < 1800) { setTimeout(go, 120); return; }
     tries++;
     if (tries > 60) { try{ window.__avsBridge.onPlaylistReal("AVS-REALPL-FAIL max-tries"); }catch(e){} return; }
     try {
@@ -2578,10 +2706,15 @@ class AnimeVsubProvider : MainAPI() {
       var pid = (location.pathname.match(/\/player\/([0-9a-f]{16,})/) || [])[1] || (typeof id !== "undefined" ? id : "");
       var tok = window._avsSk || (typeof avsToken !== "undefined" ? avsToken : "");
       if (!pid || !tok) { setTimeout(go, 300); return; }
-      fetch(location.origin + "/playlist/" + pid + "/playlist.m3u8?token=" + tok, { credentials: "include" })
+      var playlistUrl = location.origin + "/playlist/" + pid + "/playlist.m3u8?token=" + tok;
+      try { window.__avsBridge.onReq(playlistUrl, "", "GET", "include"); } catch (e1) {}
+      (window.__avsBaseFetch || window.fetch || fetch).call(window, playlistUrl, { credentials: "include" })
         .then(function(r) {
-          var hs = {};
-          try { r.headers.forEach(function(v, k) { hs[k] = v; }); } catch (e2) {}
+          var hs = {}, parts = [];
+          try {
+            r.headers.forEach(function(v, k) { hs[k] = v; parts.push(k + "=" + v); });
+            window.__avsBridge.onPlRes(playlistUrl, parts.join("|"));
+          } catch (e2) {}
           return r.text().then(function(t) {
             try { return Promise.resolve(dec.call(window, t, hs)); }
             catch (e3) { return "AVS-REALPL-ERR " + e3; }
@@ -2589,17 +2722,35 @@ class AnimeVsubProvider : MainAPI() {
         })
         .then(function(out) {
           if (typeof out === "string" && out.indexOf("#EXTM3U") === 0 && out.indexOf("_t=") < 0) {
-            try { window.__avsBridge.onPlaylistReal(out); } catch (e4) {}
-          } else { setTimeout(go, 900); }
+            if (!window.__avsRealSent) {
+              window.__avsRealSent = true;
+              try { window.__avsBridge.onPlaylistReal(out); } catch (e4) {}
+            }
+          } else if (!window.__avsRealSent) { setTimeout(go, 900); }
         })
         .catch(function() { setTimeout(go, 900); });
     } catch (e) { setTimeout(go, 900); }
   }
-  go();
+  setTimeout(go, 350);
 })();
 """;
 
     private val AVS_CALM_JS = "(function(){try{var vs=document.querySelectorAll('video');for(var i=0;i<vs.length;i++){try{vs[i].pause();}catch(e){}}}catch(e){}})();"
+
+    private val AVS_CALM_FAST_JS = """
+(function(){
+  try {
+    window.__avsPausePlayerMedia = true;
+    var xs = (window.__avsActiveVideoXHR || []).slice(), fs = (window.__avsActiveVideoFetch || []).slice();
+    window.__avsActiveVideoXHR = []; window.__avsActiveVideoFetch = [];
+    for (var i = 0; i < xs.length; i++) { try { xs[i].abort(); } catch (e) {} }
+    for (var j = 0; j < fs.length; j++) { try { fs[j].abort(); } catch (e) {} }
+    var vs = document.querySelectorAll('video');
+    for (var k = 0; k < vs.length; k++) { try { vs[k].pause(); } catch (e) {} }
+    return JSON.stringify({xhr:xs.length, fetch:fs.length, videos:vs.length});
+  } catch (e) { return 'error'; }
+})();
+"""
 
     private val AVS_VIDEO_STATE_JS = "(function(){try{var v=document.querySelector('video');var h=false;try{h=!!(window.hls||window.Hls);}catch(e0){}if(!v)return 'novideo hls='+h;return 'rs='+v.readyState+' paused='+v.paused+' t='+Math.round(v.currentTime||0)+' net='+v.networkState+' hls='+h+' src='+String(v.currentSrc||v.src||'').substring(0,50);}catch(e){return 'err '+(e&&e.message?e.message:'?')}})();"
 
@@ -2631,7 +2782,7 @@ class AnimeVsubProvider : MainAPI() {
       }
       var opt = {credentials: 'include', headers: h};
       if (controller) opt.signal = controller.signal;
-      fetch(url, opt).then(function(r){
+      (window.__avsBaseFetch || window.fetch || fetch).call(window, url, opt).then(function(r){
         if (finished) { if (r.body && r.body.cancel) r.body.cancel(); return; }
         if (!r.ok) { finish('HTTP' + r.status); return; }
         var cr = r.headers.get('content-range') || '';
@@ -2747,7 +2898,7 @@ class AnimeVsubProvider : MainAPI() {
         if (rb.done) rb.latch.countDown()
     }
 
-    private fun adoptRelayWebView(wv: WebView?, dlg: android.app.Dialog?) {
+    private fun adoptRelayWebView(wv: WebView?, dlg: android.app.Dialog?, fastReal: Boolean) {
         if (wv == null) return
         try {
             relayLastUseMs = System.currentTimeMillis()
@@ -2769,7 +2920,11 @@ class AnimeVsubProvider : MainAPI() {
                             win.setLayout(1, 1)
                         } catch (_: Throwable) {}
                     }
-                    try { wv.evaluateJavascript(AVS_CALM_JS, null) } catch (_: Throwable) {}
+                    try {
+                        wv.evaluateJavascript(if (fastReal) AVS_CALM_FAST_JS else AVS_CALM_JS) { result ->
+                            if (fastReal) nlog("[Fast] player nền tạm dừng ${result?.take(100)}")
+                        }
+                    } catch (_: Throwable) {}
                     try { wv.evaluateJavascript(avsRelayJs, null) } catch (_: Throwable) {}
                     nlog("[Relay] WebView nhận nuôi — giữ ngữ cảnh player cho segment")
                 } catch (_: Throwable) {}
@@ -2934,6 +3089,7 @@ class AnimeVsubProvider : MainAPI() {
 
         var proxyBase: String? = null
         synchronized(activeServers) {
+            for (old in activeServers) old.cancelUnclaimedWarm()
             while (activeServers.size >= 8) {
                 try { activeServers.removeAt(0).stop() } catch (_: Throwable) {}
             }
@@ -3021,6 +3177,18 @@ class AnimeVsubProvider : MainAPI() {
         @Volatile var cancelled = false
     }
 
+    private data class AvsContentRange(val start: Long, val end: Long, val total: Long?)
+
+    private class AvsWarmConnection {
+        val ready = java.util.concurrent.CountDownLatch(1)
+        val released = java.util.concurrent.CountDownLatch(1)
+        @Volatile var call: okhttp3.Call? = null
+        @Volatile var cancelled = false
+        val slotFreed = java.util.concurrent.atomic.AtomicBoolean(false)
+        var claimed = false
+        var response: okhttp3.Response? = null
+    }
+
     private class AvsResponseOutput(private val target: java.io.OutputStream) : java.io.OutputStream() {
         @Volatile var started = false
             private set
@@ -3059,6 +3227,8 @@ class AnimeVsubProvider : MainAPI() {
         private val maxPrefetchBytes = 8 * 1024 * 1024
         private val segPrefetchInflight = java.util.concurrent.ConcurrentHashMap<String, AvsPrefetchTask>()
         private val prefetchSlots = java.util.concurrent.Semaphore(3)
+        private val warmConnections = java.util.concurrent.ConcurrentHashMap<String, AvsWarmConnection>()
+        private val warmSlots = java.util.concurrent.Semaphore(1)
         @Volatile private var startupRecoveryRequired = false
         @Volatile private var startupRecoveryDone = false
         private val failedWarmKeys = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
@@ -3140,7 +3310,7 @@ class AnimeVsubProvider : MainAPI() {
 
                     firstKey?.let { schedulePrefetch(it, null, true, "warm-key") }
                     val first = entries.first()
-                    schedulePrefetch(first.first, first.second, false, "warm-first")
+                    openWarmConnection(first.first, first.second, true)
                 }
             } catch (e: Throwable) {
                 nlogE("[Proxy] prefetch-map", e)
@@ -3304,12 +3474,150 @@ class AnimeVsubProvider : MainAPI() {
             }
         }
 
-        private fun maybePrefetchSegment(fromIdx: Int) {
-            if (fromIdx < 0) return
-            for (n in 1..3) {
-                val entry = synchronized(segOrder) { segOrder.getOrNull(fromIdx + n) } ?: break
-                schedulePrefetch(entry.first, entry.second, false, "next")
+        private fun openWarmConnection(u: String, rg: String?, startup: Boolean) {
+            val key = cacheKey(u, rg)
+            if (cacheGet(key) != null || !warmSlots.tryAcquire()) return
+            val task = AvsWarmConnection()
+            if (warmConnections.putIfAbsent(key, task) != null) {
+                warmSlots.release()
+                return
             }
+            try {
+                threadPool.execute {
+                    var published = false
+                    val startMs = System.currentTimeMillis()
+                    try {
+                        try {
+                            if (task.cancelled || System.currentTimeMillis() < segAuthBackoffGlobalUntil ||
+                                System.currentTimeMillis() < dnsCooldownUntil) return@execute
+                            val rb = okhttp3.Request.Builder().url(u)
+                                .header("User-Agent", USER_AGENT)
+                                .header("Referer", primaryRef())
+                                .header("Accept", "*/*")
+                                .header("Sec-Fetch-Site", "same-origin")
+                                .header("Sec-Fetch-Mode", "cors")
+                                .header("Sec-Fetch-Dest", "empty")
+                            rg?.let { rb.header("Range", it) }
+                            cookieHeaderFor(u)?.let { rb.header("Cookie", it) }
+                            val call = segClient.newCall(rb.build())
+                            task.call = call
+                            if (task.cancelled) { call.cancel(); return@execute }
+                            val resp = call.execute()
+                            val ct = resp.header("Content-Type")
+                            val len = resp.body?.contentLength() ?: -1L
+                            val valid = !isBlockedResponse(resp.code, ct) && len != 0L &&
+                                rangeResponseValid(rg, resp.code, resp.header("Content-Range"), len)
+                            if (!valid) {
+                                if (startup && !task.cancelled && isBlockedResponse(resp.code, ct)) {
+                                    failedWarmKeys.add(key)
+                                    startupRecoveryRequired = true
+                                }
+                                if (prefetchLogCount.incrementAndGet() <= 20)
+                                    nlog("[Warm] không dùng status=${resp.code} range=${rg ?: "-"} headerMs=${System.currentTimeMillis() - startMs}")
+                                resp.close()
+                            } else {
+                                synchronized(task) {
+                                    if (!task.cancelled) {
+                                        task.response = resp
+                                        published = true
+                                    }
+                                }
+                                if (!published) resp.close()
+                                else if (prefetchLogCount.incrementAndGet() <= 20)
+                                    nlog("[Warm] headers sẵn status=${resp.code} bytes=$len headerMs=${System.currentTimeMillis() - startMs}")
+                            }
+                        } catch (e: Throwable) {
+                            if (!task.cancelled) {
+                                if (startup) {
+                                    failedWarmKeys.add(key)
+                                    startupRecoveryRequired = true
+                                }
+                                if (prefetchLogCount.incrementAndGet() <= 20)
+                                    nlog("[Warm] lỗi ${e.javaClass.simpleName}: ${e.message?.take(80)}")
+                            }
+                        } finally {
+                            task.ready.countDown()
+                        }
+                        if (published) {
+                            try { task.released.await(8, java.util.concurrent.TimeUnit.SECONDS) }
+                            catch (_: InterruptedException) { Thread.currentThread().interrupt() }
+                        }
+                    } finally {
+                        task.ready.countDown()
+                        synchronized(task) {
+                            try { task.response?.close() } catch (_: Throwable) {}
+                            task.response = null
+                        }
+                        warmConnections.remove(key, task)
+                        releaseWarmSlot(task)
+                    }
+                }
+            } catch (e: Throwable) {
+                warmConnections.remove(key, task)
+                task.ready.countDown()
+                task.released.countDown()
+                releaseWarmSlot(task)
+                nlogE("[Warm] scheduling", e)
+            }
+        }
+
+        private fun releaseWarmSlot(task: AvsWarmConnection) {
+            if (task.slotFreed.compareAndSet(false, true)) warmSlots.release()
+        }
+
+        private fun cancelWarmConnection(task: AvsWarmConnection, force: Boolean = false) {
+            val shouldCancel = synchronized(task) {
+                if (task.claimed && !force) false else {
+                    task.cancelled = true
+                    try { task.response?.close() } catch (_: Throwable) {}
+                    task.response = null
+                    true
+                }
+            }
+            if (shouldCancel) {
+                try { task.call?.cancel() } catch (_: Throwable) {}
+                task.ready.countDown()
+                task.released.countDown()
+            }
+        }
+
+        fun cancelUnclaimedWarm() {
+            for (task in warmConnections.values) cancelWarmConnection(task)
+        }
+
+        private fun takeWarmConnection(key: String): okhttp3.Response? {
+            val task = warmConnections[key] ?: run {
+                cancelUnclaimedWarm()
+                return null
+            }
+            val start = System.currentTimeMillis()
+            val ready = try { task.ready.await(4_000L, java.util.concurrent.TimeUnit.MILLISECONDS) }
+                catch (_: InterruptedException) { Thread.currentThread().interrupt(); false }
+            if (!ready) {
+                cancelWarmConnection(task)
+                nlog("[Warm] chờ header quá 4000ms — dùng đường thường")
+                return null
+            }
+            val response = synchronized(task) {
+                if (task.cancelled) null else task.response?.also {
+                    task.response = null
+                    task.claimed = true
+                }
+            }
+            if (response != null) {
+                warmConnections.remove(key, task)
+                releaseWarmSlot(task)
+            }
+            task.released.countDown()
+            if (response != null && prefetchLogCount.incrementAndGet() <= 20)
+                nlog("[Warm] chuyển stream trực tiếp waitMs=${System.currentTimeMillis() - start}")
+            return response
+        }
+
+        private fun maybePrefetchSegment(fromIdx: Int) {
+            if (!fastReal || fromIdx < 0) return
+            val entry = synchronized(segOrder) { segOrder.getOrNull(fromIdx + 1) } ?: return
+            openWarmConnection(entry.first, entry.second, false)
         }
 
         private fun awaitPrefetch(key: String): Triple<Int, String?, ByteArray>? {
@@ -3355,7 +3663,7 @@ class AnimeVsubProvider : MainAPI() {
             val wv = synchronized(relayLock) { relayWv } ?: return
             if (!recoveryCalmed.compareAndSet(false, true)) return
             try { android.os.Handler(android.os.Looper.getMainLooper()).post {
-                try { wv.evaluateJavascript(AVS_CALM_JS, null) } catch (_: Throwable) {}
+                try { wv.evaluateJavascript(AVS_CALM_FAST_JS, null) } catch (_: Throwable) {}
             } } catch (_: Throwable) {}
         }
 
@@ -3385,6 +3693,7 @@ class AnimeVsubProvider : MainAPI() {
                 task.cancelled = true
                 try { task.call?.cancel() } catch (_: Throwable) {}
             }
+            for (task in warmConnections.values) cancelWarmConnection(task, true)
             synchronized(segCacheLock) { segCache.clear(); segCacheBytes = 0L }
             try { threadPool.shutdownNow() } catch (_: Throwable) {}
             nlog("[Proxy] stopped port=$port")
@@ -3426,80 +3735,88 @@ class AnimeVsubProvider : MainAPI() {
                         }
 
                         val key = cacheKey(segUrl, reqRange)
-                        var cacheHit = awaitPrefetch(key)
-                        if (cacheHit == null && fastReal && failedWarmKeys.contains(key)) {
-                            recoverFastStartupIfNeeded()
-
-                            schedulePrefetch(segUrl, reqRange, keyUrls.contains(segUrl), "recovery")
-                            cacheHit = awaitPrefetch(key)
-                            failedWarmKeys.remove(key)
-                        }
-                        if (cacheHit != null && cacheHit.third.isNotEmpty()) {
-                            if (cacheHit.third.size >= 4096) servedBig = true
-                            val head = StringBuilder(
-                                if (cacheHit.first == 206) "HTTP/1.1 206 Partial Content" else "HTTP/1.1 200 OK"
-                            ).append(crlf)
-                                .append("Content-Type: ").append(if (keyUrls.contains(segUrl)) "application/octet-stream" else "video/mp2t").append(crlf)
-                                .append("Access-Control-Allow-Origin: *").append(crlf)
-                            cacheHit.second?.let { head.append("Content-Range: ").append(it).append(crlf) }
-                            head.append("Content-Length: ").append(cacheHit.third.size).append(crlf).append(crlf)
-                            output.write(head.toString().toByteArray())
-                            output.write(cacheHit.third)
-                            if (okLogCount.incrementAndGet() <= 40) {
-                                nlog("[Seg] CACHE-HIT bytes=${cacheHit.third.size} url=...${segUrl.takeLast(26)}")
+                        val isKey = keyUrls.contains(segUrl)
+                        var cacheHit = if (isKey) awaitPrefetch(key) else cacheGet(key)
+                        val warmResponse = if (!isKey && cacheHit == null) takeWarmConnection(key) else null
+                        try {
+                            if (cacheHit == null && warmResponse == null && fastReal && failedWarmKeys.contains(key)) {
+                                recoverFastStartupIfNeeded()
+                                if (isKey) {
+                                    schedulePrefetch(segUrl, reqRange, true, "recovery")
+                                    cacheHit = awaitPrefetch(key)
+                                }
+                                failedWarmKeys.remove(key)
                             }
-                            ok = true
-                        }
-
-                        val nowMs = System.currentTimeMillis()
-                        if (ok) {
-
-                        } else if (nowMs < segAuthBackoffGlobalUntil || nowMs < dnsCooldownUntil) {
-
-                            val skipN = backoffSkips.incrementAndGet()
-                            if (skipN <= 2 || skipN % 20 == 0) {
-                                val waitS = ((maxOf(segAuthBackoffGlobalUntil, dnsCooldownUntil) - nowMs) / 1000L).coerceAtLeast(1)
-                                nlog("[Seg] backoff toàn cục ${waitS}s — 502 tạm url=...${segUrl.takeLast(26)}")
+                            if (cacheHit != null && cacheHit.third.isNotEmpty()) {
+                                if (cacheHit.third.size >= 4096) servedBig = true
+                                val head = StringBuilder(
+                                    if (cacheHit.first == 206) "HTTP/1.1 206 Partial Content" else "HTTP/1.1 200 OK"
+                                ).append(crlf)
+                                    .append("Content-Type: ").append(if (keyUrls.contains(segUrl)) "application/octet-stream" else "video/mp2t").append(crlf)
+                                    .append("Access-Control-Allow-Origin: *").append(crlf)
+                                cacheHit.second?.let { head.append("Content-Range: ").append(it).append(crlf) }
+                                head.append("Content-Length: ").append(cacheHit.third.size).append(crlf).append(crlf)
+                                output.write(head.toString().toByteArray())
+                                output.write(cacheHit.third)
+                                if (okLogCount.incrementAndGet() <= 40) {
+                                    nlog("[Seg] CACHE-HIT bytes=${cacheHit.third.size} url=...${segUrl.takeLast(26)}")
+                                }
+                                ok = true
                             }
-                        } else {
 
-                            if (segRecipe == null && recipeNeeded && !servedBig) waitForRecipe()
+                            val nowMs = System.currentTimeMillis()
+                            if (ok) {
 
-                            if (!ok && recipeNeeded) ok = viaRecipe(segUrl, reqRange, output, crlf, t0)
-                            if (!ok && !output.started) ok = viaOkHttp(segUrl, reqRange, output, crlf, t0)
-                            if (!ok && !output.started) ok = viaRelay(segUrl, reqRange, output, crlf, t0)
-                            if (!ok && !output.started) {
-                                val origin = Regex("""^(https?://[^/]+)""").find(primaryRef())?.groupValues?.get(1) ?: ""
-                                if (origin.isNotEmpty()) ok = viaOkHttpOrigin(segUrl, reqRange, "$origin/", output, crlf, t0)
+                            } else if (warmResponse == null && (nowMs < segAuthBackoffGlobalUntil || nowMs < dnsCooldownUntil)) {
+
+                                val skipN = backoffSkips.incrementAndGet()
+                                if (skipN <= 2 || skipN % 20 == 0) {
+                                    val waitS = ((maxOf(segAuthBackoffGlobalUntil, dnsCooldownUntil) - nowMs) / 1000L).coerceAtLeast(1)
+                                    nlog("[Seg] backoff toàn cục ${waitS}s — 502 tạm url=...${segUrl.takeLast(26)}")
+                                }
+                            } else {
+
+                                if (segRecipe == null && recipeNeeded && !servedBig) waitForRecipe()
+
+                                if (!ok && warmResponse != null) ok = viaWarmResponse(warmResponse, segUrl, reqRange, output, crlf, t0)
+                                if (!ok && !output.started && recipeNeeded) ok = viaRecipe(segUrl, reqRange, output, crlf, t0)
+                                if (!ok && !output.started) ok = viaOkHttp(segUrl, reqRange, output, crlf, t0)
+                                if (!ok && !output.started) ok = viaRelay(segUrl, reqRange, output, crlf, t0)
+                                if (!ok && !output.started) {
+                                    val origin = Regex("""^(https?://[^/]+)""").find(primaryRef())?.groupValues?.get(1) ?: ""
+                                    if (origin.isNotEmpty()) ok = viaOkHttpOrigin(segUrl, reqRange, "$origin/", output, crlf, t0)
+                                }
+                                if (!ok && !output.started) ok = viaUrlConnection(segUrl, reqRange, output, crlf, t0)
                             }
-                            if (!ok && !output.started) ok = viaUrlConnection(segUrl, reqRange, output, crlf, t0)
-                        }
 
-                        if (ok) {
+                            if (ok) {
 
-                            allMethodFails.set(0)
-                            backoffSkips.set(0)
-                            segStormToastShown = false
-                            calmRecoveredPlayer()
+                                allMethodFails.set(0)
+                                backoffSkips.set(0)
+                                segStormToastShown = false
+                                calmRecoveredPlayer()
 
-                            try { maybePrefetchSegment(orderIndexOf(segUrl, reqRange)) } catch (_: Throwable) {}
-                        } else if (output.started) {
+                                try { maybePrefetchSegment(orderIndexOf(segUrl, reqRange)) } catch (_: Throwable) {}
+                            } else if (output.started) {
 
-                            nlog("[Seg] stream bị ngắt sau header — đóng socket để player retry")
-                        } else {
-                            val body = "502 upstream blocked".toByteArray(Charsets.UTF_8)
-                            output.write(("HTTP/1.1 502 Bad Gateway${crlf}Content-Length: ${body.size}${crlf}$crlf").toByteArray())
-                            output.write(body)
-                            val n = allMethodFails.incrementAndGet()
-                            if (n <= 3 || n % 10 == 0) nlog("[Seg] ALL-METHODS-FAILED #$n url=...${segUrl.takeLast(40)}")
+                                nlog("[Seg] stream bị ngắt sau header — đóng socket để player retry")
+                            } else {
+                                val body = "502 upstream blocked".toByteArray(Charsets.UTF_8)
+                                output.write(("HTTP/1.1 502 Bad Gateway${crlf}Content-Length: ${body.size}${crlf}$crlf").toByteArray())
+                                output.write(body)
+                                val n = allMethodFails.incrementAndGet()
+                                if (n <= 3 || n % 10 == 0) nlog("[Seg] ALL-METHODS-FAILED #$n url=...${segUrl.takeLast(40)}")
 
-                            if (n >= 5 && System.currentTimeMillis() > segAuthBackoffGlobalUntil) {
-                                segAuthBackoffGlobalUntil = System.currentTimeMillis() + 30_000L
-                                if (!segStormToastShown) {
-                                    segStormToastShown = true
-                                    ntoast("AnimeVsub: CDN chặn segment — nghỉ 30s rồi thử lại")
+                                if (n >= 5 && System.currentTimeMillis() > segAuthBackoffGlobalUntil) {
+                                    segAuthBackoffGlobalUntil = System.currentTimeMillis() + 30_000L
+                                    if (!segStormToastShown) {
+                                        segStormToastShown = true
+                                        ntoast("AnimeVsub: CDN chặn segment — nghỉ 30s rồi thử lại")
+                                    }
                                 }
                             }
+                        } finally {
+                            try { warmResponse?.close() } catch (_: Throwable) {}
                         }
                     }
                     else -> {
@@ -3584,9 +3901,79 @@ class AnimeVsubProvider : MainAPI() {
             }
         }
 
-        private fun streamOkHttpBody(resp: okhttp3.Response, output: AvsResponseOutput, crlf: String): Long {
+        private fun parseContentRange(value: String?): AvsContentRange? {
+            val m = value?.trim()?.let {
+                Regex("""(?i)^bytes\s+(\d+)-(\d+)/(\d+|\*)$""").matchEntire(it)
+            } ?: return null
+            val start = m.groupValues[1].toLongOrNull() ?: return null
+            val end = m.groupValues[2].toLongOrNull() ?: return null
+            val total = m.groupValues[3].toLongOrNull()
+            if (end < start || (total != null && (total <= 0 || end >= total))) return null
+            if (end - start == Long.MAX_VALUE) return null
+            return AvsContentRange(start, end, total)
+        }
+
+        private fun lastBytes(previous: ByteArray, bytes: ByteArray, length: Int): ByteArray {
+            if (length >= 64) return bytes.copyOfRange(length - 64, length)
+            val keep = minOf(previous.size, 64 - length)
+            val result = ByteArray(keep + length)
+            if (keep > 0) System.arraycopy(previous, previous.size - keep, result, 0, keep)
+            if (length > 0) System.arraycopy(bytes, 0, result, keep, length)
+            return result
+        }
+
+        private fun resumeRange(
+            original: okhttp3.Response, range: AvsContentRange, sent: Long, tail: ByteArray
+        ): Pair<okhttp3.Response, java.io.InputStream>? {
+            if (sent <= 0 || sent > range.end - range.start || tail.size > sent) return null
+            val first = range.start + sent - tail.size
+            val wanted = "bytes=$first-${range.end}"
+            val etag = original.header("ETag")?.takeIf { it.isNotBlank() && !it.startsWith("W/", true) }
+            val modified = original.header("Last-Modified")?.takeIf { it.isNotBlank() }
+            if (etag == null && modified == null) {
+                nlog("[Seg] RESUME thiếu validator — để player retry")
+                return null
+            }
+            val builder = original.request.newBuilder().header("Range", wanted)
+            (etag ?: modified)?.let { builder.header("If-Range", it) }
+            var response: okhttp3.Response? = null
+            try {
+                val next = segClient.newCall(builder.build()).execute()
+                response = next
+                if (!validOkHttpResponse(next, wanted, original.request.url.toString(), "RESUME")) return null
+                val nextRange = parseContentRange(next.header("Content-Range")) ?: return null
+                if (nextRange.start != first || nextRange.end != range.end || nextRange.total != range.total) return null
+                if (etag != null && next.header("ETag") != etag) return null
+                if (etag == null && modified != null && next.header("Last-Modified") != modified) return null
+                val stream = next.body?.byteStream() ?: return null
+                val verify = ByteArray(tail.size)
+                var pos = 0
+                while (pos < verify.size) {
+                    val n = stream.read(verify, pos, verify.size - pos)
+                    if (n < 0) return null
+                    if (n > 0) pos += n
+                }
+                if (!java.util.Arrays.equals(tail, verify)) {
+                    nlog("[Seg] RESUME dữ liệu đối chiếu không khớp — dừng")
+                    return null
+                }
+                response = null
+                return next to stream
+            } catch (e: java.io.IOException) {
+                nlog("[Seg] RESUME lỗi upstream ${e.javaClass.simpleName}: ${e.message?.take(70)}")
+                return null
+            } finally {
+                try { response?.close() } catch (_: Throwable) {}
+            }
+        }
+
+        private fun streamOkHttpBody(
+            resp: okhttp3.Response, output: AvsResponseOutput, crlf: String, t0: Long, method: String
+        ): Long {
             val body = resp.body ?: return -1
-            if (body.contentLength() == 0L) return -1
+            val originalRange = if (resp.code == 206) parseContentRange(resp.header("Content-Range")) else null
+            val length = originalRange?.let { it.end - it.start + 1 } ?: body.contentLength()
+            if (length == 0L) return -1
             val statusLine = if (resp.code == 206) "HTTP/1.1 206 Partial Content" else "HTTP/1.1 200 OK"
             val head = StringBuilder(statusLine).append(crlf)
                 .append("Content-Type: ").append(resp.header("Content-Type") ?: "application/octet-stream").append(crlf)
@@ -3594,22 +3981,63 @@ class AnimeVsubProvider : MainAPI() {
                 .append("Connection: close").append(crlf)
             resp.header("Content-Range")?.let { head.append("Content-Range: ").append(it).append(crlf) }
             resp.header("Accept-Ranges")?.let { head.append("Accept-Ranges: ").append(it).append(crlf) }
-            val len = body.contentLength()
-            if (len >= 0) head.append("Content-Length: ").append(len).append(crlf)
+            if (length >= 0) head.append("Content-Length: ").append(length).append(crlf)
             head.append(crlf)
             output.write(head.toString().toByteArray())
+            if (okLogCount.get() < 40)
+                nlog("[Seg] READY $method status=${resp.code} bytes=$length headerMs=${System.currentTimeMillis() - t0}")
             val buf = ByteArray(65536)
             var sent = 0L
-            body.byteStream().use { stream ->
-                while (true) {
-                    val n = stream.read(buf)
-                    if (n < 0) break
+            var tail = ByteArray(0)
+            var retries = 0
+            var current = resp
+            var stream = body.byteStream()
+            var lastProgress = System.currentTimeMillis()
+            var progressLogs = 0
+            try {
+                while (length < 0 || sent < length) {
+                    var problem: java.io.IOException? = null
+                    val wanted = if (length >= 0) minOf(buf.size.toLong(), length - sent).toInt() else buf.size
+                    val n = try { stream.read(buf, 0, wanted) } catch (e: java.io.IOException) { problem = e; -1 }
+                    if (n < 0) {
+                        if (problem == null && length < 0) break
+                        if (length >= 0 && sent == length) break
+                        nlog("[Seg] upstream ngắt $method bytes=$sent/$length ${problem?.javaClass?.simpleName ?: "EOF"}")
+                        if (originalRange == null || retries >= 2 || sent <= 0) return -1
+                        retries++
+                        try { current.close() } catch (_: Throwable) {}
+                        val next = resumeRange(resp, originalRange, sent, tail) ?: return -1
+                        current = next.first
+                        stream = next.second
+                        nlog("[Seg] RESUME #$retries tiếp từ byte=$sent")
+                        continue
+                    }
                     if (n == 0) continue
-                    output.write(buf, 0, n)
+                    try {
+                        output.write(buf, 0, n)
+                    } catch (e: java.io.IOException) {
+                        nlog("[Seg] player đóng $method bytes=$sent/$length ${e.javaClass.simpleName}")
+                        return -1
+                    }
+                    val before = sent
                     sent += n
+                    tail = lastBytes(tail, buf, n)
+                    if (before == 0L && okLogCount.get() < 40)
+                        nlog("[Seg] FIRST $method firstMs=${System.currentTimeMillis() - t0} bytes=$n")
+                    if (sent >= 4096L && !servedBig) {
+                        servedBig = true
+                        calmRecoveredPlayer()
+                    }
+                    val now = System.currentTimeMillis()
+                    if (now - lastProgress >= 5_000L && progressLogs++ < 6) {
+                        lastProgress = now
+                        nlog("[Seg] PROGRESS $method bytes=$sent/$length totalMs=${now - t0}")
+                    }
                 }
+                return sent
+            } finally {
+                if (current !== resp) try { current.close() } catch (_: Throwable) {}
             }
-            return sent
         }
 
         private fun validOkHttpResponse(
@@ -3654,7 +4082,7 @@ class AnimeVsubProvider : MainAPI() {
                 callWithDnsRetry(rb.build()).use { resp ->
                     val headerMs = System.currentTimeMillis() - t0
                     if (!validOkHttpResponse(resp, reqRange, url, "RECIPE")) return@use false
-                    val sent = streamOkHttpBody(resp, output, crlf)
+                    val sent = streamOkHttpBody(resp, output, crlf, t0, "RECIPE")
                     if (sent >= 4096L) servedBig = true
                     if (sent > 0 && okLogCount.incrementAndGet() <= 40) {
                         nlog("[Seg] RECIPE OK bytes=$sent headerMs=${headerMs} totalMs=${System.currentTimeMillis() - t0} url=...${url.takeLast(26)}")
@@ -3706,6 +4134,23 @@ class AnimeVsubProvider : MainAPI() {
             return true
         }
 
+        private fun viaWarmResponse(
+            resp: okhttp3.Response, segUrl: String, reqRange: String?,
+            output: AvsResponseOutput, crlf: String, t0: Long
+        ): Boolean {
+            return try {
+                if (!validOkHttpResponse(resp, reqRange, segUrl, "WARM")) return false
+                val sent = streamOkHttpBody(resp, output, crlf, t0, "WARM")
+                if (sent >= 4096L) servedBig = true
+                if (sent > 0 && okLogCount.incrementAndGet() <= 40)
+                    nlog("[Seg] WARM OK bytes=$sent totalMs=${System.currentTimeMillis() - t0}")
+                sent > 0
+            } catch (e: Throwable) {
+                nlog("[Seg] WARM lỗi ${e.javaClass.simpleName}: ${e.message?.take(80)}")
+                false
+            }
+        }
+
         private fun viaOkHttp(segUrl: String, reqRange: String?, output: AvsResponseOutput, crlf: String, t0: Long): Boolean {
             val ck = cookieHeaderFor(segUrl)
             for (ref in referers) {
@@ -3723,7 +4168,7 @@ class AnimeVsubProvider : MainAPI() {
                     segClient.newCall(rb.build()).execute().use { resp ->
                         val headerMs = System.currentTimeMillis() - t0
                         if (!validOkHttpResponse(resp, reqRange, segUrl, "OKHTTP")) return@use false
-                        val sent = streamOkHttpBody(resp, output, crlf)
+                        val sent = streamOkHttpBody(resp, output, crlf, t0, "OKHTTP")
                         if (sent >= 4096L) servedBig = true
                         if (sent > 0 && okLogCount.incrementAndGet() <= 40) {
                             nlog("[Seg] OKHTTP OK bytes=$sent headerMs=${headerMs} totalMs=${System.currentTimeMillis() - t0} sinceReg=${System.currentTimeMillis() - bornAt}ms url=...${segUrl.takeLast(26)}")
@@ -3755,7 +4200,7 @@ class AnimeVsubProvider : MainAPI() {
                 segClient.newCall(rb.build()).execute().use { resp ->
                     val headerMs = System.currentTimeMillis() - t0
                     if (!validOkHttpResponse(resp, reqRange, segUrl, "OKHTTP-ORIGIN")) return@use false
-                    val sent = streamOkHttpBody(resp, output, crlf)
+                    val sent = streamOkHttpBody(resp, output, crlf, t0, "OKHTTP-ORIGIN")
                     if (sent >= 4096L) servedBig = true
                     if (sent > 0 && okLogCount.incrementAndGet() <= 40)
                         nlog("[Seg] OKHTTP-ORIGIN OK bytes=$sent headerMs=$headerMs totalMs=${System.currentTimeMillis() - t0}")
