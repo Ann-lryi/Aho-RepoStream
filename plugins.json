@@ -22,10 +22,10 @@
     },
     {
         "iconUrl": "https://phim.nguonc.com/favicon.ico",
-        "fileHash": "sha256-f2986fd4c3b49579ee642b3e822943ac0f313a9e3b9c8603fe562f8f7106251d",
+        "fileHash": "sha256-ed39bcdbce164c2eec8640004ec4d1f8ef49639bd7040567f2976bddf10798a1",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/Ann-lryi/Aho-RepoStream",
-        "fileSize": 143571,
+        "fileSize": 143548,
         "status": 1,
         "language": "vi",
         "authors": [
