@@ -1,5 +1,5 @@
-// use an integer for version numbers — v28: chặn raw playlist (_t=) hết 2004 + cứu phim iframes=0
-version = 28
+// use an integer for version numbers — v29: T1-T7 tốc độ (register ngay, poller hết treo, 1 proxy, prefetch đầu) — giữ nguyên cơ chế phát v28
+version = 29
 
 
 cloudstream {
