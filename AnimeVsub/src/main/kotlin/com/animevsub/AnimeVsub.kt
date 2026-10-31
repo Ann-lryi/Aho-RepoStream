@@ -43,7 +43,7 @@ class AnimeVsubProvider : MainAPI() {
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 
-    private val AVS_BUILD = "v33"
+    private val AVS_BUILD = "v34"
 
     private val AVS_FAST_REAL_PLAY = true
     private val REAL_STARTUP_GRACE_MS = 1_200L
@@ -3268,6 +3268,14 @@ class AnimeVsubProvider : MainAPI() {
         }
     }
 
+    private val parallelSegClient: okhttp3.OkHttpClient by lazy {
+        segClient.newBuilder()
+            .connectionPool(okhttp3.ConnectionPool(2, 90, java.util.concurrent.TimeUnit.SECONDS))
+            .build()
+    }
+
+    private class AvsWarmLane(val alternate: Boolean)
+
     private class AvsPrefetchTask {
         val done = java.util.concurrent.CountDownLatch(1)
         @Volatile var call: okhttp3.Call? = null
@@ -3330,6 +3338,10 @@ class AnimeVsubProvider : MainAPI() {
         private val prefetchSlots = java.util.concurrent.Semaphore(3)
         private val warmConnections = java.util.concurrent.ConcurrentHashMap<String, AvsWarmConnection>()
         private val warmSlots = java.util.concurrent.Semaphore(1)
+        @Volatile private var parallelBoostUntilMs = 0L
+        @Volatile private var parallelCooldownUntilMs = 0L
+        @Volatile private var lastSoloBytesPerSecond = 0.0
+        private val parallelLogCount = java.util.concurrent.atomic.AtomicInteger(0)
         @Volatile private var startupRecoveryRequired = false
         @Volatile private var startupRecoveryDone = false
         @Volatile private var recoverySegmentOk = false
@@ -3588,7 +3600,9 @@ class AnimeVsubProvider : MainAPI() {
             }
         }
 
-        private fun openWarmConnection(u: String, rg: String?, startup: Boolean): AvsWarmConnection? {
+        private fun openWarmConnection(
+            u: String, rg: String?, startup: Boolean, alternate: Boolean = false, ttlMs: Long = 8_000L
+        ): AvsWarmConnection? {
             val key = cacheKey(u, rg)
             if (cacheGet(key) != null || !warmSlots.tryAcquire()) return null
             val task = AvsWarmConnection()
@@ -3613,7 +3627,8 @@ class AnimeVsubProvider : MainAPI() {
                                 .header("Sec-Fetch-Dest", "empty")
                             rg?.let { rb.header("Range", it) }
                             cookieHeaderFor(u)?.let { rb.header("Cookie", it) }
-                            val call = segClient.newCall(rb.build())
+                            rb.tag(AvsWarmLane::class.java, AvsWarmLane(alternate))
+                            val call = (if (alternate) parallelSegClient else segClient).newCall(rb.build())
                             task.call = call
                             if (task.cancelled) { call.cancel(); return@execute }
                             val resp = call.execute()
@@ -3653,7 +3668,7 @@ class AnimeVsubProvider : MainAPI() {
                             task.ready.countDown()
                         }
                         if (published) {
-                            try { task.released.await(8, java.util.concurrent.TimeUnit.SECONDS) }
+                            try { task.released.await(ttlMs, java.util.concurrent.TimeUnit.MILLISECONDS) }
                             catch (_: InterruptedException) { Thread.currentThread().interrupt() }
                         }
                     } finally {
@@ -3739,7 +3754,9 @@ class AnimeVsubProvider : MainAPI() {
             return end - start + 1
         }
 
-        private fun maybePrefetchSegment(fromIdx: Int, early: Boolean = false): AvsWarmConnection? {
+        private fun maybePrefetchSegment(
+            fromIdx: Int, early: Boolean = false, parallel: Boolean = false, currentAlternate: Boolean = false
+        ): AvsWarmConnection? {
             if (!fastReal || fromIdx < 0 || latestSegmentIndex.get() != fromIdx) return null
             val entry = synchronized(segOrder) { segOrder.getOrNull(fromIdx + 1) } ?: return null
             val key = cacheKey(entry.first, entry.second)
@@ -3747,12 +3764,14 @@ class AnimeVsubProvider : MainAPI() {
             if (System.currentTimeMillis() - lastRequest < 3_000L) return null
             val size = rangeLength(entry.second)
             if (early && (size == null || size !in 1L..3_145_728L)) return null
-            val task = openWarmConnection(entry.first, entry.second, false) ?: return null
+            val task = openWarmConnection(entry.first, entry.second, false,
+                alternate = parallel && !currentAlternate,
+                ttlMs = if (parallel) 16_000L else 8_000L) ?: return null
             if (latestSegmentIndex.get() != fromIdx) {
                 cancelWarmConnection(task)
                 return null
             }
-            if (early) nlog("[Ahead] mở sớm segment kế bytes=$size")
+            if (early && !parallel) nlog("[Ahead] mở sớm segment kế bytes=$size")
             return task
         }
 
@@ -4093,6 +4112,7 @@ class AnimeVsubProvider : MainAPI() {
                 return null
             }
             val builder = original.request.newBuilder().header("Range", wanted)
+                .tag(AvsWarmLane::class.java, AvsWarmLane(false))
             (etag ?: modified)?.let { builder.header("If-Range", it) }
             var response: okhttp3.Response? = null
             try {
@@ -4163,6 +4183,12 @@ class AnimeVsubProvider : MainAPI() {
             var firstByteAt = 0L
             var earlyStarted = false
             var earlyTask: AvsWarmConnection? = null
+            var parallelAttempted = false
+            var parallelActive = false
+            var parallelCheckAt = 0L
+            var parallelStartAt = 0L
+            var parallelCheckBytes = 0L
+            var parallelBaseline = 0.0
             var progressLogs = 0
             try {
                 while (length < 0 || sent < length) {
@@ -4202,6 +4228,69 @@ class AnimeVsubProvider : MainAPI() {
                         calmRecoveredPlayer()
                     }
                     val now = System.currentTimeMillis()
+                    val elapsed = (now - firstByteAt).coerceAtLeast(1L)
+                    val mediaBytesPerSecond = segmentDuration?.let { length.toDouble() / it }
+                    val currentBytesPerSecond = sent.toDouble() * 1_000.0 / elapsed
+                    if (!parallelAttempted && !earlyStarted && segmentIndex >= 0 &&
+                        latestSegmentIndex.get() == segmentIndex && length >= 524_288L &&
+                        sent >= 131_072L && sent.toDouble() / length < 0.80 &&
+                        mediaBytesPerSecond != null && now >= parallelCooldownUntilMs) {
+                        val measuredSlow = elapsed >= 1_000L && currentBytesPerSecond < mediaBytesPerSecond * 1.08
+                        val learned = now < parallelBoostUntilMs && lastSoloBytesPerSecond > 0.0
+                        if (measuredSlow || learned) {
+                            parallelAttempted = true
+                            if (measuredSlow && !learned) lastSoloBytesPerSecond = currentBytesPerSecond
+                            parallelBaseline = if (learned) lastSoloBytesPerSecond else currentBytesPerSecond
+                            val currentAlternate = current.request.tag(AvsWarmLane::class.java)?.alternate ?: false
+                            earlyTask = maybePrefetchSegment(segmentIndex, early = true, parallel = true,
+                                currentAlternate = currentAlternate)
+                            if (earlyTask != null) {
+                                earlyStarted = true
+                                parallelActive = true
+                                parallelStartAt = now
+                                parallelCheckAt = now
+                                parallelCheckBytes = sent
+                                if (parallelLogCount.incrementAndGet() <= 30)
+                                    nlog("[Boost] tải song song segment kế baselineKbps=${(parallelBaseline * 8 / 1000).toInt()} mediaKbps=${(mediaBytesPerSecond * 8 / 1000).toInt()}")
+                            }
+                        }
+                    }
+                    if (parallelActive && latestSegmentIndex.get() == segmentIndex &&
+                        now - parallelCheckAt >= 2_000L && sent < length) {
+                        val task = earlyTask
+                        val state = if (task == null) 0 else synchronized(task) {
+                            when {
+                                task.claimed -> 3
+                                task.cancelled -> 0
+                                task.response != null -> 1
+                                task.ready.count == 0L -> 0
+                                else -> 2
+                            }
+                        }
+                        val intervalRate = (sent - parallelCheckBytes).toDouble() * 1_000.0 /
+                            (now - parallelCheckAt).coerceAtLeast(1L)
+                        val tooSlow = state == 1 && parallelBaseline > 0.0 && mediaBytesPerSecond != null &&
+                            intervalRate < parallelBaseline * 0.65 && intervalRate < mediaBytesPerSecond * 0.90
+                        val failed = state == 0 || (state == 2 && now - parallelStartAt >= 5_000L)
+                        if (tooSlow || failed) {
+                            task?.let { cancelWarmConnection(it) }
+                            earlyTask = null
+                            earlyStarted = false
+                            parallelActive = false
+                            parallelBoostUntilMs = 0L
+                            parallelCooldownUntilMs = now + 30_000L
+                            if (parallelLogCount.incrementAndGet() <= 30)
+                                nlog("[Boost] giảm tải, dùng luồng thường reason=${if (failed) "header" else "bandwidth"} rateKbps=${(intervalRate * 8 / 1000).toInt()}")
+                        } else if (state == 1) {
+                            parallelBoostUntilMs = now + 60_000L
+                            parallelCheckAt = now
+                            parallelCheckBytes = sent
+                            if (parallelLogCount.incrementAndGet() <= 30)
+                                nlog("[Boost] tiếp tục tải song song rateKbps=${(intervalRate * 8 / 1000).toInt()}")
+                        } else if (state == 3) {
+                            parallelActive = false
+                        }
+                    }
                     if (!earlyStarted && segmentIndex >= 0 && latestSegmentIndex.get() == segmentIndex &&
                         length >= 524_288L && sent >= 262_144L && sent < length && now - firstByteAt >= 1_000L) {
                         val downloadRate = sent.toDouble() * 1_000.0 / (now - firstByteAt).coerceAtLeast(1L)
