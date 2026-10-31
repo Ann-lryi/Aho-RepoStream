@@ -43,7 +43,7 @@ class AnimeVsubProvider : MainAPI() {
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 
-    private val AVS_BUILD = "v34"
+    private val AVS_BUILD = "v35"
 
     private val AVS_FAST_REAL_PLAY = true
     private val REAL_STARTUP_GRACE_MS = 1_200L
@@ -100,7 +100,7 @@ class AnimeVsubProvider : MainAPI() {
             ?.getSharedPreferences("avs_provider_state", android.content.Context.MODE_PRIVATE)
     } catch (_: Throwable) { null }
 
-    private fun restoreStateOnce() {
+    @Synchronized private fun restoreStateOnce() {
         if (!stateRestored.compareAndSet(false, true)) return
         try {
             val p = statePrefs()
@@ -114,12 +114,12 @@ class AnimeVsubProvider : MainAPI() {
             }
             if (AVS_DIRECT_CANONICAL) {
                 val ch = p.getString("canonicalHost", null)
-                if (!ch.isNullOrBlank() && ch.contains("animevietsub") && ch != hostOf(mainUrl)) {
+                if (!ch.isNullOrBlank() && isSiteUrl("https://$ch/") && ch != hostOf(mainUrl)) {
                     canonicalHost = ch
                     nlog("[Fetch] host chuẩn khôi phục: $ch (v30 C2)")
                 }
             }
-        } catch (_: Throwable) {}
+        } catch (_: Throwable) { stateRestored.set(false) }
     }
 
     private fun setPlainDead(untilMs: Long) {
@@ -130,7 +130,7 @@ class AnimeVsubProvider : MainAPI() {
     private fun learnCanonical(pageUrl: String) {
         if (!AVS_DIRECT_CANONICAL || canonicalOff) return
         val h = hostOf(pageUrl)
-        if (h.isEmpty() || h == hostOf(mainUrl) || !h.contains("animevietsub")) return
+        if (h.isEmpty() || h == hostOf(mainUrl) || !isSiteUrl(pageUrl)) return
         if (canonicalHost != h) {
             canonicalHost = h
             nlog("[Fetch] học host chuẩn: $h (mainUrl=${hostOf(mainUrl)}) (v30 C2)")
@@ -191,7 +191,7 @@ class AnimeVsubProvider : MainAPI() {
 
     private val diagUrlQuery = Regex("""(?i)(https?://[^\s|"'<>?#]+)\?[^\s|"'<>]*""")
     private val diagHeaders = Regex("""(?i)\b(cookie|authorization|x-envelope|set-cookie)\s*[:=]\s*[^\r\n|]+""")
-    private val diagFields = Regex("""(?i)(["']?(?:token|access_token|cf_clearance|__cf_bm)["']?\s*[:=]\s*["']?)[^"'\s,|}]+""")
+    private val diagFields = Regex("""(?i)(["']?(?:[a-z0-9_-]*token|cf_clearance|__cf_bm|password|secret|signature|api[_-]?key|x-envelope|hash|auth)["']?\s*[:=]\s*["']?)[^"'\s,|}]+""")
 
     private fun redactDiag(msg: String): String {
         val noQueries = diagUrlQuery.replace(msg) { it.groupValues[1] + "?[redacted]" }
@@ -253,9 +253,26 @@ class AnimeVsubProvider : MainAPI() {
 
     private val docCache = ConcurrentHashMap<String, CachedDoc>()
     private val DOC_CACHE_TTL_MS = 5 * 60 * 1000L
+    private val DOC_CACHE_MAX = 80
+
+    private fun cacheDoc(url: String, doc: Document) {
+        val now = System.currentTimeMillis()
+        synchronized(docCache) {
+            docCache[url] = CachedDoc(doc, now)
+            if (docCache.size > DOC_CACHE_MAX) {
+                for ((key, entry) in docCache) {
+                    if (now - entry.time >= DOC_CACHE_TTL_MS) docCache.remove(key, entry)
+                }
+                while (docCache.size > DOC_CACHE_MAX) {
+                    val oldest = docCache.entries.minByOrNull { it.value.time } ?: break
+                    docCache.remove(oldest.key, oldest.value)
+                }
+            }
+        }
+    }
 
     private fun cachedDocSupports(cached: CachedDoc, mode: Int): Boolean =
-        mode != MODE_EPISODES || cached.doc.selectFirst("a[data-id]") != null
+        mode != MODE_EPISODES || episodeAnchors(cached.doc).isNotEmpty()
 
     private val cfCookieCache = ConcurrentHashMap<String, Map<String, String>>()
     private val cfMutex = Mutex()
@@ -318,6 +335,7 @@ class AnimeVsubProvider : MainAPI() {
     )
 
     private fun noteServerError(where: String, url: String) {
+        if (!isSiteUrl(url)) return
         val n = srvErrCount.incrementAndGet()
         nlog("[Site] lỗi 5xx #$n ($where) ${url.take(70)}")
 
@@ -366,6 +384,20 @@ class AnimeVsubProvider : MainAPI() {
         } catch (e: Throwable) { nlogE("[CookieMgr]", e); null }
     }
 
+    private fun cookiesForUrl(url: String): Map<String, String>? {
+        cookiesFromCookieManager(url)?.let { return it }
+        return if (sameOrigin(url, mainUrl)) cfCookieCache[mainUrl] else null
+    }
+
+    private fun isSiteUrl(url: String): Boolean {
+        val host = try { java.net.URI(url).host?.lowercase(java.util.Locale.ROOT) ?: "" }
+            catch (_: Throwable) { "" }
+        val main = try { java.net.URI(mainUrl).host?.lowercase(java.util.Locale.ROOT) ?: "" }
+            catch (_: Throwable) { "" }
+        return host.isNotEmpty() && (host == main || host == canonicalHost ||
+            Regex("""^(?:[a-z0-9-]+\.)*animevietsub\.[a-z]{2,}$""").matches(host))
+    }
+
     private fun countPhimAnchors(html: String): Int {
         return try {
             Regex("""/phim/[^"'\s<>\\]*?-a\d+""").findAll(html)
@@ -379,9 +411,9 @@ class AnimeVsubProvider : MainAPI() {
         } catch (_: Throwable) { 0 }
     }
 
-    private fun countEpisodeAnchors(html: String): Int {
-        return try { Regex("""data-id=""").findAll(html).count() } catch (_: Throwable) { 0 }
-    }
+    private fun countEpisodeAnchors(html: String): Int = try {
+        episodeAnchors(Jsoup.parse(html)).size
+    } catch (_: Throwable) { 0 }
 
     private val playerIframeRegex = Regex(
         """<iframe[^>]+(?:src|data-src)\s*=\s*["']?[^"'>\s]*googleapiscdn""",
@@ -416,8 +448,11 @@ class AnimeVsubProvider : MainAPI() {
         }
     }
 
-    private fun hostOf(url: String): String =
-        Regex("""^https?://([^/?#]+)""").find(url)?.groupValues?.get(1)?.lowercase() ?: ""
+    private fun hostOf(url: String): String = try {
+        val uri = java.net.URI(url)
+        if (!uri.scheme.equals("http", true) && !uri.scheme.equals("https", true)) ""
+        else uri.host?.lowercase(java.util.Locale.ROOT) ?: ""
+    } catch (_: Throwable) { "" }
 
     private fun isBackgroundPlayerUrl(url: String): Boolean = try {
         val uri = java.net.URI(url)
@@ -439,11 +474,21 @@ class AnimeVsubProvider : MainAPI() {
         try {
 
             val resp = withTimeoutOrNull(PLAIN_TIMEOUT_MS) {
-                if (cookies != null) {
-                    app.get(url, headers = commonHeaders, cookies = cookies)
-                } else {
-                    app.get(url, headers = commonHeaders)
+                var currentUrl = url
+                var scoped = if (sameOrigin(url, mainUrl)) cookies else cookiesForUrl(url)
+                var result = app.get(currentUrl, headers = commonHeaders,
+                    cookies = scoped ?: emptyMap(), allowRedirects = false)
+                var redirects = 0
+                while (result.code in listOf(301, 302, 303, 307, 308) && redirects++ < 5) {
+                    val location = result.headers["Location"] ?: break
+                    val next = resolvePlaylistUri(location, currentUrl) ?: break
+                    result.text
+                    currentUrl = next
+                    scoped = cookiesForUrl(currentUrl)
+                    result = app.get(currentUrl, headers = commonHeaders,
+                        cookies = scoped ?: emptyMap(), allowRedirects = false)
                 }
+                result
             }
             if (resp == null) {
                 nlog("[Fetch] plain $tag TIMEOUT ${PLAIN_TIMEOUT_MS}ms (v29 F1) $url")
@@ -479,9 +524,9 @@ class AnimeVsubProvider : MainAPI() {
                     nlog("[Fetch] plain $tag ${resp.code} SRV-ERR title='${pageTitleOf(html)}' len=${html.length} ms=${System.currentTimeMillis() - t0} $url")
                     return null
                 }
-                val doc = resp.document
-                if (doc.body()?.text()?.isNotBlank() == true) {
-                    noteSiteOk()
+                val doc = Jsoup.parse(html, resp.url)
+                if (doc.body().text().isNotBlank() || doc.selectFirst("iframe, video, source, embed, script") != null) {
+                    if (isSiteUrl(url)) noteSiteOk()
                     nlog("[Fetch] plain $tag OK ${resp.code} len=${html.length} ms=${System.currentTimeMillis() - t0} $url")
                     return doc
                 }
@@ -502,7 +547,7 @@ class AnimeVsubProvider : MainAPI() {
                 if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) {
 
                     if (docLooksServerError(cached.doc)) {
-                        docCache.remove(url)
+                        docCache.remove(url, cached)
                         nlog("[Fetch] cache-drop (trang lỗi 5xx) $url")
                     } else if (cachedDocSupports(cached, mode)) {
                         nlog("[Fetch] cache-hit $url")
@@ -567,7 +612,7 @@ class AnimeVsubProvider : MainAPI() {
     private suspend fun fetchDocChain(url: String, useCache: Boolean, mode: Int): Document {
 
         restoreStateOnce()
-        val cachedCookies = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
+        val cachedCookies = cookiesForUrl(url)
         if (System.currentTimeMillis() < plainHtmlDeadUntilMs) {
             nlog("[Fetch] plain TẮT (breaker 403 liên tục) — vào WebView luôn $url")
         } else {
@@ -586,7 +631,7 @@ class AnimeVsubProvider : MainAPI() {
                         plainDeadStreak.set(0)
                         setPlainDead(0L)
                     }
-                    if (useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
+                    if (useCache) cacheDoc(url, doc)
                     return doc
                 }
                 if (!deadNow && hostOf(url) == hostOf(mainUrl)) {
@@ -611,7 +656,7 @@ class AnimeVsubProvider : MainAPI() {
                     if (System.currentTimeMillis() - cached.time < DOC_CACHE_TTL_MS) {
 
                         if (docLooksServerError(cached.doc)) {
-                            docCache.remove(url)
+                            docCache.remove(url, cached)
                             nlog("[Fetch] cache-drop (trang lỗi 5xx) $url")
                         } else if (cachedDocSupports(cached, mode)) {
                             return@run cached.doc
@@ -620,12 +665,12 @@ class AnimeVsubProvider : MainAPI() {
                 }
             }
 
-            val fresh = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
+            val fresh = cookiesForUrl(url)
 
             if (System.currentTimeMillis() >= plainHtmlDeadUntilMs &&
                 fresh != null && fresh != cachedCookies) {
                 tryPlainDoc(url, fresh)?.let {
-                    if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
+                    if (useCache) cacheDoc(url, it)
                     return@run it
                 }
             }
@@ -645,7 +690,7 @@ class AnimeVsubProvider : MainAPI() {
                 try { statePrefs()?.edit()?.remove("canonicalHost")?.apply() } catch (_: Throwable) {}
                 doc = webviewDocCapture(url, mode, WV_SILENT_TIMEOUT_MS, interactive = false)
             }
-            if (doc != null && useCache) docCache[url] = CachedDoc(doc, System.currentTimeMillis())
+            if (doc != null && useCache) cacheDoc(url, doc)
             doc
         }
         if (silent != null) return silent
@@ -656,17 +701,17 @@ class AnimeVsubProvider : MainAPI() {
         }
 
         unlockGate(url, mode)?.let {
-            if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
+            if (useCache) cacheDoc(url, it)
             return it
         }
 
-        tryPlainDoc(url, cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl))?.let {
-            if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
+        tryPlainDoc(url, cookiesForUrl(url))?.let {
+            if (useCache) cacheDoc(url, it)
             return it
         }
 
         webviewDocCapture(url, mode, WV_SILENT_TIMEOUT_MS, interactive = false)?.let {
-            if (useCache) docCache[url] = CachedDoc(it, System.currentTimeMillis())
+            if (useCache) cacheDoc(url, it)
             return it
         }
 
@@ -680,7 +725,7 @@ class AnimeVsubProvider : MainAPI() {
                 corsProxies.map { proxy -> async { tryCorsProxy(proxy, url) } }
             }.awaitAll().filterNotNull().firstOrNull()
             if (found != null) {
-                if (useCache) docCache[url] = CachedDoc(found, System.currentTimeMillis())
+                if (useCache) cacheDoc(url, found)
                 return found
             }
             if (proxyFailCount.get() >= 4) {
@@ -707,11 +752,11 @@ class AnimeVsubProvider : MainAPI() {
             }
             val html = resp.text
             if (resp.code in 200..299 && !looksBlocked(html) && !looksServerError(html)) {
-                val doc = resp.document
-                if (doc.body()?.text()?.isNotBlank() == true) {
+                val doc = Jsoup.parse(html, url)
+                if (doc.body().text().isNotBlank() || doc.selectFirst("iframe, video, source, embed, script") != null) {
                     nlog("[Fetch] proxy ${hostOf(proxy)} OK ${resp.code} len=${html.length} ms=${System.currentTimeMillis() - pt0} $url")
                     proxyFailCount.set(0)
-                    noteSiteOk()
+                    if (isSiteUrl(url)) noteSiteOk()
                     return doc
                 }
             }
@@ -729,7 +774,7 @@ class AnimeVsubProvider : MainAPI() {
     private suspend fun fetchText(url: String, referer: String?): String? {
         val headers = if (referer != null) commonHeaders + mapOf("Referer" to referer) else commonHeaders
         val t0 = System.currentTimeMillis()
-        val short = "...${url.takeLast(60)}"
+        val short = "host=${hostOf(url)}"
         return try {
             val resp = app.get(url, headers = headers)
             val t = resp.text
@@ -833,7 +878,8 @@ class AnimeVsubProvider : MainAPI() {
         val out = LinkedHashMap<String, SearchResponse>()
         for (a in doc.select("a[href*=\"/phim/\"]")) {
             try {
-                val href = absolutize(a.attr("href")) ?: continue
+                val href = a.absUrl("href").takeIf { it.isNotBlank() }
+                    ?: resolvePlaylistUri(a.attr("href"), doc.baseUri().ifBlank { mainUrl }) ?: continue
                 val detail = detailUrl(href) ?: continue
                 val slugId = slugIdRegex.find(detail)!!.groupValues[1]
                 if (out.containsKey(slugId)) continue
@@ -859,7 +905,9 @@ class AnimeVsubProvider : MainAPI() {
                 val img: Element? = a.selectFirst("img")
                     ?: a.closest("li, .item, .card, .movie-item, .film-item, article, div")
                         ?.selectFirst("img")
-                val poster: String? = if (img == null) null else absolutize(pickImgUrl(img))
+                val poster: String? = if (img == null) null else pickImgUrl(img)?.let {
+                    resolvePlaylistUri(it, doc.baseUri().ifBlank { mainUrl }) ?: absolutize(it)
+                }
 
                 out[slugId] = newAnimeSearchResponse(title, detail, TvType.Anime) {
                     this.posterUrl = poster
@@ -879,7 +927,7 @@ class AnimeVsubProvider : MainAPI() {
         val keyword = URLEncoder.encode(query.trim(), "UTF-8")
 
         try {
-            val res = app.post(
+            val res = withTimeoutOrNull(PLAIN_TIMEOUT_MS) { app.post(
                 "$mainUrl/ajax/suggest",
                 headers = commonHeaders + mapOf(
                     "X-Requested-With" to "XMLHttpRequest",
@@ -887,7 +935,7 @@ class AnimeVsubProvider : MainAPI() {
                     "Referer" to mainUrl
                 ),
                 data = mapOf("ajaxSearch" to "1", "keysearch" to query.trim())
-            )
+            ) } ?: throw java.io.IOException("search timeout")
             val body = res.text
             if (res.code in 200..299 && body.isNotBlank() && !looksBlocked(body) && !looksServerError(body)) {
                 val items = parseCards(Jsoup.parse(body, mainUrl))
@@ -933,10 +981,72 @@ class AnimeVsubProvider : MainAPI() {
 
     private fun normalizeEpName(raw: String?): String {
         if (raw.isNullOrBlank()) return "0"
-        val s = raw.trim()
-        val numMatch = Regex("""(\d+)""").find(s)
-        if (numMatch != null) return numMatch.groupValues[1].trimStart('0').ifBlank { "0" }
-        return s
+        val value = raw.trim().replace(Regex("\\s+"), " ")
+        if (Regex("""(?i)\b(?:season|mùa|phan|phần)\s*\d+""").containsMatchIn(value)) return value
+        val number = Regex("""^\s*(\d+(?:[.,]\d+)?)\s*$""").matchEntire(value)?.groupValues?.get(1)
+            ?: Regex("""(?i)\b(?:tập|tap|episode|ep)\s*[:.#-]?\s*(\d+(?:[.,]\d+)?)""")
+                .find(value)?.groupValues?.get(1)
+        if (number != null) return try {
+            java.math.BigDecimal(number.replace(',', '.')).stripTrailingZeros().toPlainString()
+        } catch (_: Throwable) { number }
+        return value
+    }
+
+    private fun episodeNumber(name: String): java.math.BigDecimal? = try {
+        if (!Regex("""\d+(?:\.\d+)?""").matches(name)) null else java.math.BigDecimal(name)
+    } catch (_: Throwable) { null }
+
+    private fun episodeAnchors(doc: Document): List<Element> {
+        val regions = doc.select("#list-server, [id^=list-server-], .list-server, .list-episode, #list-episode, #episode-list, .episode-list")
+        val fromRegions = regions.select("a[data-id]").distinct()
+        return if (fromRegions.isNotEmpty()) fromRegions
+        else doc.select("a[data-id][data-play], a[data-id][data-hash]").distinct()
+    }
+
+    private fun sameOrigin(a: String, b: String): Boolean = try {
+        val x = java.net.URI(a)
+        val y = java.net.URI(b)
+        val xs = x.scheme?.lowercase(java.util.Locale.ROOT)
+        val ys = y.scheme?.lowercase(java.util.Locale.ROOT)
+        val xp = if (x.port >= 0) x.port else if (xs == "https") 443 else 80
+        val yp = if (y.port >= 0) y.port else if (ys == "https") 443 else 80
+        (xs == "http" || xs == "https") && xs == ys &&
+            x.host != null && x.host.equals(y.host, true) && xp == yp
+    } catch (_: Throwable) { false }
+
+    private fun sameWatchUrl(a: String, b: String): Boolean = try {
+        val x = java.net.URI(a).normalize()
+        val y = java.net.URI(b).normalize()
+        sameOrigin(a, b) && x.rawPath == y.rawPath && x.rawQuery == y.rawQuery
+    } catch (_: Throwable) { false }
+
+    private fun selectWatchMeta(
+        watchUrl: String, epOrder: LinkedHashMap<String, String>,
+        epMeta: LinkedHashMap<String, MutableSet<String>>
+    ): List<AvsSrv> {
+        val genericWatch = try {
+            val uri = java.net.URI(watchUrl)
+            (uri.path ?: "").endsWith("/xem-phim.html", true) && uri.rawQuery.isNullOrBlank()
+        } catch (_: Throwable) { true }
+        val matching = if (genericWatch) emptySet() else
+            epOrder.filter { (name, url) -> epMeta.containsKey(name) && sameWatchUrl(url, watchUrl) }.keys
+        val selected = when {
+            matching.size == 1 -> matching.first()
+            epMeta.size == 1 -> epMeta.keys.first()
+            else -> {
+                val hint = try {
+                    val uri = java.net.URI(watchUrl)
+                    val pathNumber = Regex("""(?i)/tap-(\d+(?:[.]\d+)?)(?:[-./]|$)""")
+                        .find(uri.path ?: "")?.groupValues?.get(1)
+                    val queryNumber = (uri.rawQuery ?: "").split('&').firstOrNull {
+                        it.substringBefore('=').equals("ep", true)
+                    }?.substringAfter('=', "")?.takeIf { Regex("""\d+(?:[.]\d+)?""").matches(it) }
+                    pathNumber ?: queryNumber
+                } catch (_: Throwable) { null }
+                hint?.let { normalizeEpName(it) }?.takeIf { epMeta.containsKey(it) }
+            }
+        } ?: return emptyList()
+        return epMeta[selected]?.flatMap { parseAvsMeta(it) }?.distinct() ?: emptyList()
     }
 
     private data class AvsSrv(val id: String, val play: String, val hash: String)
@@ -974,9 +1084,8 @@ class AnimeVsubProvider : MainAPI() {
     ): Int {
         var added = 0
         try {
-            val region = doc.selectFirst("#list-server, #list-server-1, #list-server-2, .list-server, .list-episode")
-                ?: doc.body()
-            for (a in region?.select("a[data-id]") ?: emptyList()) {
+            val fallback = detail.trimEnd('/') + "/xem-phim.html"
+            for (a in episodeAnchors(doc)) {
                 try {
                     val id = a.attr("data-id").trim()
                     if (id.isBlank()) continue
@@ -986,16 +1095,21 @@ class AnimeVsubProvider : MainAPI() {
                     if (rawName.isBlank() || rawName.length > 40) rawName = id
                     val epName = normalizeEpName(rawName)
                     epMeta.getOrPut(epName) { LinkedHashSet() }.add(buildAvsMetaBlock(id, play, hash))
-                    if (!epOrder.containsKey(epName)) {
-
-                        val rawHref = a.attr("href").trim()
-                        val href = if (rawHref.isBlank() || rawHref.startsWith("#") ||
-                            rawHref.startsWith("javascript:", ignoreCase = true)) null
-                        else a.absUrl("href").takeIf { it.isNotBlank() } ?: absolutize(rawHref)
-                        epOrder[epName] = if (href != null && isWatchPageUrl(href) &&
-                            detailUrl(href) == detailUrl(detail)) href
-                        else detail.trimEnd('/') + "/xem-phim.html"
+                    val rawHref = a.attr("href").trim()
+                    val href = if (rawHref.isBlank() || rawHref.startsWith("#") ||
+                        rawHref.startsWith("javascript:", ignoreCase = true)) null
+                    else a.absUrl("href").takeIf { it.isNotBlank() }
+                        ?: resolvePlaylistUri(rawHref, doc.baseUri().ifBlank { fallback })
+                    val validHref = href?.takeIf {
+                        isWatchPageUrl(it) && detailUrl(it) == detailUrl(detail) &&
+                            (sameOrigin(it, detail) || sameOrigin(it, doc.baseUri()))
+                    }
+                    val old = epOrder[epName]
+                    if (old == null) {
+                        epOrder[epName] = validHref ?: fallback
                         added++
+                    } else if (validHref != null && sameWatchUrl(old, fallback) && !sameWatchUrl(validHref, fallback)) {
+                        epOrder[epName] = validHref
                     }
                 } catch (e: Throwable) { nlogE("[Load] list-server", e) }
             }
@@ -1009,41 +1123,40 @@ class AnimeVsubProvider : MainAPI() {
         var encrypted = false
         try {
             val json = org.json.JSONObject(body)
-            val links = json.opt("link") ?: json.opt("sources")
-            if (links is String) {
-                val s = links.replace("\\/", "/").trim()
-                if (s.contains("<iframe", ignoreCase = true)) {
-                    frames.addAll(harvestIframes(Jsoup.parse(s)))
-                } else {
-                    val u = absolutize(s)
-                    when {
-                        u == null || isJunkUrl(u)              -> encrypted = true
-                        m3u8UrlRegex.containsMatchIn(u) ||
-                        mp4UrlRegex.containsMatchIn(u)         -> media.add(u to "")
-                        json.optString("playTech") == "iframe" -> frames.add(u)
-                        else                                   -> encrypted = true
-                    }
+            fun addSource(raw: String, label: String, type: String) {
+                val value = raw.replace("\\/", "/").trim()
+                if (value.isBlank() || value == "null") return
+                if (value.contains("<iframe", ignoreCase = true)) {
+                    val found = harvestIframes(Jsoup.parse(value, mainUrl))
+                    if (found.isEmpty()) encrypted = true else frames.addAll(found)
+                    return
                 }
-            } else if (links is org.json.JSONArray) {
-                for (i in 0 until links.length()) {
-                    val item = links.optJSONObject(i) ?: continue
-                    val raw = item.optString("file").ifBlank { item.optString("src") }
-                        .replace("\\/", "/").trim()
-                    if (raw.isBlank()) { encrypted = true; continue }
-                    val u = absolutize(raw)
-                    if (u == null || isJunkUrl(u)) { encrypted = true; continue }
-                    val label = item.optString("label")
-                    if (m3u8UrlRegex.containsMatchIn(u) || mp4UrlRegex.containsMatchIn(u)) {
-                        media.add(u to label)
-                    } else if (item.optString("type").contains("iframe", true)) {
-                        frames.add(u)
-                    } else {
-                        encrypted = true
-                    }
+                val url = absolutize(value)
+                when {
+                    url == null || isJunkUrl(url) -> encrypted = true
+                    m3u8UrlRegex.containsMatchIn(url) || mp4UrlRegex.containsMatchIn(url) -> media.add(url to label)
+                    type.contains("iframe", true) -> frames.add(url)
+                    else -> encrypted = true
                 }
             }
+            fun addValue(value: Any?, inheritedType: String) {
+                when (value) {
+                    is String -> addSource(value, "", inheritedType)
+                    is org.json.JSONObject -> {
+                        val raw = sequenceOf("file", "src", "url", "link").mapNotNull { key ->
+                            if (value.isNull(key)) null else value.optString(key).takeIf { it.isNotBlank() && it != "null" }
+                        }.firstOrNull() ?: ""
+                        val label = if (value.isNull("label")) "" else value.optString("label")
+                        val type = if (value.isNull("type")) inheritedType else value.optString("type")
+                        addSource(raw, label, type)
+                    }
+                    is org.json.JSONArray -> for (i in 0 until value.length()) addValue(value.opt(i), inheritedType)
+                }
+            }
+            val type = if (json.isNull("playTech")) "" else json.optString("playTech")
+            addValue(json.opt("link"), type)
+            addValue(json.opt("sources"), type)
         } catch (e: Throwable) {
-
             try {
                 val ifr = harvestIframes(Jsoup.parse(body, mainUrl))
                 if (ifr.isNotEmpty()) {
@@ -1056,7 +1169,7 @@ class AnimeVsubProvider : MainAPI() {
                 }
             } catch (_: Throwable) { encrypted = true }
         }
-        return Triple(media, frames, encrypted)
+        return Triple(media.distinct(), frames.distinct(), encrypted)
     }
 
     private fun qualityFromLabel(label: String): Int {
@@ -1233,8 +1346,11 @@ class AnimeVsubProvider : MainAPI() {
         nlog("[Load] list-server eps=+$addedDetail total=${epOrder.size} meta=${epMeta.size}")
 
         for (a in doc.select("a[href]")) {
-            val href = absolutize(a.attr("href")) ?: continue
-            if (!href.contains("xem-phim")) continue
+            val rawHref = a.attr("href").trim()
+            val href = a.absUrl("href").takeIf { it.isNotBlank() }
+                ?: resolvePlaylistUri(rawHref, doc.baseUri().ifBlank { detail }) ?: continue
+            if (!isWatchPageUrl(href) || detailUrl(href) != detailUrl(detail) ||
+                (!sameOrigin(href, detail) && !sameOrigin(href, doc.baseUri()))) continue
             if (seenUrls.contains(href)) continue
 
             val label = a.text().trim()
@@ -1250,36 +1366,56 @@ class AnimeVsubProvider : MainAPI() {
             if (!epOrder.containsKey(epName)) epOrder[epName] = href
         }
 
-        if (epOrder.isEmpty()) {
-            try {
-                val wdoc = watchJob.await()
-                if (wdoc != null) {
-                    val addedWatch = parseOphimEpisodes(wdoc, detail, epOrder, epMeta)
-                    nlog("[Load] watch-page eps=+$addedWatch total=${epOrder.size} meta=${epMeta.size} $watchGuess")
-                }
-            } catch (e: Throwable) {
-                if (isCancellation(e)) throw e
-                nlogE("[Load] watch-page", e, watchGuess)
+        var watchDocument: Document? = null
+        try {
+            watchDocument = if (epOrder.isEmpty()) watchJob.await()
+                else withTimeoutOrNull(1_200L) { watchJob.await() }
+            if (watchDocument != null) {
+                val addedWatch = parseOphimEpisodes(watchDocument, detail, epOrder, epMeta)
+                nlog("[Load] watch-page eps=+$addedWatch total=${epOrder.size} meta=${epMeta.size} $watchGuess")
             }
-        } else {
-            watchJob.cancel()
+        } catch (e: Throwable) {
+            if (isCancellation(e)) throw e
+            nlogE("[Load] watch-page", e, watchGuess)
+        } finally {
+            if (!watchJob.isCompleted) watchJob.cancel()
         }
 
         nlog("[Load] $detail title='$title' tags=${tags.size} eps=${epOrder.size} totalEps=$totalEps")
         ntoastV("AnimeVsub $AVS_BUILD: $title — ${epOrder.size} tập")
 
         if (epOrder.isEmpty()) {
-            val n = totalEps ?: throw ErrorLoadingException("Không tìm thấy tập phim nào")
-            if (n in 1..2000) {
-                val base = detail.trimEnd('/')
-                for (i in 1..n) epOrder[i.toString()] = "$base/xem-phim.html?ep=$i"
-                nlog("[Load] fallback dựng $n tập từ info")
+            val linkedWatch = doc.select("a[href]").asSequence().mapNotNull { a ->
+                val raw = a.attr("href").trim()
+                val href = a.absUrl("href").takeIf { it.isNotBlank() }
+                    ?: resolvePlaylistUri(raw, doc.baseUri().ifBlank { detail })
+                href?.takeIf {
+                    isWatchPageUrl(it) && detailUrl(it) == detailUrl(detail) &&
+                        (sameOrigin(it, detail) || sameOrigin(it, doc.baseUri()))
+                }
+            }.firstOrNull()
+            val watchHasMedia = watchDocument?.let { watchDocumentHasMedia(it) } == true
+            val fallback = linkedWatch ?: watchGuess.takeIf { watchHasMedia }
+            if (fallback != null) {
+                epOrder["Full"] = fallback
+                nlog("[Load] fallback trang xem duy nhất")
             }
         }
 
         if (epOrder.isEmpty()) throw ErrorLoadingException("Không tìm thấy tập phim nào")
 
-        val episodes = epOrder.map { (epName, watchUrl) ->
+        val sortedEpisodes = epOrder.entries.withIndex().sortedWith { a, b ->
+            val x = episodeNumber(a.value.key)
+            val y = episodeNumber(b.value.key)
+            when {
+                x != null && y != null -> x.compareTo(y).takeIf { it != 0 } ?: a.index.compareTo(b.index)
+                x != null -> -1
+                y != null -> 1
+                else -> a.index.compareTo(b.index)
+            }
+        }
+        val episodes = sortedEpisodes.map { (_, entry) ->
+            val (epName, watchUrl) = entry
 
             val metaRaw = epMeta[epName]?.joinToString(";;") { it } ?: ""
             val data = if (metaRaw.isNotBlank())
@@ -1289,10 +1425,12 @@ class AnimeVsubProvider : MainAPI() {
                 this.name    = "Tập $epName"
                 this.episode = epName.toIntOrNull()
             })
-        }.sortedBy { it.episode ?: Int.MAX_VALUE }
+        }
 
         newTvSeriesLoadResponse(title, detail, TvType.Anime, episodes) {
-            this.posterUrl = poster.takeIf { it.isNotBlank() }
+            this.posterUrl = poster.takeIf { it.isNotBlank() }?.let {
+                resolvePlaylistUri(it, doc.baseUri().ifBlank { detail }) ?: absolutize(it)
+            }
             this.plot      = plot.takeIf { it.isNotBlank() }
             this.tags      = tags
             this.year      = year
@@ -1316,7 +1454,7 @@ class AnimeVsubProvider : MainAPI() {
     private fun harvestIframes(doc: Document): List<String> {
         return doc.select("iframe, source, embed").mapNotNull { el ->
             val raw = el.attr("src").ifBlank { el.attr("data-src") }
-            val src = absolutize(raw)
+            val src = resolvePlaylistUri(raw, doc.baseUri().ifBlank { mainUrl }) ?: absolutize(raw)
             src?.takeIf { !isJunkUrl(it) && !it.startsWith("data:") }
         }.distinct()
     }
@@ -1398,7 +1536,7 @@ class AnimeVsubProvider : MainAPI() {
                     }
 
                     if (watchDoc == null && System.currentTimeMillis() >= plainHtmlDeadUntilMs) {
-                        val ck = cfCookieCache[mainUrl] ?: cookiesFromCookieManager(mainUrl)
+                        val ck = cookiesForUrl(watchUrl)
                         watchDoc = (if (ck != null) tryPlainDoc(watchUrl, ck) else null)
                             ?: tryPlainDoc(watchUrl, null)
                     }
@@ -1415,9 +1553,7 @@ class AnimeVsubProvider : MainAPI() {
                     val tmpOrder = LinkedHashMap<String, String>()
                     val tmpMeta  = LinkedHashMap<String, MutableSet<String>>()
                     parseOphimEpisodes(watchDoc!!, detailBaseOf(watchUrl), tmpOrder, tmpMeta)
-                    for (set in tmpMeta.values) {
-                        for (block in set) srvList.addAll(parseAvsMeta(block))
-                    }
+                    srvList.addAll(selectWatchMeta(watchUrl, tmpOrder, tmpMeta))
                     if (srvList.isNotEmpty()) nlog("[Step1p] watch-page meta servers=${srvList.size} eps=${tmpOrder.size}")
                 }
             }
@@ -2066,6 +2202,7 @@ class AnimeVsubProvider : MainAPI() {
     private class AvsMediaGate {
         @Volatile private var paused = false
         @Volatile private var recovering = false
+        @Volatile var closed = false
         private val relayUses = java.util.concurrent.atomic.AtomicInteger(0)
         val blockedCount = java.util.concurrent.atomic.AtomicInteger(0)
         @Synchronized fun pauseUnlessRecovering(): Boolean {
@@ -2082,6 +2219,7 @@ class AnimeVsubProvider : MainAPI() {
     private suspend fun tryHookFlow(targetUrl: String, callback: (ExtractorLink) -> Unit): Boolean {
         val flowT0 = System.currentTimeMillis()
         val mediaGate = AvsMediaGate()
+        val flow = AvsFlowState()
         var webView: WebView? = null
         var dialog: android.app.Dialog? = null
 
@@ -2119,53 +2257,50 @@ class AnimeVsubProvider : MainAPI() {
                         reqHandler = { url, headers, method, _ ->
 
                             if (url.contains("/chunks/")) {
-                                val isFirst = segObservedUrl == null
-                                segObservedUrl = url
-                                segObservedHeaders = parseHdrPairs(headers)
-                                segRecipeUpdateAt = System.currentTimeMillis()
-                                buildSegRecipe()
-                                val n = segReqCount.incrementAndGet()
+                                val isFirst = flow.segObservedUrl == null
+                                observeSegment(flow, url, headers)
+                                val n = flow.segReqCount.incrementAndGet()
                                 if (isFirst) {
 
-                                    nlog("[Hook] SEG-REQ +${System.currentTimeMillis() - flowT0}ms $method url=$url hdrs=$headers cred=hit")
+                                    nlog("[Hook] SEG-REQ +${System.currentTimeMillis() - flowT0}ms $method host=${hostOf(url)} hdrs=${parseHdrPairs(headers).keys.joinToString(",")} cred=hit")
                                 } else if (n <= 4 || n % 15 == 0) {
-                                    nlog("[Hook] SEG-REQ#$n $method url=...${url.takeLast(70)} hdrs=${headers.take(80)}")
+                                    nlog("[Hook] SEG-REQ#$n $method host=${hostOf(url)} hdrs=${parseHdrPairs(headers).keys.joinToString(",")}")
                                 }
                             } else if (url.startsWith("PM:")) {
 
-                                if (pmLogCount.incrementAndGet() <= 6) {
-                                    nlog("[Hook] PM ${url.take(30)} ${headers.take(220)}")
+                                if (flow.pmLogCount.incrementAndGet() <= 6) {
+                                    nlog("[Hook] PM ${url.take(30)}")
                                 }
                             } else if (url.contains("/playlist/")) {
                                 nlog("[Hook] PL-REQ +${System.currentTimeMillis() - flowT0}ms $method url=${url.take(80)}")
                             } else if (url.contains("/api/")) {
 
-                                if (apiLogCount.incrementAndGet() <= 6) {
-                                    nlog("[Hook] API-REQ $method $url hdrs=${headers.take(120)}")
+                                if (flow.apiLogCount.incrementAndGet() <= 6) {
+                                    nlog("[Hook] API-REQ $method host=${hostOf(url)} hdrs=${parseHdrPairs(headers).keys.joinToString(",")}")
                                 }
                             }
                         },
                         plResHandler = { url, headers ->
 
-                            nlog("[Hook] PL-RES ${url.take(60)} hdrs=${headers.take(1500)}")
+                            nlog("[Hook] PL-RES host=${hostOf(url)} hdrs=${headers.split('|', '\n').map { it.substringBefore('=').substringBefore(':').trim() }.filter { it.isNotBlank() }.joinToString(",").take(200)}")
                         },
                         segResHandler = { url, status ->
 
                             if (url.contains("/chunks/")) {
-                                if (status.toIntOrNull() in 200..299) playerSegOkSeen = true
-                                val n = segResCount.incrementAndGet()
+                                if (status.toIntOrNull() in 200..299) flow.playerSegOkSeen = true
+                                val n = flow.segResCount.incrementAndGet()
                                 if (n <= 4 || n % 15 == 0) {
-                                    nlog("[Hook] SEG-RES#$n st=$status url=...${url.takeLast(70)}")
+                                    nlog("[Hook] SEG-RES#$n st=$status host=${hostOf(url)}")
                                 }
                             } else if (url.contains("/playlist/")) {
                                 nlog("[Hook] PL-RES-ST st=$status ${url.take(50)}")
                             }
                         },
                         relayMetaHandler = { id, status, range, ct ->
-                            handleRelayMeta(id, status, range, ct)
+                            handleRelayMeta(mediaGate, id, status, range, ct)
                         },
                         relayHandler = { id, b64, last, err ->
-                            handleRelayChunk(id, b64, last, err)
+                            handleRelayChunk(mediaGate, id, b64, last, err)
                         }
                     ),
                     "__avsBridge"
@@ -2214,15 +2349,12 @@ class AnimeVsubProvider : MainAPI() {
                             request.requestHeaders?.entries?.joinToString("|") { "${it.key}=${it.value}" } ?: ""
                         } catch (_: Throwable) { "" }
                         if (u.contains("/chunks/")) {
-                            segObservedUrl = u
-                            segObservedHeaders = parseHdrPairs(hdrs)
-                            segRecipeUpdateAt = System.currentTimeMillis()
-                            buildSegRecipe()
+                            observeSegment(flow, u, hdrs)
                         }
-                        val n = siReqCount.incrementAndGet()
+                        val n = flow.siReqCount.incrementAndGet()
                         if (n <= 2 || n % 25 == 0) {
 
-                            nlog("[SI] #$n ${request.method} ${u.take(80)} hdrs=${hdrs.take(700)}")
+                            nlog("[SI] #$n ${request.method} host=${hostOf(u)} hdrs=${parseHdrPairs(hdrs).keys.joinToString(",")}")
                         }
                         return null
                     }
@@ -2272,7 +2404,6 @@ class AnimeVsubProvider : MainAPI() {
                     if (body.startsWith("#EXTM3U")) {
                         if (capUrl.startsWith("avs-playlist-real")) {
                             pendingPl = recv
-                            realPlaylistSeen = true
                             break
                         }
                         if (!body.contains("_t=")) {
@@ -2293,7 +2424,6 @@ class AnimeVsubProvider : MainAPI() {
                         }
                         if (chosen != null) {
                             nlog("[Hook] dùng manifest THẬT (decrypt) thay placeholder")
-                            realPlaylistSeen = true
                             pendingPl = chosen
                         } else {
                             nlog("[Hook] raw playlist chưa được giải mã — không đăng ký")
@@ -2335,16 +2465,14 @@ class AnimeVsubProvider : MainAPI() {
                 if (!registered && pendingPl != null) {
                     val (capUrlP, capBodyP) = pendingPl
 
-                    lastPlaylistLines = capBodyP.trim().lines().map { it.trim() }
+                    setFlowPlaylist(flow, capBodyP.trim().lines().map { it.trim() }
                         .filter { it.isNotEmpty() && !it.startsWith("#") }
-                        .map { resolvePlaylistUri(it, capUrlP) ?: it }
-                    segObservedUrl = null
-                    segObservedHeaders = emptyMap()
-                    segReqCount.set(0)
-                    segResCount.set(0)
+                        .map { resolvePlaylistUri(it, capUrlP) ?: it })
+                    flow.segReqCount.set(0)
+                    flow.segResCount.set(0)
 
                     try {
-                        lastKickAtMs = System.currentTimeMillis()
+                        flow.lastKickAtMs = System.currentTimeMillis()
                         withContext(Dispatchers.Main) { webView?.evaluateJavascript(AVS_KICK_JS, null) }
                     } catch (_: Throwable) {}
 
@@ -2356,7 +2484,7 @@ class AnimeVsubProvider : MainAPI() {
                     val obsMaxMs = if (fastReal) 0L else 8_000L
                     val obsT0 = System.currentTimeMillis()
                     var kicks = 1
-                    while (segObservedUrl == null && System.currentTimeMillis() - obsT0 < obsMaxMs) {
+                    while (flow.segRecipe == null && System.currentTimeMillis() - obsT0 < obsMaxMs) {
                         kotlinx.coroutines.delay(400)
 
                         if (kicks < 4 && System.currentTimeMillis() - obsT0 > 3_000L * kicks) {
@@ -2366,7 +2494,7 @@ class AnimeVsubProvider : MainAPI() {
                             } catch (_: Throwable) {}
                         }
                     }
-                    if (segObservedUrl != null) buildSegRecipe()
+                    if (flow.segRecipe != null) buildSegRecipe(flow)
                     else if (obsMaxMs == 0L) {
                         nlog("[Hook] fast-real: bỏ chờ recipe 8s; giữ fallback khi CDN không sẵn sàng (v31)")
                     } else {
@@ -2382,7 +2510,7 @@ class AnimeVsubProvider : MainAPI() {
 
                     val baseP = Regex("""^(https?://[^/]+/.*/)""").find(capUrlP)?.groupValues?.get(1) ?: ""
                     if (registerM3U8Link(capBodyP, capUrlP, baseP, "Vietsub", callback,
-                            siteReferer = targetUrl, mediaGate = mediaGate)) {
+                            siteReferer = targetUrl, mediaGate = mediaGate, flowState = flow)) {
                         registered = true
                         if (!targetUrl.startsWith(mainUrl)) {
 
@@ -2474,6 +2602,8 @@ class AnimeVsubProvider : MainAPI() {
 })();
 """
 
+    private data class AvsDomSnapshot(val url: String, val html: String, val blocked: Boolean)
+
     private class AvsGateBridge(private val handler: (String, String) -> Unit) {
         @JavascriptInterface
         fun onDom(url: String?, html: String?) {
@@ -2500,7 +2630,8 @@ class AnimeVsubProvider : MainAPI() {
         var dialog: android.app.Dialog? = null
         var lastHtml: String? = null
         var lastBlocked = true
-        var sawSrvErr = false
+        val lastSnapshot = java.util.concurrent.atomic.AtomicReference<AvsDomSnapshot?>(null)
+        val sawSrvErr = java.util.concurrent.atomic.AtomicBoolean(false)
         try {
             withContext(Dispatchers.Main) {
                 val wv = WebView(ctx)
@@ -2521,6 +2652,7 @@ class AnimeVsubProvider : MainAPI() {
                 var lastEps = 0
                 var lastPageUrl = ""
                 var firstPagePollMs = 0L
+                var lastEpisodeChangeMs = 0L
                 val blockedPlayerFrames = java.util.concurrent.atomic.AtomicInteger(0)
 
                 fun domReady(u: String, html: String, blocked: Boolean, cards: Int, xem: Int, eps: Int, ageMs: Long): Boolean {
@@ -2532,7 +2664,8 @@ class AnimeVsubProvider : MainAPI() {
                         MODE_DETAIL, MODE_PLAY -> if (isWatchPage) {
                             hasPlayerFrame || (xem > 0 && ageMs >= 2_400L) || ageMs >= 7_200L
                         } else xem > 0 || cards > 0 || ageMs >= 5_600L
-                        MODE_EPISODES -> (eps > 0 && (hasPlayerFrame || ageMs >= 2_400L)) || ageMs >= 7_200L
+                        MODE_EPISODES -> (eps > 0 && ageMs >= 600L &&
+                            android.os.SystemClock.elapsedRealtime() - lastEpisodeChangeMs >= 600L) || ageMs >= 7_200L
                         else         -> ageMs >= 2_400L || cards > 0 || xem > 0
                     }
                 }
@@ -2543,8 +2676,10 @@ class AnimeVsubProvider : MainAPI() {
                     if (u != lastPageUrl) {
                         lastPageUrl = u
                         firstPagePollMs = nowMs
+                        lastEpisodeChangeMs = nowMs
                         lastSig = ""
                         lastHtml = null
+                        lastSnapshot.set(null)
                     }
                     val pageAgeMs = nowMs - firstPagePollMs
                     val sig = html.length.toString() + ":" + html.hashCode()
@@ -2553,7 +2688,7 @@ class AnimeVsubProvider : MainAPI() {
                         val lh = lastHtml
                         if (lh != null && domReady(u, lh, lastBlocked, lastCards, lastXem, lastEps, pageAgeMs)) {
                             if (!lastBlocked && (lastCards > 0 || lastXem > 0 || lastEps > 0 || hasPlayerIframe(lh))) {
-                                noteSiteOk()
+                                if (isSiteUrl(u)) noteSiteOk()
                                 learnCanonical(u)
                             }
                             saveCfCookiesFromManager("WVDom")
@@ -2567,12 +2702,13 @@ class AnimeVsubProvider : MainAPI() {
                     val srvErr = looksServerError(html)
                     val cards = countPhimAnchors(html)
                     val xem = countXemPhim(html)
-                    val eps = countEpisodeAnchors(html)
+                    val eps = if (mode == MODE_EPISODES) countEpisodeAnchors(html) else 0
+                    if (eps != lastEps) lastEpisodeChangeMs = nowMs
                     nlog("[WVDom] poll#$pollIdx len=${html.length} blocked=$blocked srvErr=$srvErr cards=$cards xem=$xem eps=$eps ${u.take(70)}")
 
                     if (srvErr) {
                         noteServerError("WVDom", u)
-                        sawSrvErr = true
+                        sawSrvErr.set(true)
                         try { wv.post { try { wv.stopLoading() } catch (_: Throwable) {} } } catch (_: Throwable) {}
                         if (!done.isCompleted) done.complete(null)
                         return@AvsGateBridge
@@ -2586,13 +2722,14 @@ class AnimeVsubProvider : MainAPI() {
                     }
                     lastHtml = html
                     lastBlocked = blocked
+                    lastSnapshot.set(AvsDomSnapshot(u, html, blocked))
                     lastCards = cards
                     lastXem = xem
                     lastEps = eps
                     val ready = domReady(u, html, blocked, cards, xem, eps, pageAgeMs)
                     if (ready) {
                         if (!blocked && (cards > 0 || xem > 0 || eps > 0 || hasPlayerIframe(html))) {
-                            noteSiteOk()
+                            if (isSiteUrl(u)) noteSiteOk()
                             learnCanonical(u)
                         }
                         saveCfCookiesFromManager("WVDom")
@@ -2662,13 +2799,13 @@ class AnimeVsubProvider : MainAPI() {
                 nlog("[WVDom] OK interactive=$interactive ms=${System.currentTimeMillis() - t0} $url")
             } else {
 
-                if (sawSrvErr) {
+                if (sawSrvErr.get()) {
                     nlog("[WVDom] DỪNG: trang lỗi 5xx (site-down) interactive=$interactive $url")
                 } else {
-                    val lh = lastHtml
-                    if (lh != null && !lastBlocked) {
-                        nlog("[WVDom] TIMEOUT nhưng DOM sạch (len=${lh.length}) — trả DOM cuối $url")
-                        doc = Jsoup.parse(lh, url)
+                    val snapshot = lastSnapshot.get()
+                    if (snapshot != null && !snapshot.blocked) {
+                        nlog("[WVDom] TIMEOUT nhưng DOM sạch (len=${snapshot.html.length}) — trả DOM cuối $url")
+                        doc = Jsoup.parse(snapshot.html, snapshot.url)
                     } else {
                         nlog("[WVDom] TIMEOUT/BỊ CHẶN ${timeoutMs / 1000}s interactive=$interactive $url")
                     }
@@ -2717,35 +2854,22 @@ class AnimeVsubProvider : MainAPI() {
         val at: Long
     )
 
-    @Volatile private var segRecipe: SegRecipe? = null
+    private class AvsFlowState {
+        @Volatile var segRecipe: SegRecipe? = null
+        @Volatile var segObservedUrl: String? = null
+        @Volatile var segObservedHeaders: Map<String, String> = emptyMap()
+        @Volatile var lastPlaylistLines: List<String>? = null
+        @Volatile var segRecipeUpdateAt = 0L
+        @Volatile var playerSegOkSeen = false
+        @Volatile var lastKickAtMs = 0L
+        val segReqCount = java.util.concurrent.atomic.AtomicInteger(0)
+        val segResCount = java.util.concurrent.atomic.AtomicInteger(0)
+        val pmLogCount = java.util.concurrent.atomic.AtomicInteger(0)
+        val apiLogCount = java.util.concurrent.atomic.AtomicInteger(0)
+        val siReqCount = java.util.concurrent.atomic.AtomicInteger(0)
+    }
 
-    @Volatile private var realPlaylistSeen = false
-    @Volatile private var segObservedUrl: String? = null
-    @Volatile private var segObservedHeaders: Map<String, String> = emptyMap()
-    @Volatile private var lastPlaylistLines: List<String>? = null
-
-    @Volatile private var segRecipeUpdateAt = 0L
-    @Volatile private var playerSegOkSeen = false
-    @Volatile private var lastKickAtMs = 0L
-
-    @Volatile private var segAuthBackoffGlobalUntil = 0L
-
-    @Volatile private var relayGateUntilGlobalMs = 0L
-
-    @Volatile private var dnsCooldownUntil = 0L
-    @Volatile private var lastDnsLogMs = 0L
-
-    @Volatile private var segStormToastShown = false
-
-    private val allMethodFails = java.util.concurrent.atomic.AtomicInteger(0)
-    private val segReqCount = java.util.concurrent.atomic.AtomicInteger(0)
-    private val segResCount = java.util.concurrent.atomic.AtomicInteger(0)
-    private val pmLogCount = java.util.concurrent.atomic.AtomicInteger(0)
-    private val apiLogCount = java.util.concurrent.atomic.AtomicInteger(0)
-
-    private val siReqCount = java.util.concurrent.atomic.AtomicInteger(0)
-
-    private class RelayBuf(val maxBytes: Int) {
+    private class RelayBuf(val maxBytes: Int, val owner: AvsMediaGate) {
         val latch = java.util.concurrent.CountDownLatch(1)
         val buf = java.io.ByteArrayOutputStream()
         @Volatile var done = false
@@ -2760,13 +2884,15 @@ class AnimeVsubProvider : MainAPI() {
         val contentRange: String?, val contentType: String?
     )
 
-    @Volatile private var relayWv: WebView? = null
-    @Volatile private var relayDialog: android.app.Dialog? = null
-    @Volatile private var relayMediaGate: AvsMediaGate? = null
+    private class AvsRelayOwner(val webView: WebView, val dialog: android.app.Dialog?) {
+        @Volatile var lastUseMs = System.currentTimeMillis()
+    }
+
     private val relayLock = Any()
+    private val relayOwners = java.util.IdentityHashMap<AvsMediaGate, AvsRelayOwner>()
     private val relayPending = java.util.concurrent.ConcurrentHashMap<String, RelayBuf>()
     private val relaySeq = java.util.concurrent.atomic.AtomicInteger(0)
-    @Volatile private var relayLastUseMs = 0L
+    private val relayCheckScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private val AVS_KICK_JS = "(function(){try{window.__avsPausePlayerMedia=false;var vs=document.querySelectorAll('video');for(var i=0;i<vs.length;i++){vs[i].muted=true;var p=vs[i].play();if(p&&p.catch)p.catch(function(){});}}catch(e){}})();"
 
@@ -2908,90 +3034,134 @@ class AnimeVsubProvider : MainAPI() {
             if (i <= 0) null else p.substring(0, i).trim() to p.substring(i + 1).trim()
         }.toMap()
 
-    @Volatile private var lastRecipeSig: String = ""
-
     private val AVS_HDR_DROP = setOf("accept-encoding", "range", "cookie", "host", "content-length", "connection")
-    private fun buildSegRecipe() {
-        val obs = segObservedUrl ?: return
-        try {
-            val obsPath = obs.substringBefore('?')
-            val obsQ = obs.substringAfter('?', "")
-            val line = lastPlaylistLines?.firstOrNull { it.substringBefore('?') == obsPath }
-            val lineNames = (line?.substringAfter('?', "") ?: "")
-                .split('&').map { it.substringBefore('=') }.toSet()
-            val extra = obsQ.split('&').filter { it.isNotBlank() && it.substringBefore('=') !in lineNames }
 
-            val hdrs = segObservedHeaders.filterKeys { it.lowercase() !in AVS_HDR_DROP }
-            val sig = extra.joinToString("&") + "#" + hdrs.keys.joinToString(",") + "#" + obsPath
-            if (sig == lastRecipeSig) return
-            lastRecipeSig = sig
-            segRecipe = SegRecipe(extra.joinToString("&"), hdrs, obs, System.currentTimeMillis())
-            nlog("[Hook] SEG-RECIPE pathMatch=${line != null} extra=[${extra.joinToString("&").take(90)}] hdrs=[${hdrs.keys.joinToString(",").take(90)}]")
-        } catch (e: Throwable) {
-            nlogE("[Hook] recipe", e)
+    private fun setFlowPlaylist(flow: AvsFlowState, lines: List<String>) {
+        synchronized(flow) {
+            flow.lastPlaylistLines = lines
+            buildSegRecipe(flow)
         }
     }
 
-    private fun recipeUrlFor(segUrl: String): String {
-        val rec = segRecipe ?: return segUrl
+    private fun observeSegment(flow: AvsFlowState, url: String, headers: String) {
+        synchronized(flow) {
+            flow.segObservedUrl = url
+            flow.segObservedHeaders = parseHdrPairs(headers)
+            flow.segRecipeUpdateAt = System.currentTimeMillis()
+            buildSegRecipe(flow)
+        }
+    }
+
+    private fun buildSegRecipe(flow: AvsFlowState) {
+        synchronized(flow) {
+            val obs = flow.segObservedUrl ?: return
+            try {
+                val obsPath = obs.substringBefore('?')
+                val obsQ = obs.substringAfter('?', "")
+                val line = flow.lastPlaylistLines?.firstOrNull { it.substringBefore('?') == obsPath } ?: return
+                val lineNames = line.substringAfter('?', "").split('&').map { it.substringBefore('=') }.toSet()
+                val extra = obsQ.split('&').filter { it.isNotBlank() && it.substringBefore('=') !in lineNames }
+                val hdrs = flow.segObservedHeaders.filterKeys { it.lowercase(java.util.Locale.ROOT) !in AVS_HDR_DROP }
+                val old = flow.segRecipe
+                val params = extra.joinToString("&")
+                if (old != null && old.sampleUrl == obs && old.extraParams == params && old.headers == hdrs) return
+                flow.segRecipe = SegRecipe(params, hdrs, obs, System.currentTimeMillis())
+                nlog("[Hook] SEG-RECIPE pathMatch=true extraKeys=[${extra.map { it.substringBefore('=') }.joinToString(",").take(90)}] hdrs=[${hdrs.keys.joinToString(",").take(90)}]")
+            } catch (e: Throwable) {
+                nlogE("[Hook] recipe", e)
+            }
+        }
+    }
+
+    private fun recipeForUrl(flow: AvsFlowState, url: String): SegRecipe? =
+        flow.segRecipe?.takeIf { sameOrigin(it.sampleUrl, url) }
+
+    private fun recipeUrlFor(flow: AvsFlowState, segUrl: String): String {
+        val rec = recipeForUrl(flow, segUrl) ?: return segUrl
         return try {
             if (rec.sampleUrl.substringBefore('?') == segUrl.substringBefore('?')) {
                 rec.sampleUrl
             } else if (rec.extraParams.isNotBlank()) {
-                val missp = rec.extraParams.split('&').filter { p ->
+                val names = segUrl.substringAfter('?', "").split('&').map { it.substringBefore('=') }.toSet()
+                val missing = rec.extraParams.split('&').filter { p ->
                     val n = p.substringBefore('=')
-                    n.isNotBlank() && !segUrl.contains(n + "=")
+                    n.isNotBlank() && n !in names
                 }
-                if (missp.isNotEmpty()) {
-                    segUrl + (if (segUrl.contains('?')) "&" else "?") + missp.joinToString("&")
+                if (missing.isNotEmpty()) {
+                    segUrl + (if (segUrl.contains('?')) "&" else "?") + missing.joinToString("&")
                 } else segUrl
             } else segUrl
         } catch (_: Throwable) { segUrl }
     }
 
-    private fun handleRelayMeta(id: String, status: Int, contentRange: String?, contentType: String?) {
+    private fun handleRelayMeta(owner: AvsMediaGate, id: String, status: Int, contentRange: String?, contentType: String?) {
         val rb = relayPending[id] ?: return
-        rb.status = status
-        rb.contentRange = contentRange?.takeIf { it.isNotBlank() }
-        rb.contentType = contentType?.takeIf { it.isNotBlank() }
+        if (rb.owner !== owner) return
+        synchronized(rb) {
+            if (rb.done) return
+            rb.status = status
+            rb.contentRange = contentRange?.takeIf { it.isNotBlank() }
+            rb.contentType = contentType?.takeIf { it.isNotBlank() }
+        }
     }
 
-    private fun handleRelayChunk(id: String, b64: String?, last: Int, err: String?) {
+    private fun handleRelayChunk(owner: AvsMediaGate, id: String, b64: String?, last: Int, err: String?) {
         val rb = relayPending[id] ?: return
-        if (rb.done) return
-        if (!err.isNullOrBlank()) {
-            rb.err = err
-            rb.done = true
-        } else {
-            if (!b64.isNullOrEmpty()) {
-                try {
-                    val chunk = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
-                    if (chunk.size > rb.maxBytes - rb.buf.size()) {
-                        rb.err = "too-large"
-                        rb.done = true
-                    } else rb.buf.write(chunk)
-                } catch (_: Throwable) { rb.err = "b64"; rb.done = true }
+        if (rb.owner !== owner) return
+        synchronized(rb) {
+            if (rb.done) return
+            if (!err.isNullOrBlank()) {
+                rb.err = err
+                rb.done = true
+            } else {
+                if (!b64.isNullOrEmpty()) {
+                    try {
+                        val chunk = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+                        if (chunk.size > rb.maxBytes - rb.buf.size()) {
+                            rb.err = "too-large"
+                            rb.done = true
+                        } else rb.buf.write(chunk)
+                    } catch (_: Throwable) { rb.err = "b64"; rb.done = true }
+                }
+                if (last == 1) rb.done = true
             }
-            if (last == 1) rb.done = true
+            if (rb.done) rb.latch.countDown()
         }
-        if (rb.done) rb.latch.countDown()
+    }
+
+    private fun relayWebView(owner: AvsMediaGate?): WebView? =
+        if (owner == null) null else synchronized(relayLock) { relayOwners[owner]?.webView }
+
+    private fun destroyRelay(owner: AvsRelayOwner) {
+        try { owner.webView.destroy() } catch (_: Throwable) {}
+        try { owner.dialog?.dismiss() } catch (_: Throwable) {}
+    }
+
+    private fun releaseRelay(gate: AvsMediaGate?) {
+        if (gate == null) return
+        val owner = synchronized(relayLock) {
+            gate.closed = true
+            relayOwners.remove(gate)
+        } ?: return
+        try {
+            android.os.Handler(android.os.Looper.getMainLooper()).post { destroyRelay(owner) }
+        } catch (_: Throwable) {}
     }
 
     private fun adoptRelayWebView(wv: WebView?, dlg: android.app.Dialog?, fastReal: Boolean, mediaGate: AvsMediaGate) {
         if (wv == null) return
         try {
-            relayLastUseMs = System.currentTimeMillis()
             android.os.Handler(android.os.Looper.getMainLooper()).post {
                 try {
-                    synchronized(relayLock) {
-                        val old = relayWv
-                        if (old != null && old !== wv) { try { old.destroy() } catch (_: Throwable) {} }
-                        val oldDlg = relayDialog
-                        if (oldDlg != null && oldDlg !== dlg) { try { oldDlg.dismiss() } catch (_: Throwable) {} }
-                        relayWv = wv
-                        relayDialog = dlg
-                        relayMediaGate = if (fastReal) mediaGate else null
+                    val owner = AvsRelayOwner(wv, dlg)
+                    val old = synchronized(relayLock) {
+                        if (mediaGate.closed) owner else relayOwners.put(mediaGate, owner)
                     }
+                    if (old === owner) {
+                        destroyRelay(owner)
+                        return@post
+                    }
+                    if (old != null && old.webView !== wv) destroyRelay(old)
                     dlg?.window?.let { win ->
                         try {
                             win.addFlags(android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
@@ -3015,48 +3185,50 @@ class AnimeVsubProvider : MainAPI() {
                     } catch (_: Throwable) {}
                     try { wv.evaluateJavascript(avsRelayJs, null) } catch (_: Throwable) {}
                     nlog("[Relay] WebView nhận nuôi — giữ ngữ cảnh player cho segment")
+                    scheduleRelayIdleCheck()
                 } catch (_: Throwable) {}
             }
-            scheduleRelayIdleCheck()
         } catch (_: Throwable) {}
     }
 
     private fun scheduleRelayIdleCheck() {
+        if (!relayCheckScheduled.compareAndSet(false, true)) return
         try {
             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                relayCheckScheduled.set(false)
                 try {
-                    val idle = System.currentTimeMillis() - relayLastUseMs
-                    if (idle > 14 * 60_000L) {
-                        synchronized(relayLock) {
-                            try { relayWv?.destroy() } catch (_: Throwable) {}
-                            try { relayDialog?.dismiss() } catch (_: Throwable) {}
-                            relayWv = null
-                            relayDialog = null
-                            relayMediaGate = null
+                    val now = System.currentTimeMillis()
+                    val expired = ArrayList<AvsRelayOwner>()
+                    synchronized(relayLock) {
+                        val iter = relayOwners.entries.iterator()
+                        while (iter.hasNext()) {
+                            val entry = iter.next()
+                            if (now - entry.value.lastUseMs > 14 * 60_000L) {
+                                expired.add(entry.value)
+                                iter.remove()
+                            }
                         }
-                        nlog("[Relay] nhàn rỗi >14 phút — giải phóng WebView")
-                    } else {
-                        scheduleRelayIdleCheck()
                     }
+                    expired.forEach { destroyRelay(it) }
+                    if (expired.isNotEmpty()) nlog("[Relay] giải phóng ${expired.size} WebView nhàn rỗi")
+                    if (synchronized(relayLock) { relayOwners.isNotEmpty() }) scheduleRelayIdleCheck()
                 } catch (_: Throwable) {}
             }, 60_000L)
-        } catch (_: Throwable) {}
+        } catch (_: Throwable) { relayCheckScheduled.set(false) }
     }
 
     private fun relayFetchSegment(
         segUrl: String, extraHeaders: Map<String, String>, timeoutMs: Long, maxBytes: Int,
         expectedGate: AvsMediaGate? = null
     ): AvsRelayResult {
-        val snapshot = synchronized(relayLock) {
-            val w = relayWv
-            if (w != null && (expectedGate == null || relayMediaGate === expectedGate)) w to relayMediaGate else null
-        } ?: return AvsRelayResult(null, "no-webview", 0, null, null)
-        val wv = snapshot.first
-        val mediaGate = snapshot.second
-        mediaGate?.beginRelay()
-        relayLastUseMs = System.currentTimeMillis()
+        val gate = expectedGate ?: return AvsRelayResult(null, "no-owner", 0, null, null)
+        val owner = synchronized(relayLock) { relayOwners[gate] }
+            ?: return AvsRelayResult(null, "no-webview", 0, null, null)
+        val wv = owner.webView
+        gate.beginRelay()
+        owner.lastUseMs = System.currentTimeMillis()
         val id = "r" + relaySeq.incrementAndGet()
-        val rb = RelayBuf(maxBytes)
+        val rb = RelayBuf(maxBytes, gate)
         relayPending[id] = rb
         try {
             val headersJson = org.json.JSONObject()
@@ -3067,9 +3239,10 @@ class AnimeVsubProvider : MainAPI() {
                 "catch(e){try{window.__avsBridge.onRelayChunk($idJson,'',1,''+e);}catch(e2){}}"
             android.os.Handler(android.os.Looper.getMainLooper()).post {
                 try {
-                    val w = synchronized(relayLock) { relayWv }
-                    if (w != null && w === wv) w.evaluateJavascript(js, null)
-                } catch (_: Throwable) {}
+                    val current = synchronized(relayLock) { relayOwners[gate] }
+                    if (current === owner) wv.evaluateJavascript(js, null)
+                    else handleRelayChunk(gate, id, null, 1, "owner-released")
+                } catch (_: Throwable) { handleRelayChunk(gate, id, null, 1, "webview-error") }
             }
             val done = rb.latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
             val error = when {
@@ -3081,8 +3254,8 @@ class AnimeVsubProvider : MainAPI() {
             return AvsRelayResult(if (error == null) rb.buf.toByteArray() else null,
                 error, rb.status, rb.contentRange, rb.contentType)
         } finally {
-            relayPending.remove(id)
-            mediaGate?.endRelay()
+            relayPending.remove(id, rb)
+            gate.endRelay()
         }
     }
 
@@ -3092,7 +3265,7 @@ class AnimeVsubProvider : MainAPI() {
         val value = uri.trim()
         val resolved = when {
             value.startsWith("http://") || value.startsWith("https://") -> value
-            value.startsWith("//") -> "https:$value"
+            value.startsWith("//") -> (try { java.net.URI(base).scheme } catch (_: Throwable) { null } ?: "https") + ":" + value
             base.startsWith("http://") || base.startsWith("https://") -> java.net.URI(base).resolve(value).toString()
             else -> ""
         }
@@ -3104,7 +3277,13 @@ class AnimeVsubProvider : MainAPI() {
             val trimmed = line.trim()
             if (trimmed.startsWith("#EXT-X-KEY:", ignoreCase = true) ||
                 trimmed.startsWith("#EXT-X-SESSION-KEY:", ignoreCase = true) ||
-                trimmed.startsWith("#EXT-X-MAP:", ignoreCase = true)) {
+                trimmed.startsWith("#EXT-X-MAP:", ignoreCase = true) ||
+                trimmed.startsWith("#EXT-X-MEDIA:", ignoreCase = true) ||
+                trimmed.startsWith("#EXT-X-I-FRAME-STREAM-INF:", ignoreCase = true) ||
+                trimmed.startsWith("#EXT-X-IMAGE-STREAM-INF:", ignoreCase = true) ||
+                trimmed.startsWith("#EXT-X-RENDITION-REPORT:", ignoreCase = true) ||
+                trimmed.startsWith("#EXT-X-PART:", ignoreCase = true) ||
+                trimmed.startsWith("#EXT-X-PRELOAD-HINT:", ignoreCase = true)) {
                 val m = Regex("URI=\"([^\"]+)\"", RegexOption.IGNORE_CASE).find(trimmed)
                 val abs = m?.groupValues?.get(1)?.let { resolvePlaylistUri(it, m3u8BaseUrl) }
                 if (m != null && abs != null) {
@@ -3143,7 +3322,7 @@ class AnimeVsubProvider : MainAPI() {
     private suspend fun registerM3U8Link(
         m3u8Content: String, m3u8Url: String, m3u8BaseUrl: String,
         serverName: String, callback: (ExtractorLink) -> Unit,
-        siteReferer: String = "", mediaGate: AvsMediaGate? = null
+        siteReferer: String = "", mediaGate: AvsMediaGate? = null, flowState: AvsFlowState? = null
     ): Boolean {
         if (!m3u8Content.contains("#EXTM3U")) return false
 
@@ -3152,6 +3331,7 @@ class AnimeVsubProvider : MainAPI() {
             return false
         }
         val ref = siteReferer.ifBlank { m3u8Url }
+        val flow = flowState ?: AvsFlowState()
         val fastReal = isFastRealPlaylist(m3u8Url, m3u8Content)
         var emitted = false
 
@@ -3160,7 +3340,7 @@ class AnimeVsubProvider : MainAPI() {
             .map { resolvePlaylistUri(it, m3u8BaseUrl) ?: it }
         nlog("[Register] '$serverName' segments=${segUrls.size} first=${segUrls.firstOrNull()?.take(100)} referer=${ref.take(60)}")
 
-        lastPlaylistLines = segUrls
+        setFlowPlaylist(flow, segUrls)
 
         val trim = preflightTrimCount(segUrls, ref)
         if (trim > 0) nlog("[Register] trim $trim segment đầu (probe chặn)")
@@ -3172,7 +3352,7 @@ class AnimeVsubProvider : MainAPI() {
             try {
                 callback(newExtractorLink(name, serverName, m3u8Url, ExtractorLinkType.M3U8) {
                     quality = Qualities.P1080.value
-                    headers = mapOf("User-Agent" to USER_AGENT, "Referer" to ref) + ckMap + (segRecipe?.headers ?: emptyMap())
+                    headers = mapOf("User-Agent" to USER_AGENT, "Referer" to ref) + ckMap + (recipeForUrl(flow, m3u8Url)?.headers ?: emptyMap())
                 })
                 emitted = true
                 nlog("[Register] direct '$serverName' ${m3u8Url.take(80)}")
@@ -3195,7 +3375,8 @@ class AnimeVsubProvider : MainAPI() {
                     fastReal
                 )
                 server.label = serverName
-                server.playerMediaGate = if (fastReal) mediaGate else null
+                server.playerMediaGate = mediaGate
+                server.flowState = flow
                 server.start()
                 activeServers.add(server)
                 proxyBase = "http://127.0.0.1:${server.port}"
@@ -3260,9 +3441,35 @@ class AnimeVsubProvider : MainAPI() {
             }
         }
     }
+    private data class AvsRequestOrigin(val url: String)
+
+    private val redirectSafeHeaders = setOf(
+        "host", "connection", "user-agent", "accept", "accept-language", "accept-encoding",
+        "referer", "origin", "range", "if-range", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest"
+    )
+
     private val segClient: okhttp3.OkHttpClient by lazy {
         try {
-            app.baseClient.newBuilder().dns(AvsDnsCache).build()
+            app.baseClient.newBuilder().dns(AvsDnsCache)
+                .addInterceptor { chain ->
+                    val request = chain.request()
+                    chain.proceed(request.newBuilder()
+                        .tag(AvsRequestOrigin::class.java, AvsRequestOrigin(request.url.toString())).build())
+                }
+                .addNetworkInterceptor { chain ->
+                    val request = chain.request()
+                    val origin = request.tag(AvsRequestOrigin::class.java)
+                    if (origin != null && !sameOrigin(origin.url, request.url.toString())) {
+                        val next = request.newBuilder()
+                        for (header in request.headers.names()) {
+                            if (header.lowercase(java.util.Locale.ROOT) !in redirectSafeHeaders) next.removeHeader(header)
+                        }
+                        val scoped = try { CookieManager.getInstance().getCookie(request.url.toString()) }
+                            catch (_: Throwable) { null }
+                        if (!scoped.isNullOrBlank()) next.header("Cookie", scoped)
+                        chain.proceed(next.build())
+                    } else chain.proceed(request)
+                }.build()
         } catch (_: Throwable) {
             app.baseClient
         }
@@ -3310,13 +3517,26 @@ class AnimeVsubProvider : MainAPI() {
 
         @Volatile var label: String = ""
         @Volatile var playerMediaGate: AvsMediaGate? = null
+        @Volatile var flowState: AvsFlowState = AvsFlowState()
         @Volatile var port: Int = -1
             private set
 
         private var serverSocket: java.net.ServerSocket? = null
-        private val threadPool = java.util.concurrent.Executors.newCachedThreadPool()
+        private val threadPool = java.util.concurrent.ThreadPoolExecutor(
+            0, 24, 45L, java.util.concurrent.TimeUnit.SECONDS,
+            java.util.concurrent.SynchronousQueue<Runnable>()
+        )
+        private val clientSockets = java.util.Collections.newSetFromMap(
+            java.util.concurrent.ConcurrentHashMap<java.net.Socket, Boolean>()
+        )
         @Volatile private var _m3u8: String = ""
         @Volatile private var recipeNeeded = true
+        @Volatile private var segAuthBackoffGlobalUntil = 0L
+        @Volatile private var relayGateUntilGlobalMs = 0L
+        @Volatile private var dnsCooldownUntil = 0L
+        @Volatile private var lastDnsLogMs = 0L
+        @Volatile private var segStormToastShown = false
+        private val allMethodFails = java.util.concurrent.atomic.AtomicInteger(0)
         @Volatile private var servedBig = false
         private val bornAt = System.currentTimeMillis()
         private val segReqLog = java.util.concurrent.atomic.AtomicInteger(0)
@@ -3329,6 +3549,8 @@ class AnimeVsubProvider : MainAPI() {
         private val recentSegmentRequests = java.util.concurrent.ConcurrentHashMap<String, Long>()
         private val latestSegmentIndex = java.util.concurrent.atomic.AtomicInteger(-1)
         private val keyUrls = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+        private val allowedUrls = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+        private val playlistUrls = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
         private val segCache = LinkedHashMap<String, Triple<Int, String?, ByteArray>>(16, 0.75f, true)
         private val segCacheLock = Any()
         private var segCacheBytes = 0L
@@ -3357,16 +3579,80 @@ class AnimeVsubProvider : MainAPI() {
         fun isRecoveryComplete(): Boolean = recoverySegmentOk
 
         private fun decodeProxyUrl(value: String): String {
-            if (!value.contains("/seg/")) return value
-            val enc = value.substringAfter("/seg/", "")
+            val prefix = "http://127.0.0.1:$port/seg/"
+            if (!value.startsWith(prefix)) return value
+            val enc = value.removePrefix(prefix)
             return try { java.net.URLDecoder.decode(enc, "UTF-8") } catch (_: Throwable) { enc }
         }
 
-        fun setM3U8(v: String) {
-            _m3u8 = v
-            try {
-                val entries = ArrayList<Pair<String, String?>>()
+        private fun recordPlaylist(v: String, reset: Boolean) {
+            if (reset) {
+                allowedUrls.clear()
+                playlistUrls.clear()
                 keyUrls.clear()
+            }
+            var variantNext = false
+            for (raw in v.lineSequence()) {
+                val line = raw.trim()
+                if (line.isBlank()) continue
+                val upper = line.uppercase(java.util.Locale.ROOT)
+                if (upper.startsWith("#EXT-X-STREAM-INF:")) {
+                    variantNext = true
+                    continue
+                }
+                if (line.startsWith("#")) {
+                    val uri = Regex("URI=\"([^\"]+)\"", RegexOption.IGNORE_CASE)
+                        .find(line)?.groupValues?.get(1) ?: continue
+                    val target = decodeProxyUrl(uri)
+                    if (!(target.startsWith("http://") || target.startsWith("https://"))) continue
+                    allowedUrls.add(target)
+                    if (upper.startsWith("#EXT-X-MEDIA:") || upper.startsWith("#EXT-X-I-FRAME-STREAM-INF:") ||
+                        upper.startsWith("#EXT-X-IMAGE-STREAM-INF:") || upper.startsWith("#EXT-X-RENDITION-REPORT:")) {
+                        playlistUrls.add(target)
+                    }
+                    if ((upper.startsWith("#EXT-X-KEY:") || upper.startsWith("#EXT-X-SESSION-KEY:")) &&
+                        Regex("""(?i)(?:^|,)METHOD\s*=\s*AES-128(?:,|$)""")
+                            .containsMatchIn(line.substringAfter(':'))) keyUrls.add(target)
+                    continue
+                }
+                val target = decodeProxyUrl(line)
+                if (target.startsWith("http://") || target.startsWith("https://")) {
+                    allowedUrls.add(target)
+                    if (variantNext) playlistUrls.add(target)
+                }
+                variantNext = false
+            }
+        }
+
+        private fun nestedPlaylist(url: String): String? {
+            return try {
+                val request = okhttp3.Request.Builder().url(url)
+                    .header("User-Agent", USER_AGENT).header("Referer", primaryRef())
+                    .header("Accept", "application/vnd.apple.mpegurl, application/x-mpegURL, */*")
+                    .apply { cookieHeaderFor(url)?.let { header("Cookie", it) } }.build()
+                segClient.newCall(request).execute().use { response ->
+                    val body = response.body ?: return@use null
+                    if (isBlockedResponse(response.code, response.header("Content-Type")) ||
+                        body.contentLength() > 2_000_000L) return@use null
+                    val bytes = readBounded(body.byteStream(), 2_000_000) ?: return@use null
+                    val text = String(bytes, Charsets.UTF_8)
+                    if (!text.trimStart().startsWith("#EXTM3U") || text.contains("_t=")) return@use null
+                    val base = response.request.url.toString()
+                    val rewritten = rewriteM3U8(text, "http://127.0.0.1:$port", base)
+                    recordPlaylist(rewritten, false)
+                    rewritten
+                }
+            } catch (e: Throwable) {
+                nlog("[Proxy] playlist con lỗi ${e.javaClass.simpleName}")
+                null
+            }
+        }
+
+        fun setM3U8(v: String) {
+            try {
+                recordPlaylist(v, true)
+                _m3u8 = v
+                val entries = ArrayList<Pair<String, String?>>()
                 segmentDurations.clear()
                 var firstKey: String? = null
                 var pendingRange: String? = null
@@ -3400,7 +3686,7 @@ class AnimeVsubProvider : MainAPI() {
 
                     } else {
                         val u = decodeProxyUrl(t)
-                        if (u.startsWith("http://") || u.startsWith("https://")) {
+                        if ((u.startsWith("http://") || u.startsWith("https://")) && !playlistUrls.contains(u)) {
                             val spec = pendingRange
                             if (spec == null) {
                                 addSegment(u, null)
@@ -3467,7 +3753,7 @@ class AnimeVsubProvider : MainAPI() {
         }
 
         private fun rangeResponseValid(range: String?, code: Int, contentRange: String?, contentLength: Long): Boolean {
-            if (range == null) return true
+            if (range == null) return code == 200
             if (code != 206 || contentRange == null) return false
             val req = Regex("""(?i)^bytes\s*=\s*(\d*)-(\d*)\s*$""").matchEntire(range.trim()) ?: return false
             val res = Regex("""(?i)^bytes\s+(\d+)-(\d+)/(\d+|\*)\s*$""").matchEntire(contentRange.trim()) ?: return false
@@ -3485,6 +3771,7 @@ class AnimeVsubProvider : MainAPI() {
                 return start == (total - reqEnd).coerceAtLeast(0L) && end == total - 1
             }
             if (start != reqStart || (reqEnd != null && reqEnd < reqStart)) return false
+            if (reqEnd == null && total != null && end != total - 1) return false
             if (reqEnd != null && end != reqEnd) {
 
                 if (total == null || reqEnd < total || end != total - 1) return false
@@ -3803,9 +4090,7 @@ class AnimeVsubProvider : MainAPI() {
                 nlog("[Fast] warm lỗi — khôi phục nhịp player kiểu v30, chờ ${delayMs}ms trước retry")
                 val gate = playerMediaGate
                 gate?.beginRecovery()
-                val wv = synchronized(relayLock) {
-                    if (gate == null || relayMediaGate === gate) relayWv else null
-                }
+                val wv = relayWebView(gate)
                 if (wv != null) {
                     try { android.os.Handler(android.os.Looper.getMainLooper()).post {
                         try { wv.evaluateJavascript(AVS_KICK_JS, null) } catch (_: Throwable) {}
@@ -3820,9 +4105,7 @@ class AnimeVsubProvider : MainAPI() {
         private fun calmRecoveredPlayer() {
             if (!startupRecoveryDone || !servedBig) return
             val gate = playerMediaGate
-            val wv = synchronized(relayLock) {
-                if (gate == null || relayMediaGate === gate) relayWv else null
-            } ?: return
+            val wv = relayWebView(gate) ?: return
             if (!recoveryCalmed.compareAndSet(false, true)) return
             gate?.endRecovery()
             try { android.os.Handler(android.os.Looper.getMainLooper()).post {
@@ -3843,7 +4126,19 @@ class AnimeVsubProvider : MainAPI() {
                 try {
                     while (!ss.isClosed) {
                         val client = ss.accept()
-                        threadPool.execute { handleClient(client) }
+                        if (!client.inetAddress.isLoopbackAddress) {
+                            try { client.close() } catch (_: Throwable) {}
+                            continue
+                        }
+                        clientSockets.add(client)
+                        try {
+                            threadPool.execute {
+                                try { handleClient(client) } finally { clientSockets.remove(client) }
+                            }
+                        } catch (_: java.util.concurrent.RejectedExecutionException) {
+                            clientSockets.remove(client)
+                            try { client.close() } catch (_: Throwable) {}
+                        }
                     }
                 } catch (_: Throwable) {}
             }
@@ -3852,6 +4147,9 @@ class AnimeVsubProvider : MainAPI() {
 
         fun stop() {
             try { serverSocket?.close() } catch (_: Throwable) {}
+            releaseRelay(playerMediaGate)
+            for (client in clientSockets) try { client.close() } catch (_: Throwable) {}
+            clientSockets.clear()
             for (task in segPrefetchInflight.values) {
                 task.cancelled = true
                 try { task.call?.cancel() } catch (_: Throwable) {}
@@ -3862,39 +4160,82 @@ class AnimeVsubProvider : MainAPI() {
             nlog("[Proxy] stopped port=$port")
         }
 
+        private fun boundedLine(input: java.io.Reader, limit: Int): String? {
+            val result = StringBuilder()
+            while (true) {
+                val ch = input.read()
+                if (ch < 0) return if (result.isEmpty()) null else result.toString()
+                if (ch == 10) return result.toString().removeSuffix("\r")
+                if (result.length >= limit) throw java.io.IOException("request line too long")
+                result.append(ch.toChar())
+            }
+        }
+
         private fun handleClient(client: java.net.Socket) {
             try {
                 client.soTimeout = 15_000
-                val input  = client.getInputStream().bufferedReader()
+                val input = client.getInputStream().bufferedReader()
                 val output = AvsResponseOutput(client.getOutputStream())
-                val requestLine = input.readLine() ?: return
+                val requestLine = boundedLine(input, 32768) ?: return
+                val parts = requestLine.split(" ", limit = 3)
+                val method = parts.getOrNull(0) ?: return
+                val path = parts.getOrNull(1) ?: return
+                val crlf = "\r\n"
+                if (method != "GET" && method != "HEAD") {
+                    output.write("HTTP/1.1 405 Method Not Allowed${crlf}Content-Length: 0${crlf}${crlf}".toByteArray())
+                    return
+                }
                 var reqRange: String? = null
-                while (true) {
-                    val h = input.readLine() ?: ""
+                var headersBytes = 0
+                for (i in 0 until 100) {
+                    val h = boundedLine(input, 8192) ?: return
+                    headersBytes += h.length
+                    if (headersBytes > 65536) return
                     if (h.isBlank()) break
-
                     if (h.length > 6 && h.substring(0, 6).equals("Range:", ignoreCase = true)) {
+                        if (reqRange != null) return
                         reqRange = h.substringAfter(':').trim()
                     }
                 }
-                val path = requestLine.split(" ").getOrNull(1) ?: "/"
-                val crlf = "\r\n"
+                if (reqRange != null && !Regex("""(?i)^bytes\s*=\s*\d*-\d*\s*$""").matches(reqRange)) {
+                    output.write("HTTP/1.1 416 Range Not Satisfiable${crlf}Content-Length: 0${crlf}${crlf}".toByteArray())
+                    return
+                }
 
                 when {
                     path == "/stream.m3u8" -> {
                         val body = getM3U8().toByteArray(Charsets.UTF_8)
                         if (body.isEmpty()) nlog("[Proxy] stream.m3u8 rỗng khi phát (port=$port label=$label)")
-                        output.write(("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${body.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}").toByteArray())
-                        output.write(body)
+                        output.write(("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${body.size}${crlf}Connection: close${crlf}${crlf}").toByteArray())
+                        if (method != "HEAD") output.write(body)
                     }
                     path.startsWith("/seg/") -> {
                         val segUrl = try {
                             java.net.URLDecoder.decode(path.removePrefix("/seg/"), "UTF-8")
                         } catch (_: Throwable) { return }
+                        if (!allowedUrls.contains(segUrl)) {
+                            output.write("HTTP/1.1 404 Not Found${crlf}Content-Length: 0${crlf}${crlf}".toByteArray())
+                            return
+                        }
+                        if (playlistUrls.contains(segUrl)) {
+                            val playlist = if (reqRange == null) nestedPlaylist(segUrl) else null
+                            if (playlist == null) {
+                                output.write("HTTP/1.1 502 Bad Gateway${crlf}Content-Length: 0${crlf}${crlf}".toByteArray())
+                            } else {
+                                val body = playlist.toByteArray(Charsets.UTF_8)
+                                output.write(("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${body.size}${crlf}Connection: close${crlf}${crlf}").toByteArray())
+                                if (method != "HEAD") output.write(body)
+                            }
+                            return
+                        }
+                        if (method == "HEAD") {
+                            output.write("HTTP/1.1 405 Method Not Allowed${crlf}Content-Length: 0${crlf}${crlf}".toByteArray())
+                            return
+                        }
                         val t0 = System.currentTimeMillis()
                         var ok = false
                         if (segReqLog.incrementAndGet() <= 8) {
-                            nlog("[Seg] REQ sinceReg=${t0 - bornAt}ms range=${reqRange ?: "-"} servedBig=$servedBig url=...${segUrl.takeLast(26)}")
+                            nlog("[Seg] REQ sinceReg=${t0 - bornAt}ms range=${reqRange ?: "-"} servedBig=$servedBig host=${hostOf(segUrl)}")
                         }
 
                         val key = cacheKey(segUrl, reqRange)
@@ -3926,13 +4267,12 @@ class AnimeVsubProvider : MainAPI() {
                                     if (cacheHit.first == 206) "HTTP/1.1 206 Partial Content" else "HTTP/1.1 200 OK"
                                 ).append(crlf)
                                     .append("Content-Type: ").append(if (keyUrls.contains(segUrl)) "application/octet-stream" else "video/mp2t").append(crlf)
-                                    .append("Access-Control-Allow-Origin: *").append(crlf)
                                 cacheHit.second?.let { head.append("Content-Range: ").append(it).append(crlf) }
                                 head.append("Content-Length: ").append(cacheHit.third.size).append(crlf).append(crlf)
                                 output.write(head.toString().toByteArray())
                                 output.write(cacheHit.third)
                                 if (okLogCount.incrementAndGet() <= 40) {
-                                    nlog("[Seg] CACHE-HIT bytes=${cacheHit.third.size} url=...${segUrl.takeLast(26)}")
+                                    nlog("[Seg] CACHE-HIT bytes=${cacheHit.third.size} host=${hostOf(segUrl)}")
                                 }
                                 ok = true
                             }
@@ -3945,11 +4285,11 @@ class AnimeVsubProvider : MainAPI() {
                                 val skipN = backoffSkips.incrementAndGet()
                                 if (skipN <= 2 || skipN % 20 == 0) {
                                     val waitS = ((maxOf(segAuthBackoffGlobalUntil, dnsCooldownUntil) - nowMs) / 1000L).coerceAtLeast(1)
-                                    nlog("[Seg] backoff toàn cục ${waitS}s — 502 tạm url=...${segUrl.takeLast(26)}")
+                                    nlog("[Seg] backoff toàn cục ${waitS}s — 502 tạm host=${hostOf(segUrl)}")
                                 }
                             } else {
 
-                                if (segRecipe == null && recipeNeeded && !servedBig) waitForRecipe()
+                                if (flowState.segRecipe == null && recipeNeeded && !servedBig) waitForRecipe()
 
                                 if (!ok && warmResponse != null) ok = viaWarmResponse(warmResponse, segUrl, reqRange, output, crlf, t0)
                                 if (!ok && !output.started && recipeNeeded) ok = viaRecipe(segUrl, reqRange, output, crlf, t0)
@@ -3982,7 +4322,7 @@ class AnimeVsubProvider : MainAPI() {
                                 output.write(("HTTP/1.1 502 Bad Gateway${crlf}Content-Length: ${body.size}${crlf}$crlf").toByteArray())
                                 output.write(body)
                                 val n = allMethodFails.incrementAndGet()
-                                if (n <= 3 || n % 10 == 0) nlog("[Seg] ALL-METHODS-FAILED #$n url=...${segUrl.takeLast(40)}")
+                                if (n <= 3 || n % 10 == 0) nlog("[Seg] ALL-METHODS-FAILED #$n host=${hostOf(segUrl)}")
 
                                 if (n >= 5 && System.currentTimeMillis() > segAuthBackoffGlobalUntil) {
                                     segAuthBackoffGlobalUntil = System.currentTimeMillis() + 30_000L
@@ -4026,7 +4366,7 @@ class AnimeVsubProvider : MainAPI() {
         private fun noteBlocked(): Boolean = blockedDetailLog.incrementAndGet() <= 3
 
         private fun logFullUrlOnce(segUrl: String) {
-            if (fullUrlLogged.compareAndSet(false, true)) nlog("[Seg] URL-ĐẦY-ĐỦ $segUrl")
+            if (fullUrlLogged.compareAndSet(false, true)) nlog("[Seg] upstream host=${hostOf(segUrl)}")
         }
 
         private fun noteAuthFail(ct: String?) {
@@ -4047,13 +4387,13 @@ class AnimeVsubProvider : MainAPI() {
         private fun waitForRecipe(maxMs: Long = 5_000L) {
             val t0 = System.currentTimeMillis()
             var kicked = false
-            while (segRecipe == null && System.currentTimeMillis() - t0 < maxMs) {
+            while (flowState.segRecipe == null && System.currentTimeMillis() - t0 < maxMs) {
                 if (!kicked && System.currentTimeMillis() - t0 > 2_500L) {
                     kicked = true
                     try {
-                        val wv = synchronized(relayLock) { relayWv }
-                        if (wv != null && System.currentTimeMillis() - lastKickAtMs > 2_500L) {
-                            lastKickAtMs = System.currentTimeMillis()
+                        val wv = relayWebView(playerMediaGate)
+                        if (wv != null && System.currentTimeMillis() - flowState.lastKickAtMs > 2_500L) {
+                            flowState.lastKickAtMs = System.currentTimeMillis()
                             android.os.Handler(android.os.Looper.getMainLooper()).post {
                                 try { wv.evaluateJavascript(AVS_KICK_JS, null) } catch (_: Throwable) {}
                             }
@@ -4062,8 +4402,8 @@ class AnimeVsubProvider : MainAPI() {
                 }
                 try { Thread.sleep(250) } catch (_: Throwable) { break }
             }
-            if (segRecipe != null && System.currentTimeMillis() - segRecipeUpdateAt < 60_000L) {
-                nlog("[Seg] recipe sẵn sàng sau ${System.currentTimeMillis() - t0}ms chờ playerSegOk=$playerSegOkSeen")
+            if (flowState.segRecipe != null && System.currentTimeMillis() - flowState.segRecipeUpdateAt < 60_000L) {
+                nlog("[Seg] recipe sẵn sàng sau ${System.currentTimeMillis() - t0}ms chờ playerSegOk=${flowState.playerSegOkSeen}")
             }
         }
 
@@ -4156,7 +4496,6 @@ class AnimeVsubProvider : MainAPI() {
             val statusLine = if (resp.code == 206) "HTTP/1.1 206 Partial Content" else "HTTP/1.1 200 OK"
             val head = StringBuilder(statusLine).append(crlf)
                 .append("Content-Type: ").append(resp.header("Content-Type") ?: "application/octet-stream").append(crlf)
-                .append("Access-Control-Allow-Origin: *").append(crlf)
                 .append("Connection: close").append(crlf)
             resp.header("Content-Range")?.let { head.append("Content-Range: ").append(it).append(crlf) }
             resp.header("Accept-Ranges")?.let { head.append("Accept-Ranges: ").append(it).append(crlf) }
@@ -4330,9 +4669,8 @@ class AnimeVsubProvider : MainAPI() {
             if (isBlockedResponse(resp.code, ct)) {
                 logFullUrlOnce(url)
                 if (noteBlocked()) {
-                    nlog("[Seg] $method ${resp.code} ct=$ct url=...${url.takeLast(40)}")
-                    val peek = try { resp.peekBody(200).string().replace("\n", " ").take(140) } catch (_: Throwable) { "?" }
-                    nlog("[Seg] $method blocked-body $peek")
+                    nlog("[Seg] $method ${resp.code} ct=$ct host=${hostOf(url)}")
+                    nlog("[Seg] $method blocked response")
                 }
                 noteAuthFail(ct)
                 return false
@@ -4352,8 +4690,8 @@ class AnimeVsubProvider : MainAPI() {
         }
 
         private fun viaRecipe(segUrl: String, reqRange: String?, output: AvsResponseOutput, crlf: String, t0: Long): Boolean {
-            val rec = segRecipe ?: return false
-            val url = recipeUrlFor(segUrl)
+            val rec = recipeForUrl(flowState, segUrl) ?: return false
+            val url = recipeUrlFor(flowState, segUrl)
             return try {
                 val rb = okhttp3.Request.Builder().url(url)
                     .header("User-Agent", USER_AGENT)
@@ -4368,51 +4706,50 @@ class AnimeVsubProvider : MainAPI() {
                     val sent = streamOkHttpBody(resp, output, crlf, t0, "RECIPE", segUrl, reqRange)
                     if (sent >= 4096L) servedBig = true
                     if (sent > 0 && okLogCount.incrementAndGet() <= 40) {
-                        nlog("[Seg] RECIPE OK bytes=$sent headerMs=${headerMs} totalMs=${System.currentTimeMillis() - t0} url=...${url.takeLast(26)}")
+                        nlog("[Seg] RECIPE OK bytes=$sent headerMs=${headerMs} totalMs=${System.currentTimeMillis() - t0} host=${hostOf(url)}")
                     }
                     sent > 0
                 }
             } catch (e: Throwable) {
                 noteDnsFail(e)
-                nlog("[Seg] RECIPE err ${e.message?.take(60)} url=...${segUrl.takeLast(30)}")
+                nlog("[Seg] RECIPE err ${e.message?.take(60)} host=${hostOf(segUrl)}")
                 false
             }
         }
 
         private fun viaRelay(segUrl: String, reqRange: String?, output: AvsResponseOutput, crlf: String, t0: Long): Boolean {
-            val hasWv = synchronized(relayLock) { relayWv != null }
+            val hasWv = relayWebView(playerMediaGate) != null
             if (!hasWv || System.currentTimeMillis() < relayGateUntilGlobalMs ||
                 System.currentTimeMillis() < dnsCooldownUntil) return false
-            val headers = (if (recipeNeeded) segRecipe?.headers ?: emptyMap() else emptyMap()).toMutableMap()
+            val headers = (if (recipeNeeded) recipeForUrl(flowState, segUrl)?.headers ?: emptyMap() else emptyMap()).toMutableMap()
             reqRange?.let { headers["Range"] = it }
-            val relayUrl = if (recipeNeeded) recipeUrlFor(segUrl) else segUrl
+            val relayUrl = if (recipeNeeded) recipeUrlFor(flowState, segUrl) else segUrl
             val isKey = keyUrls.contains(segUrl)
             val limit = if (isKey) 16 * 1024 else maxPrefetchBytes
             val result = try {
-                relayFetchSegment(relayUrl, headers, 9_000L, limit, if (fastReal) playerMediaGate else null)
+                relayFetchSegment(relayUrl, headers, 9_000L, limit, playerMediaGate)
             } catch (e: Throwable) {
                 AvsRelayResult(null, "exc " + (e.message?.take(50) ?: "?"), 0, null, null)
             }
             val bytes = result.bytes
             if (bytes == null || bytes.isEmpty() || isBlockedResponse(result.status, result.contentType) ||
                 !rangeResponseValid(reqRange, result.status, result.contentRange, bytes.size.toLong()) ||
-                looksLikeErrorBytes(bytes) || (isKey && bytes.size != 16) || (!isKey && bytes.size < 1024)) {
+                looksLikeErrorBytes(bytes) || (isKey && bytes.size != 16)) {
                 relayGateUntilGlobalMs = System.currentTimeMillis() + 10_000
-                nlog("[Seg] RELAY fail err=${result.error ?: "bad-response"} st=${result.status} range=${reqRange ?: "-"} — nghỉ 10s url=...${segUrl.takeLast(30)}")
+                nlog("[Seg] RELAY fail err=${result.error ?: "bad-response"} st=${result.status} range=${reqRange ?: "-"} — nghỉ 10s host=${hostOf(segUrl)}")
                 return false
             }
             val head = StringBuilder(if (result.status == 206) "HTTP/1.1 206 Partial Content" else "HTTP/1.1 200 OK").append(crlf)
                 .append("Content-Type: ").append(result.contentType ?: if (isKey) "application/octet-stream" else "video/mp2t").append(crlf)
                 .append("Content-Length: ").append(bytes.size).append(crlf)
                 .append("Connection: close").append(crlf)
-                .append("Access-Control-Allow-Origin: *").append(crlf)
             result.contentRange?.let { head.append("Content-Range: ").append(it).append(crlf) }
             head.append(crlf)
             output.write(head.toString().toByteArray())
             output.write(bytes)
             if (bytes.size >= 4096) servedBig = true
             if (okLogCount.incrementAndGet() <= 40) {
-                nlog("[Seg] RELAY OK bytes=${bytes.size} totalMs=${System.currentTimeMillis() - t0} url=...${segUrl.takeLast(26)}")
+                nlog("[Seg] RELAY OK bytes=${bytes.size} totalMs=${System.currentTimeMillis() - t0} host=${hostOf(segUrl)}")
             }
             return true
         }
@@ -4454,13 +4791,13 @@ class AnimeVsubProvider : MainAPI() {
                         val sent = streamOkHttpBody(resp, output, crlf, t0, "OKHTTP", segUrl, reqRange)
                         if (sent >= 4096L) servedBig = true
                         if (sent > 0 && okLogCount.incrementAndGet() <= 40) {
-                            nlog("[Seg] OKHTTP OK bytes=$sent headerMs=${headerMs} totalMs=${System.currentTimeMillis() - t0} sinceReg=${System.currentTimeMillis() - bornAt}ms url=...${segUrl.takeLast(26)}")
+                            nlog("[Seg] OKHTTP OK bytes=$sent headerMs=${headerMs} totalMs=${System.currentTimeMillis() - t0} sinceReg=${System.currentTimeMillis() - bornAt}ms host=${hostOf(segUrl)}")
                         }
                         sent > 0
                     }
                 } catch (e: Throwable) {
                     noteDnsFail(e)
-                    nlog("[Seg] OKHTTP err ${e.message?.take(80)} ref=${ref.take(30)} url=...${segUrl.takeLast(40)}")
+                    nlog("[Seg] OKHTTP err ${e.message?.take(80)} ref=${ref.take(30)} host=${hostOf(segUrl)}")
                     false
                 }
                 if (ok) return true
@@ -4491,7 +4828,7 @@ class AnimeVsubProvider : MainAPI() {
                 }
             } catch (e: Throwable) {
                 noteDnsFail(e)
-                nlogE("[Seg] OKHTTP-ORIGIN", e, "...${segUrl.takeLast(40)}")
+                nlogE("[Seg] OKHTTP-ORIGIN", e, "host=${hostOf(segUrl)}")
                 false
             }
         }
@@ -4501,6 +4838,7 @@ class AnimeVsubProvider : MainAPI() {
             return try {
                 val c = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
                 conn = c
+                c.instanceFollowRedirects = false
                 c.connectTimeout = 10_000
                 c.readTimeout = 15_000
                 c.setRequestProperty("User-Agent", USER_AGENT)
@@ -4517,8 +4855,7 @@ class AnimeVsubProvider : MainAPI() {
                 if (isBlockedResponse(code, ct)) {
                     logFullUrlOnce(segUrl)
                     if (noteBlocked()) {
-                        val peek = try { c.errorStream?.bufferedReader()?.readLine() ?: "?" } catch (_: Throwable) { "?" }
-                        nlog("[Seg] URLCONN $code ct=$ct body=${peek.take(140)} url=...${segUrl.takeLast(40)}")
+                        nlog("[Seg] URLCONN $code ct=$ct host=${hostOf(segUrl)}")
                     }
                     noteAuthFail(ct)
                     return false
@@ -4531,8 +4868,7 @@ class AnimeVsubProvider : MainAPI() {
                 }
                 val head = StringBuilder(if (code == 206) "HTTP/1.1 206 Partial Content" else "HTTP/1.1 200 OK").append(crlf)
                     .append("Content-Type: ").append(ct ?: "application/octet-stream").append(crlf)
-                    .append("Access-Control-Allow-Origin: *").append(crlf)
-                    .append("Connection: close").append(crlf)
+                        .append("Connection: close").append(crlf)
                 if (contentRange != null) head.append("Content-Range: ").append(contentRange).append(crlf)
                 if (len >= 0) head.append("Content-Length: ").append(len).append(crlf)
                 head.append(crlf)
@@ -4554,7 +4890,7 @@ class AnimeVsubProvider : MainAPI() {
                 sent > 0
             } catch (e: Throwable) {
                 noteDnsFail(e)
-                nlogE("[Seg] URLCONN", e, "...${segUrl.takeLast(40)}")
+                nlogE("[Seg] URLCONN", e, "host=${hostOf(segUrl)}")
                 false
             } finally {
                 try { conn?.disconnect() } catch (_: Throwable) {}
