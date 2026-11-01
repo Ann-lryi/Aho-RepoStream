@@ -43,7 +43,7 @@ class AnimeVsubProvider : MainAPI() {
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 
-    private val AVS_BUILD = "v35"
+    private val AVS_BUILD = "v36"
 
     private val AVS_FAST_REAL_PLAY = true
     private val REAL_STARTUP_GRACE_MS = 1_200L
@@ -874,6 +874,70 @@ class AnimeVsubProvider : MainAPI() {
         return null
     }
 
+    private data class AvsCardBadge(val episode: Int?, val quality: SearchQuality?, val sub: Boolean, val dub: Boolean)
+
+    private fun cardBadge(a: Element): AvsCardBadge {
+        val card = a.closest(".TPostMv, .TPost, .movie-item, .film-item, .card, .item, article, li") ?: a
+        val status = card.select(".mli-eps, .episode, .episodes, .ep, .status, .quality, .badge, .lang, .language, [class*=episode], [class*=quality]")
+            .map { it.text().trim() }.filter { it.isNotBlank() && it.length <= 80 }.distinct().joinToString(" | ")
+        val episode = (Regex("""(?i)(?:tập|tap|episode|ep)\s*(\d+)""").find(status)?.groupValues?.get(1)
+            ?: Regex("""\b(\d+)\s*/\s*\d+\b""").find(status)?.groupValues?.get(1))
+            ?.toIntOrNull()?.takeIf { it in 1..10000 }
+        val quality = when {
+            Regex("""(?i)\b(?:4k|2160p)\b""").containsMatchIn(status) -> SearchQuality.FourK
+            Regex("""(?i)\b(?:fhd|hd|1080p|720p)\b""").containsMatchIn(status) -> SearchQuality.HD
+            Regex("""(?i)\b(?:sd|480p)\b""").containsMatchIn(status) -> SearchQuality.SD
+            Regex("""(?i)\b(?:cam|camrip)\b""").containsMatchIn(status) -> SearchQuality.Cam
+            else -> null
+        }
+        val dub = Regex("""(?i)(?:thuyết\s*minh|lồng\s*tiếng|thuyet\s*minh|long\s*tieng|\bdub\b)""").containsMatchIn(status)
+        val explicitSub = Regex("""(?i)(?:vietsub|việt\s*sub|phụ\s*đề|phu\s*de|\bsub\b)""").containsMatchIn(status)
+        return AvsCardBadge(episode, quality, explicitSub || (!dub && episode != null), dub)
+    }
+
+    private fun htmlText(value: String): String = value.replace("&", "&amp;")
+        .replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&#39;")
+
+    private fun detailField(doc: Document, vararg labels: String): String? {
+        val names = labels.map { it.lowercase(java.util.Locale.ROOT) }.toSet()
+        for (row in doc.select(".Info li, .info li, .information li, .metadata li, .film-info li, .TPost li, .TPostMv li, .info p, .metadata p, dl dt")) {
+            val text = row.text().trim()
+            if (text.isBlank() || text.length > 300) continue
+            val label = text.substringBefore(':', "").trim().lowercase(java.util.Locale.ROOT)
+            if (label !in names) continue
+            val value = text.substringAfter(':', "").trim().ifBlank {
+                if (row.tagName().equals("dt", true)) row.nextElementSibling()?.text()?.trim() ?: "" else ""
+            }
+            if (value.isNotBlank() && value.length <= 240) return value
+        }
+        return null
+    }
+
+    private fun animeDescription(
+        original: String?, status: String?, current: Int?, total: Int?, duration: String?,
+        quality: String?, language: String?, format: String?, studio: String?, year: Int?,
+        genres: List<String>, story: String?
+    ): String = buildString {
+        if (!original.isNullOrBlank()) append("<i><font color='#B7A9D6'>${htmlText(original)}</font></i><br><br>")
+        fun row(symbol: String, label: String, value: String?, color: String = "#E9E5F1") {
+            if (!value.isNullOrBlank()) append("$symbol <b>$label:</b> <font color='$color'>${htmlText(value)}</font><br>")
+        }
+        row("✦", "Tiến độ", status ?: current?.let { "Tập $it" }, "#FF83BB")
+        row("◈", "Số tập", total?.let { "$it tập" })
+        row("◷", "Thời lượng", duration)
+        row("◇", "Chất lượng", quality, "#8CE3F2")
+        row("♫", "Ngôn ngữ", language)
+        row("⌘", "Định dạng", format)
+        row("✎", "Studio", studio)
+        row("▣", "Năm", year?.toString())
+        row("❖", "Thể loại", genres.takeIf { it.isNotEmpty() }?.joinToString(" • "))
+        if (!story.isNullOrBlank()) {
+            if (isNotEmpty()) append("<br>")
+            append("<b><font color='#FF83BB'>✧ CÂU CHUYỆN ✧</font></b><br>")
+            append(htmlText(story))
+        }
+    }
+
     private fun parseCards(doc: Document): List<SearchResponse> {
         val out = LinkedHashMap<String, SearchResponse>()
         for (a in doc.select("a[href*=\"/phim/\"]")) {
@@ -909,8 +973,13 @@ class AnimeVsubProvider : MainAPI() {
                     resolvePlaylistUri(it, doc.baseUri().ifBlank { mainUrl }) ?: absolutize(it)
                 }
 
+                val badge = cardBadge(a)
                 out[slugId] = newAnimeSearchResponse(title, detail, TvType.Anime) {
                     this.posterUrl = poster
+                    this.quality = badge.quality
+                    addDubStatus(dubExist = badge.dub, subExist = badge.sub,
+                        dubEpisodes = if (badge.dub) badge.episode else null,
+                        subEpisodes = if (badge.sub) badge.episode else null)
                 }
             } catch (e: Throwable) {
                 nlogE("[Card]", e, a.attr("href").take(60))
@@ -1316,14 +1385,16 @@ class AnimeVsubProvider : MainAPI() {
             poster = if (posterImg == null) "" else pickImgUrl(posterImg) ?: ""
         }
 
-        var plot = doc.selectFirst("meta[name=\"description\"]")?.attr("content")?.trim() ?: ""
-        for (sel in listOf(".description", ".film-description", "#bio", ".story", "[class*=descript]", ".content-detail")) {
-            if (plot.isNotBlank()) break
+        var plot = ""
+        for (sel in listOf(".Description", ".description", ".film-description", "#bio", ".story", ".content-detail")) {
             plot = doc.selectFirst(sel)?.text()?.trim() ?: ""
+            if (plot.isNotBlank()) break
         }
         if (plot.isBlank()) plot = doc.selectFirst("meta[property=\"og:description\"]")?.attr("content")?.trim() ?: ""
+        if (plot.isBlank()) plot = doc.selectFirst("meta[name=\"description\"]")?.attr("content")?.trim() ?: ""
 
-        val tags = doc.select("a[href*=\"/the-loai/\"]")
+        val genreRegion = doc.selectFirst(".Info, .info, .film-info, .information, .TPost, .TPostMv")
+        val tags = (genreRegion ?: doc).select("a[href*=\"/the-loai/\"]")
             .map { it.text().trim() }
             .filter { it.isNotBlank() && it.length < 40 }
             .distinct()
@@ -1335,8 +1406,9 @@ class AnimeVsubProvider : MainAPI() {
             .find(infoText)?.groupValues?.get(1)?.toIntOrNull()
             ?: Regex("""\b((?:19|20)\d{2})\b""").find(title)?.groupValues?.get(1)?.toIntOrNull()
 
-        val totalEps = Regex("""(\d+)\s*(?:tập|episodes?)""", RegexOption.IGNORE_CASE)
-            .find(infoText + " " + title)?.groupValues?.get(1)?.toIntOrNull()
+        val totalEps = detailField(doc, "số tập", "tổng số tập", "số tập phim", "episodes")
+            ?.let { Regex("""\d+""").find(it)?.value?.toIntOrNull() }
+            ?.takeIf { it in 1..10000 }
 
         val epOrder = LinkedHashMap<String, String>()
         val epMeta  = LinkedHashMap<String, MutableSet<String>>()
@@ -1427,11 +1499,23 @@ class AnimeVsubProvider : MainAPI() {
             })
         }
 
+        val original = doc.selectFirst(".Original, .original-title, .original-name, .sub-title, .subtitle")
+            ?.text()?.trim()?.takeIf { it.isNotBlank() && it.length <= 160 && !it.equals(title, true) }
+        val status = detailField(doc, "trạng thái", "tình trạng", "status")
+        val duration = detailField(doc, "thời lượng", "duration")
+        val quality = detailField(doc, "chất lượng", "quality")
+        val language = detailField(doc, "ngôn ngữ", "language")
+        val format = detailField(doc, "định dạng", "loại", "type")
+        val studio = detailField(doc, "studio", "hãng sản xuất")
+        val current = epOrder.keys.mapNotNull { it.toIntOrNull() }.maxOrNull()
+        val description = animeDescription(original, status, current, totalEps, duration,
+            quality, language, format, studio, year, tags, plot.takeIf { it.isNotBlank() })
+
         newTvSeriesLoadResponse(title, detail, TvType.Anime, episodes) {
             this.posterUrl = poster.takeIf { it.isNotBlank() }?.let {
                 resolvePlaylistUri(it, doc.baseUri().ifBlank { detail }) ?: absolutize(it)
             }
-            this.plot      = plot.takeIf { it.isNotBlank() }
+            this.plot      = description.takeIf { it.isNotBlank() }
             this.tags      = tags
             this.year      = year
         }
