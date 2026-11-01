@@ -33,7 +33,7 @@ class AnimeVsubPlugin : Plugin() {
 }
 
 class AnimeVsubProvider : MainAPI() {
-    override var mainUrl = "https://animevietsub.news"
+    override var mainUrl = "https://animevietsub.sale"
     override var name = "AnimeVsub"
     override val hasMainPage = true
     override var lang = "vi"
@@ -43,7 +43,7 @@ class AnimeVsubProvider : MainAPI() {
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 
-    private val AVS_BUILD = "v36"
+    private val AVS_BUILD = "v37"
 
     private val AVS_FAST_REAL_PLAY = true
     private val REAL_STARTUP_GRACE_MS = 1_200L
@@ -795,53 +795,37 @@ class AnimeVsubProvider : MainAPI() {
         }
     }
 
-    @Volatile private var homePageStyle = 0
-    @Volatile private var genrePageStyle = 0
 
     override val mainPage = mainPageOf(
         "/anime-moi/" to "Mới Cập Nhật",
-        "/danh-sach/list-le/all/all/all/all/all/all/"  to "Anime Lẻ",
-        "/danh-sach/list-bo/all/all/all/all/all/all/"   to "Anime Bộ",
-        "/danh-sach/list-sap-chieu/all/all/all/all/all/all/"   to "Sắp Chiếu"
+        "/danh-sach/list-le/all/all/all/all/all/all/" to "Anime Lẻ",
+        "/danh-sach/list-bo/all/all/all/all/all/all/" to "Anime Bộ",
+        "/danh-sach/list-sap-chieu/all/all/all/all/all/all/" to "Sắp Chiếu"
     )
 
     private fun listingCandidates(data: String, page: Int): List<String> {
-        return if (data == "HOME") {
-            if (page == 1) listOf("$mainUrl/")
-            else when (homePageStyle) {
-                0 -> listOf("$mainUrl/trang-$page.html", "$mainUrl/?page=$page")
-                else -> listOf("$mainUrl/?page=$page", "$mainUrl/trang-$page.html")
-            }
-        } else {
-            val slug = data.removePrefix("GENRE::")
-            if (page == 1) {
-                listOf("$mainUrl/the-loai/$slug/", "$mainUrl/the-loai/$slug/trang-1.html")
-            } else when (genrePageStyle) {
-                0 -> listOf("$mainUrl/the-loai/$slug/trang-$page.html", "$mainUrl/the-loai/$slug/?page=$page")
-                else -> listOf("$mainUrl/the-loai/$slug/?page=$page", "$mainUrl/the-loai/$slug/trang-$page.html")
-            }
+        val path = when (data) {
+            "/anime-moi/",
+            "/danh-sach/list-le/all/all/all/all/all/all/",
+            "/danh-sach/list-bo/all/all/all/all/all/all/",
+            "/danh-sach/list-sap-chieu/all/all/all/all/all/all/" -> data
+            else -> return emptyList()
         }
-    }
-
-    private fun rememberPaginationStyle(data: String, page: Int, idx: Int) {
-        if (page == 1) return
-        if (data == "HOME") {
-            if (idx != homePageStyle) homePageStyle = idx
-        } else {
-            if (idx != genrePageStyle) genrePageStyle = idx
-        }
-        nlog("[List] pagination style ${data.take(12)} p$page -> idx=$idx")
+        val base = mainUrl.trimEnd('/') + path
+        if (page <= 1) return listOf(base)
+        val pathPage = "${base}trang-$page.html"
+        val queryPage = "${base}?page=$page"
+        return listOf(pathPage, queryPage)
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val candidates = listingCandidates(request.data, page)
         var items: List<SearchResponse> = emptyList()
-        var usedIdx = -1
-        for ((idx, url) in candidates.withIndex()) {
+        for (url in candidates) {
             try {
                 val doc = fetchDoc(url)
                 items = parseCards(doc)
-                if (items.isNotEmpty()) { usedIdx = idx; break }
+                if (items.isNotEmpty()) break
             } catch (e: Throwable) {
                 if (isCancellation(e)) throw e
                 nlog("[List] candidate fail $url: ${e.message}")
@@ -849,7 +833,6 @@ class AnimeVsubProvider : MainAPI() {
                 if (siteDown() || srvStormActive()) break
             }
         }
-        if (usedIdx >= 0) rememberPaginationStyle(request.data, page, usedIdx)
         nlog("[List] ${request.name} p$page -> ${items.size} items")
         ntoastV("AnimeVsub $AVS_BUILD: ${request.name} p$page — ${items.size} phim")
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
