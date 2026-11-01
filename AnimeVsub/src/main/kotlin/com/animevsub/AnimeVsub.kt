@@ -33,7 +33,7 @@ class AnimeVsubPlugin : Plugin() {
 }
 
 class AnimeVsubProvider : MainAPI() {
-    override var mainUrl = "https://animevietsub.sale"
+    override var mainUrl = "https://animevietsub.news"
     override var name = "AnimeVsub"
     override val hasMainPage = true
     override var lang = "vi"
@@ -799,11 +799,10 @@ class AnimeVsubProvider : MainAPI() {
     @Volatile private var genrePageStyle = 0
 
     override val mainPage = mainPageOf(
-        "HOME" to "Mới Cập Nhật",
-        "GENRE::hanh-dong"  to "Hành Động",
-        "GENRE::hai-huoc"   to "Hài Hước",
-        "GENRE::tinh-cam"   to "Tình Cảm",
-        "GENRE::kinh-di"    to "Kinh Dị"
+        "/anime-moi/" to "Mới Cập Nhật",
+        "/danh-sach/list-le/all/all/all/all/all/all/"  to "Anime Lẻ",
+        "/danh-sach/list-bo/all/all/all/all/all/all/"   to "Anime Bộ",
+        "/danh-sach/list-sap-chieu/all/all/all/all/all/all/"   to "Sắp Chiếu"
     )
 
     private fun listingCandidates(data: String, page: Int): List<String> {
