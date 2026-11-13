@@ -1,28 +1,11 @@
-// use an integer for version numbers — v29: T1-T7 tốc độ (register ngay, poller hết treo, 1 proxy, prefetch đầu) — giữ nguyên cơ chế phát v28
 version = 29
 
-
 cloudstream {
-    // All of these properties are optional, you can safely remove them
-
     description = "Anime vietsub - lồng tiếng từ animevietsub.sale"
-    language    = "vi"
+    language = "vi"
     authors = listOf("Aho-Repo")
-
-    /**
-    * Status int as the following:
-    * 0: Down
-    * 1: Ok
-    * 2: Slow
-    * 3: Beta only
-    * */
-    status = 3 // Beta — chưa verify runtime player sau gate Turnstile; đổi thành 1 khi đã test ổn
-
-    // List of video source types. Users are able to filter for extensions in a given category.
-    // You can find a list of available types here:
-    // https://recloudstream.github.io/cloudstream/html/app/com.lagradost.cloudstream3/-tv-type/index.html
+    status = 3
     tvTypes = listOf("Anime", "AnimeMovie")
     iconUrl = "https://animevietsub.sale/favicon.ico"
-
     isCrossPlatform = false
 }

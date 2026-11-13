@@ -6,7 +6,7 @@ import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 
 buildscript {
     repositories {
-        google() 
+        google()
         mavenCentral()
         maven { url = uri("https://jitpack.io") }
     }
@@ -18,11 +18,11 @@ buildscript {
     }
 }
 
-allprojects { 
+allprojects {
     repositories {
         google()
         mavenCentral()
-        maven { url = uri("https://jitpack.io") } 
+        maven { url = uri("https://jitpack.io") }
     }
     configurations.all {
         resolutionStrategy.cacheChangingModulesFor(0, java.util.concurrent.TimeUnit.SECONDS)
@@ -93,4 +93,4 @@ subprojects {
 
 tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
-} 
+}

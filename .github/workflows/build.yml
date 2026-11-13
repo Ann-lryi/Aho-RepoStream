@@ -1,6 +1,5 @@
 name: Build
 
-# https://docs.github.com/en/actions/learn-github-actions/workflow-syntax-for-github-actions#concurrency
 concurrency:
   group: "build"
   cancel-in-progress: true
@@ -8,7 +7,6 @@ concurrency:
 on:
   push:
     branches:
-      # choose your default branch
       - master
       - main
     paths-ignore:
@@ -37,7 +35,6 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE/builds
           
-          # Check if we have a valid builds branch
           if git rev-parse --verify builds >/dev/null 2>&1; then
             echo "Builds branch exists locally, checking it out"
             git checkout builds
@@ -49,7 +46,6 @@ jobs:
           else
             echo "Builds branch does not exist, creating it..."
             
-            # If .git exists but no builds branch, we need to start fresh
             cd $GITHUB_WORKSPACE
             rm -rf builds
             mkdir -p builds
@@ -60,7 +56,6 @@ jobs:
             git config user.name "GitHub Actions"
             git config user.email "actions@github.com"
             
-            # Create orphan builds branch
             git checkout --orphan builds
             echo "# Builds" > README.md
             git add README.md
@@ -211,10 +206,8 @@ jobs:
           git config --local user.name "GitHub Actions"
           git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           
-          # Make sure we're on builds branch
           git checkout builds
           
-          # Pull latest changes from remote
           git pull origin builds --rebase || true
           
           git add .
