@@ -42,20 +42,30 @@ class AnimeVsubProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+
     private val AVS_BUILD = "v37"
+
     private val AVS_FAST_REAL_PLAY = true
     private val REAL_STARTUP_GRACE_MS = 1_200L
+
     private val PLAIN_TIMEOUT_MS = 2_500L
+
     private val AVS_DIRECT_CANONICAL = true
+
     private val PREFLIGHT_TRIM = false
+
     private val MAX_EMBEDS = 3
+
     private val HOOK_TIMEOUT_MS = 60_000L
+
     private val WV_SILENT_TIMEOUT_MS = 22_000L
+
     private val MODE_LISTING = 0
     private val MODE_DETAIL = 1
     private val MODE_LOOSE = 2
     private val MODE_EPISODES = 3
     private val MODE_PLAY = 4
+
     private val commonHeaders = mapOf(
         "User-Agent"      to USER_AGENT,
         "Accept"          to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -70,12 +80,16 @@ class AnimeVsubProvider : MainAPI() {
     private val proxyFailCount = java.util.concurrent.atomic.AtomicInteger(0)
     @Volatile private var proxyDisabledUntilMs = 0L
     private val PROXY_COOLDOWN_MS = 10 * 60 * 1000L
+
     private val fetchGate = java.util.concurrent.Semaphore(3)
     private val fetchRand = kotlin.random.Random
+
     private val plainDeadStreak = java.util.concurrent.atomic.AtomicInteger(0)
     @Volatile private var plainHtmlDeadUntilMs = 0L
     private val PLAIN_DEAD_THRESHOLD = 3
+
     private val PLAIN_DEAD_COOLDOWN_MS = 2 * 60 * 60 * 1000L
+
     private val stateRestored = java.util.concurrent.atomic.AtomicBoolean(false)
     @Volatile private var canonicalHost: String? = null
     @Volatile private var canonicalConfirmed = false
@@ -96,13 +110,13 @@ class AnimeVsubProvider : MainAPI() {
             if (until > now && until > plainHtmlDeadUntilMs) {
                 plainHtmlDeadUntilMs = until
                 plainDeadStreak.set(PLAIN_DEAD_THRESHOLD)
-                nlog("[Fetch] plain TẮT khôi phục từ phiên trước — còn ${(until - now) / 60000} phút")
+                nlog("[Fetch] plain TẮT khôi phục từ phiên trước — còn ${(until - now) / 60000} phút (v30 C1)")
             }
             if (AVS_DIRECT_CANONICAL) {
                 val ch = p.getString("canonicalHost", null)
                 if (!ch.isNullOrBlank() && isSiteUrl("https://$ch/") && ch != hostOf(mainUrl)) {
                     canonicalHost = ch
-                    nlog("[Fetch] host chuẩn khôi phục: $ch")
+                    nlog("[Fetch] host chuẩn khôi phục: $ch (v30 C2)")
                 }
             }
         } catch (_: Throwable) { stateRestored.set(false) }
@@ -119,7 +133,7 @@ class AnimeVsubProvider : MainAPI() {
         if (h.isEmpty() || h == hostOf(mainUrl) || !isSiteUrl(pageUrl)) return
         if (canonicalHost != h) {
             canonicalHost = h
-            nlog("[Fetch] học host chuẩn: $h (mainUrl=${hostOf(mainUrl)})")
+            nlog("[Fetch] học host chuẩn: $h (mainUrl=${hostOf(mainUrl)}) (v30 C2)")
             try { statePrefs()?.edit()?.putString("canonicalHost", h)?.apply() } catch (_: Throwable) {}
         }
         canonicalConfirmed = true
@@ -137,6 +151,7 @@ class AnimeVsubProvider : MainAPI() {
     private val playWvGate = java.util.concurrent.Semaphore(1)
     private val inflightLock = Any()
     private val inflightDocs = HashMap<String, kotlinx.coroutines.CompletableDeferred<Document>>()
+
     private val junkHosts = listOf(
         "googleads", "doubleclick", "googlesyndication", "google-analytics",
         "facebook.com", "t.me", "telegram", "twitter.com", "x.com", "disqus",
@@ -476,12 +491,12 @@ class AnimeVsubProvider : MainAPI() {
                 result
             }
             if (resp == null) {
-                nlog("[Fetch] plain $tag TIMEOUT ${PLAIN_TIMEOUT_MS}ms $url")
+                nlog("[Fetch] plain $tag TIMEOUT ${PLAIN_TIMEOUT_MS}ms (v29 F1) $url")
 
                 if (hostOf(url) == hostOf(mainUrl) && System.currentTimeMillis() >= plainHtmlDeadUntilMs) {
                     plainDeadStreak.set(PLAIN_DEAD_THRESHOLD)
                     setPlainDead(System.currentTimeMillis() + PLAIN_DEAD_COOLDOWN_MS)
-                    nlog("[Fetch] plain TẮT ${PLAIN_DEAD_COOLDOWN_MS / 60000} phút (TIMEOUT)")
+                    nlog("[Fetch] plain TẮT ${PLAIN_DEAD_COOLDOWN_MS / 60000} phút (TIMEOUT, v30 C1)")
                 }
                 return null
             }
@@ -496,7 +511,7 @@ class AnimeVsubProvider : MainAPI() {
                     System.currentTimeMillis() >= plainHtmlDeadUntilMs) {
                     plainDeadStreak.set(PLAIN_DEAD_THRESHOLD)
                     setPlainDead(System.currentTimeMillis() + PLAIN_DEAD_COOLDOWN_MS)
-                    nlog("[Fetch] plain 403 challenge-page (len=${html.length}) — tắt plain ${PLAIN_DEAD_COOLDOWN_MS / 60000} phút NGAY")
+                    nlog("[Fetch] plain 403 challenge-page (len=${html.length}) — tắt plain ${PLAIN_DEAD_COOLDOWN_MS / 60000} phút NGAY (v26 P5)")
                 }
                 nlog("[Fetch] plain $tag ${resp.code} REJECT len=${html.length} ms=${System.currentTimeMillis() - t0} $url")
                 return null
@@ -669,7 +684,7 @@ class AnimeVsubProvider : MainAPI() {
                 interactive = false
             )
             if (doc == null && viaCanon) {
-                nlog("[Fetch] canonical-direct thất bại -> tắt, thử lại URL gốc $url")
+                nlog("[Fetch] canonical-direct thất bại -> tắt, thử lại URL gốc (v30 C2) $url")
                 canonicalOff = true
                 canonicalHost = null
                 try { statePrefs()?.edit()?.remove("canonicalHost")?.apply() } catch (_: Throwable) {}
@@ -779,6 +794,7 @@ class AnimeVsubProvider : MainAPI() {
             null
         }
     }
+
 
     override val mainPage = mainPageOf(
         "/anime-moi/" to "Mới Cập Nhật",
@@ -1488,7 +1504,7 @@ class AnimeVsubProvider : MainAPI() {
     }
 
     private val m3u8UrlRegex =
-        Regex("""https?:
+        Regex("""https?://[^"'\s<>\\]+?\.m3u[89](?:\?[^"'\s<>\\]*)?""", RegexOption.IGNORE_CASE)
     private val mp4UrlRegex =
         Regex("""https?://[^"'\s<>\\]+?\.(?:mp4|m4v)(?:\?[^"'\s<>\\]*)?""", RegexOption.IGNORE_CASE)
 
@@ -1756,7 +1772,7 @@ class AnimeVsubProvider : MainAPI() {
                         var embeds = harvestIframes(doc).sortedByDescending { isBackgroundPlayerUrl(it) }.take(MAX_EMBEDS)
 
                         if (embeds.isEmpty() && isWatchPageUrl(watchUrl)) {
-                            nlog("[Step1] iframes=0 — nạp lại trang xem (WVDom đợi iframe)")
+                            nlog("[Step1] iframes=0 — nạp lại trang xem (WVDom đợi iframe, v28 R5)")
                             docCache.remove(watchUrl)
                             try {
                                 val doc2 = fetchDoc(watchUrl, useCache = false, mode = MODE_EPISODES)
@@ -2546,7 +2562,7 @@ class AnimeVsubProvider : MainAPI() {
                     }
                     if (flow.segRecipe != null) buildSegRecipe(flow)
                     else if (obsMaxMs == 0L) {
-                        nlog("[Hook] fast-real: bỏ chờ recipe 8s; giữ fallback khi CDN không sẵn sàng")
+                        nlog("[Hook] fast-real: bỏ chờ recipe 8s; giữ fallback khi CDN không sẵn sàng (v31)")
                     } else {
                         nlog("[Hook] player chưa fetch segment trong 8s — proxy sẽ ĐỢI recipe (F6), không dội method mù")
                         try {
@@ -2616,6 +2632,7 @@ class AnimeVsubProvider : MainAPI() {
     @Volatile private var lastGateAttemptMs = 0L
     private val GATE_RETRY_MS = 10 * 60 * 1000L
     private val GATE_OPEN_TIMEOUT_MS = 90_000L
+
     private val domPollJs = """
 (function(){
   if (window.__avsDomLoop) return; window.__avsDomLoop = true;
@@ -2942,7 +2959,9 @@ class AnimeVsubProvider : MainAPI() {
     private val relayPending = java.util.concurrent.ConcurrentHashMap<String, RelayBuf>()
     private val relaySeq = java.util.concurrent.atomic.AtomicInteger(0)
     private val relayCheckScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
+
     private val AVS_KICK_JS = "(function(){try{window.__avsPausePlayerMedia=false;var vs=document.querySelectorAll('video');for(var i=0;i<vs.length;i++){vs[i].muted=true;var p=vs[i].play();if(p&&p.catch)p.catch(function(){});}}catch(e){}})();"
+
     private val AVS_REAL_PL_JS = """
 (function(){
   if (window.__avsRealPlRunning) return; window.__avsRealPlRunning = true;
@@ -2988,6 +3007,7 @@ class AnimeVsubProvider : MainAPI() {
 """;
 
     private val AVS_CALM_JS = "(function(){try{var vs=document.querySelectorAll('video');for(var i=0;i<vs.length;i++){try{vs[i].pause();}catch(e){}}}catch(e){}})();"
+
     private val AVS_CALM_FAST_JS = """
 (function(){
   try {
@@ -3004,6 +3024,7 @@ class AnimeVsubProvider : MainAPI() {
 """
 
     private val AVS_VIDEO_STATE_JS = "(function(){try{var v=document.querySelector('video');var h=false;try{h=!!(window.hls||window.Hls);}catch(e0){}if(!v)return 'novideo hls='+h;return 'rs='+v.readyState+' paused='+v.paused+' t='+Math.round(v.currentTime||0)+' net='+v.networkState+' hls='+h+' src='+String(v.currentSrc||v.src||'').substring(0,50);}catch(e){return 'err '+(e&&e.message?e.message:'?')}})();"
+
     private val avsRelayJs = """
 (function(){
   if (window.__avsRelayInstalled) return; window.__avsRelayInstalled = true;
@@ -3405,7 +3426,7 @@ class AnimeVsubProvider : MainAPI() {
                 nlogE("[Register] direct", e)
             }
         } else {
-            nlog("[Register] bỏ link direct (manifest nội bộ '${m3u8Url.take(40)}') — chỉ phát link proxy")
+            nlog("[Register] bỏ link direct (manifest nội bộ '${m3u8Url.take(40)}') — chỉ phát link proxy (v26 P0, hết 2001)")
         }
 
         var proxyBase: String? = null
@@ -3588,6 +3609,7 @@ class AnimeVsubProvider : MainAPI() {
         private val okLogCount = java.util.concurrent.atomic.AtomicInteger(0)
         private val prefetchLogCount = java.util.concurrent.atomic.AtomicInteger(0)
         private val backoffSkips = java.util.concurrent.atomic.AtomicInteger(0)
+
         private val segOrder = java.util.Collections.synchronizedList(ArrayList<Pair<String, String?>>())
         private val segmentDurations = java.util.concurrent.ConcurrentHashMap<String, Double>()
         private val recentSegmentRequests = java.util.concurrent.ConcurrentHashMap<String, Long>()
@@ -4131,7 +4153,7 @@ class AnimeVsubProvider : MainAPI() {
             synchronized(startupRecoveryLock) {
                 if (startupRecoveryDone || !startupRecoveryRequired) return
                 val delayMs = (bornAt + 8_000L - System.currentTimeMillis()).coerceIn(0L, 8_000L)
-                nlog("[Fast] warm lỗi — chờ ${delayMs}ms trước retry")
+                nlog("[Fast] warm lỗi — khôi phục nhịp player kiểu v30, chờ ${delayMs}ms trước retry")
                 val gate = playerMediaGate
                 gate?.beginRecovery()
                 val wv = relayWebView(gate)
